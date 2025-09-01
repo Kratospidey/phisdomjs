@@ -1,0 +1,25 @@
+# Example endpoints. Replace with your access URLs/keys where required and
+# check license/terms before use. Some feeds require API keys or paid access.
+feeds:
+  openphish:
+    # OpenPhish community feed (public text)
+    url: https://raw.githubusercontent.com/openphish/public_feed/refs/heads/main/feed.txt
+    out: data/feeds/openphish.txt
+
+  phishtank:
+    # PhishTank hourly CSV (requires APP KEY). Set env PHISHTANK_APP_KEY before running fetch_feeds.py
+    # The fetcher expands ${ENV} vars and can decompress bz2 if the server returns compressed content.
+    url: http://data.phishtank.com/data/${PHISHTANK_APP_KEY}/online-valid.csv.bz2
+    out: data/feeds/phishtank.csv
+    decompress: bz2
+    headers:
+      User-Agent: ${PHISHTANK_UA}
+
+  tranco:
+    # For Tranco, we typically generate a CSV locally via the Python package (see Makefile target).
+    # Keep a small fallback or a previously generated CSV at data/feeds/tranco.csv with a 'url' header.
+    url: file://${PWD}/data/feeds/tranco.csv
+    out: data/feeds/tranco.csv
+
+# polite delay between requests
+delay_s: 0.5

@@ -1,0 +1,99 @@
+<html><head><meta charset='utf-8'><title>PhisDOM Report</title>
+<style>
+:root{color-scheme:dark light} body{font-family:system-ui,Arial,sans-serif;margin:0;background:#0f1115;color:#e6e6e6}
+a{color:#8ab4f8} img{max-width:1000px;border:1px solid #333;border-radius:6px;margin:8px 0;background:#111}
+table{border-collapse:collapse;margin:8px 0;background:#111} td,th{border:1px solid #333;padding:6px 10px}
+.pill{display:inline-block;padding:2px 8px;border-radius:999px;background:#1f2330;color:#cbd5e1;border:1px solid #2a2f3a;font-size:12px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(360px,1fr));gap:16px}
+.card{background:#0f1320;border:1px solid #262b36;border-radius:8px;padding:12px}
+.top{display:flex;align-items:center;gap:12px;padding:12px 16px;border-bottom:1px solid #262b36;background:#0b0e14;position:sticky;top:0}
+.wrap{max-width:1200px;margin:0 auto;padding:16px}
+.section{margin-top:16px}
+.subgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.jump{position:sticky;top:54px;background:#0b0e14;border-bottom:1px solid #262b36;padding:8px 16px;z-index:5}
+.jump a{margin-right:10px}
+</style>
+</head><body>
+<div class='top'><div class='pill'>Report</div><div class='mono'>PhisDOM Evaluation</div><div style='margin-left:auto' class='mono'>artifacts/markup_run</div></div>
+<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>
+<div class='wrap'>
+<div id='dataset' class='section'><h2 style='margin:0 0 8px 0'>Dataset summary</h2>
+<div class='subgrid'><div class='card'><b>Train</b><div>2009 docs</div><div>benign: 661</div><div>phish: 1348</div></div>
+<div class='card'><b>Val</b><div>231 docs</div><div>benign: 63</div><div>phish: 168</div></div>
+<div class='card'><b>Test</b><div>560 docs</div><div>benign: 172</div><div>phish: 388</div></div></div></div>
+<div id='cal' class='section'><h2 style='margin:0 0 8px 0'>Calibration & Metrics</h2>
+<div class='grid'><div class='card'><h3>DOM (MarkupLM)</h3><p>PR-AUC: 0.9811 | ROC-AUC: 0.9585</p><table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody><tr><td>0.95</td><td>0.2602174000815223</td><td>0.23255813953488372</td></tr><tr><td>0.9</td><td>0.6349935730145471</td><td>0.08139534883720931</td></tr></tbody></table></div>
+<div class='card'><h3>JS (CodeT5+)</h3><p>PR-AUC: 0.9573 | ROC-AUC: 0.9422</p><table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody><tr><td>0.95</td><td>0.341852460203616</td><td>0.22058823529411764</td></tr><tr><td>0.9</td><td>0.3615182031538254</td><td>0.21323529411764705</td></tr></tbody></table></div>
+<div class='card'><h3>Fused (DOM+JS)</h3><p>PR-AUC: 0.9728 | ROC-AUC: 0.9639</p><table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody><tr><td>0.95</td><td>0.41369322634258987</td><td>0.25735294117647056</td></tr><tr><td>0.9</td><td>0.5644988007128925</td><td>0.10294117647058823</td></tr></tbody></table></div></div></div>
+<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>
+<div><p>accuracy_dom_splits_combined.png</p><img src='accuracy_dom_splits_combined.png'/></div>
+<div><p>accuracy_fused_splits_combined.png</p><img src='accuracy_fused_splits_combined.png'/></div>
+<div><p>accuracy_js_splits_combined.png</p><img src='accuracy_js_splits_combined.png'/></div>
+<div><p>confusion_test_fused_tpr90.png</p><img src='confusion_test_fused_tpr90.png'/></div>
+<div><p>confusion_test_fused_tpr95.png</p><img src='confusion_test_fused_tpr95.png'/></div>
+<div><p>confusion_test_tpr90.png</p><img src='confusion_test_tpr90.png'/></div>
+<div><p>confusion_test_tpr95.png</p><img src='confusion_test_tpr95.png'/></div>
+<div><p>confusion_val_fused_tpr90.png</p><img src='confusion_val_fused_tpr90.png'/></div>
+<div><p>confusion_val_fused_tpr95.png</p><img src='confusion_val_fused_tpr95.png'/></div>
+<div><p>confusion_val_tpr90.png</p><img src='confusion_val_tpr90.png'/></div>
+<div><p>confusion_val_tpr95.png</p><img src='confusion_val_tpr95.png'/></div>
+<div><p>pr_curve_test.png</p><img src='pr_curve_test.png'/></div>
+<div><p>pr_curve_test_fused.png</p><img src='pr_curve_test_fused.png'/></div>
+<div><p>pr_curve_test_js.png</p><img src='pr_curve_test_js.png'/></div>
+<div><p>pr_curve_train.png</p><img src='pr_curve_train.png'/></div>
+<div><p>pr_curve_val.png</p><img src='pr_curve_val.png'/></div>
+<div><p>pr_curve_val_fused.png</p><img src='pr_curve_val_fused.png'/></div>
+<div><p>pr_curve_val_js.png</p><img src='pr_curve_val_js.png'/></div>
+<div><p>pr_dom_splits_combined.png</p><img src='pr_dom_splits_combined.png'/></div>
+<div><p>pr_fused_splits_combined.png</p><img src='pr_fused_splits_combined.png'/></div>
+<div><p>pr_js_splits_combined.png</p><img src='pr_js_splits_combined.png'/></div>
+<div><p>pr_test_combined.png</p><img src='pr_test_combined.png'/></div>
+<div><p>reliability_dom_splits_combined.png</p><img src='reliability_dom_splits_combined.png'/></div>
+<div><p>reliability_fused_splits_combined.png</p><img src='reliability_fused_splits_combined.png'/></div>
+<div><p>reliability_js_splits_combined.png</p><img src='reliability_js_splits_combined.png'/></div>
+<div><p>reliability_test.png</p><img src='reliability_test.png'/></div>
+<div><p>reliability_test_combined.png</p><img src='reliability_test_combined.png'/></div>
+<div><p>reliability_test_fused.png</p><img src='reliability_test_fused.png'/></div>
+<div><p>reliability_test_js.png</p><img src='reliability_test_js.png'/></div>
+<div><p>reliability_val.png</p><img src='reliability_val.png'/></div>
+<div><p>reliability_val_fused.png</p><img src='reliability_val_fused.png'/></div>
+<div><p>reliability_val_js.png</p><img src='reliability_val_js.png'/></div>
+<div><p>roc_curve_test.png</p><img src='roc_curve_test.png'/></div>
+<div><p>roc_curve_test_fused.png</p><img src='roc_curve_test_fused.png'/></div>
+<div><p>roc_curve_test_js.png</p><img src='roc_curve_test_js.png'/></div>
+<div><p>roc_curve_train.png</p><img src='roc_curve_train.png'/></div>
+<div><p>roc_curve_val.png</p><img src='roc_curve_val.png'/></div>
+<div><p>roc_curve_val_fused.png</p><img src='roc_curve_val_fused.png'/></div>
+<div><p>roc_curve_val_js.png</p><img src='roc_curve_val_js.png'/></div>
+<div><p>roc_dom_splits_combined.png</p><img src='roc_dom_splits_combined.png'/></div>
+<div><p>roc_fused_splits_combined.png</p><img src='roc_fused_splits_combined.png'/></div>
+<div><p>roc_js_splits_combined.png</p><img src='roc_js_splits_combined.png'/></div>
+<div><p>roc_test_combined.png</p><img src='roc_test_combined.png'/></div>
+<div id='xai' class='section'><h2 style='margin:0 0 8px 0'>Explanations</h2><div class='grid'>
+<div class='card'><h3>LIME (DOM)</h3><ul>
+<li><a href='lime_dom/lime_12c08c83a3ef95fbb170b9e0bec6aca562168958.html' target='_blank'>lime_12c08c83a3ef95fbb170b9e0bec6aca562168958.html</a> — <a href='http://allegrolokalnie.pl-oferta9581959.cfd' target='_blank'>visit</a></li>
+<li><a href='lime_dom/lime_24196e4efb8e63f8f338ce2db7e61b2ac98b70ed.html' target='_blank'>lime_24196e4efb8e63f8f338ce2db7e61b2ac98b70ed.html</a> — <a href='http://openx.net/' target='_blank'>visit</a></li>
+<li><a href='lime_dom/lime_5c01cd00ef3c9e6e413e1027410b7324772e3b8e.html' target='_blank'>lime_5c01cd00ef3c9e6e413e1027410b7324772e3b8e.html</a></li>
+<li><a href='lime_dom/lime_6e5d6b2ce2d4a9eb81ab7e95a59822a086367c69.html' target='_blank'>lime_6e5d6b2ce2d4a9eb81ab7e95a59822a086367c69.html</a> — <a href='http://lencr.org/' target='_blank'>visit</a></li>
+<li><a href='lime_dom/lime_a786fb33d774efe14919047477789c0eca6b6e53.html' target='_blank'>lime_a786fb33d774efe14919047477789c0eca6b6e53.html</a> — <a href='http://twitter.com/' target='_blank'>visit</a></li>
+<li><a href='lime_dom/lime_d345367bbd3673a6d220bea0631f38051282fdb6.html' target='_blank'>lime_d345367bbd3673a6d220bea0631f38051282fdb6.html</a> — <a href='https://px.cmqmgd3.sa.com/gyx/raya.html' target='_blank'>visit</a></li>
+</ul></div>
+<div class='card'><h3>SHAP (DOM)</h3><ul>
+<li><a href='shap_dom/shap_24196e4efb8e63f8f338ce2db7e61b2ac98b70ed.html' target='_blank'>shap_24196e4efb8e63f8f338ce2db7e61b2ac98b70ed.html</a> — <a href='http://openx.net/' target='_blank'>visit</a></li>
+<li><a href='shap_dom/shap_a786fb33d774efe14919047477789c0eca6b6e53.html' target='_blank'>shap_a786fb33d774efe14919047477789c0eca6b6e53.html</a> — <a href='http://twitter.com/' target='_blank'>visit</a></li>
+<li><a href='shap_dom/shap_d345367bbd3673a6d220bea0631f38051282fdb6.html' target='_blank'>shap_d345367bbd3673a6d220bea0631f38051282fdb6.html</a> — <a href='https://px.cmqmgd3.sa.com/gyx/raya.html' target='_blank'>visit</a></li>
+</ul></div>
+<div class='card'><h3>LIME (JS)</h3><ul>
+<li><a href='lime_js/lime_js_09da2dee6421d4d872bf02b8bec1c2d80bdd69db.html' target='_blank'>lime_js_09da2dee6421d4d872bf02b8bec1c2d80bdd69db.html</a> — <a href='http://validateonmainnet.firebaseapp.com/' target='_blank'>visit</a></li>
+<li><a href='lime_js/lime_js_119e677e3e41f12cef68c3cc2744833bb2805479.html' target='_blank'>lime_js_119e677e3e41f12cef68c3cc2744833bb2805479.html</a> — <a href='http://mandirienergikonsultan.com/' target='_blank'>visit</a></li>
+<li><a href='lime_js/lime_js_6e5d6b2ce2d4a9eb81ab7e95a59822a086367c69.html' target='_blank'>lime_js_6e5d6b2ce2d4a9eb81ab7e95a59822a086367c69.html</a> — <a href='http://lencr.org/' target='_blank'>visit</a></li>
+<li><a href='lime_js/lime_js_a786fb33d774efe14919047477789c0eca6b6e53.html' target='_blank'>lime_js_a786fb33d774efe14919047477789c0eca6b6e53.html</a> — <a href='http://twitter.com/' target='_blank'>visit</a></li>
+<li><a href='lime_js/lime_js_d345367bbd3673a6d220bea0631f38051282fdb6.html' target='_blank'>lime_js_d345367bbd3673a6d220bea0631f38051282fdb6.html</a> — <a href='https://px.cmqmgd3.sa.com/gyx/raya.html' target='_blank'>visit</a></li>
+<li><a href='lime_js/lime_js_f02a05a3a98313a014581167adc11090cf0707f2.html' target='_blank'>lime_js_f02a05a3a98313a014581167adc11090cf0707f2.html</a></li>
+</ul></div>
+<div class='card'><h3>SHAP (JS)</h3><ul>
+<li><a href='shap_js/shap_js_a786fb33d774efe14919047477789c0eca6b6e53.html' target='_blank'>shap_js_a786fb33d774efe14919047477789c0eca6b6e53.html</a> — <a href='http://twitter.com/' target='_blank'>visit</a></li>
+<li><a href='shap_js/shap_js_d345367bbd3673a6d220bea0631f38051282fdb6.html' target='_blank'>shap_js_d345367bbd3673a6d220bea0631f38051282fdb6.html</a> — <a href='https://px.cmqmgd3.sa.com/gyx/raya.html' target='_blank'>visit</a></li>
+</ul></div>
+</div></div>
+</div></body></html>
