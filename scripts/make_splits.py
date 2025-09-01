@@ -29,7 +29,7 @@ def main():
     parser.add_argument("--test-after", type=float, default=None, help="Unix timestamp; test has timestamps strictly greater")
     parser.add_argument("--auto-cutoff-percentile", type=float, default=80.0, help="If --test-after not provided, use this percentile of timestamps as cutoff (0-100)")
     parser.add_argument("--val-frac", type=float, default=0.1)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
     rows = load_jsonl(args.dataset)

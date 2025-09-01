@@ -144,7 +144,7 @@ def main():
     parser.add_argument("--limit-phish", type=int, default=None, help="Limit number of phish URLs from each phish source")
     parser.add_argument("--limit-benign", type=int, default=None, help="Limit number of benign URLs")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle output rows")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="Seed for shuffling; default is random")
     args = parser.parse_args()
 
     rows: List[Tuple[str, int, str]] = []

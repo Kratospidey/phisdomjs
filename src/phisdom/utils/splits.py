@@ -1,4 +1,4 @@
-from typing import Iterable, List, Dict, Tuple, Sequence
+from typing import Iterable, List, Dict, Tuple, Sequence, Optional
 import random
 
 
@@ -8,7 +8,7 @@ def time_group_split(
     *,
     test_after: float,
     val_frac: float = 0.1,
-    seed: int = 42,
+    seed: Optional[int] = None,
 ) -> Dict[str, List[int]]:
     """
     Create leak-safe splits with:
@@ -34,6 +34,7 @@ def time_group_split(
         g = groups[i]
         pre_groups.setdefault(g, []).append(i)
 
+    # If seed is None, Random(None) seeds from system time for non-deterministic behavior by default
     rng = random.Random(seed)
     pre_group_keys = list(pre_groups.keys())
     rng.shuffle(pre_group_keys)

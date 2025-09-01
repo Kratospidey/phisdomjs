@@ -60,7 +60,9 @@ def main():
     # Also force Python loggers used inside Transformers to ERROR
     py_logging.getLogger("transformers").setLevel(py_logging.ERROR)
     py_logging.getLogger("transformers.modeling_utils").setLevel(py_logging.ERROR)
-    set_seed(int(cfg.get("seed", 42)))
+    # Use explicit seed only if provided; otherwise keep run stochastic
+    if "seed" in cfg and cfg["seed"] is not None:
+        set_seed(int(cfg["seed"]))
 
     model_name = cfg.get("model_name", "microsoft/markuplm-base")
     max_length = int(cfg.get("max_length", 512))

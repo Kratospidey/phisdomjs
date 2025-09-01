@@ -1,9 +1,13 @@
 # Simple automation for fetching feeds, unifying seed, crawling, training, and evaluation
 
 PY := PYTHONPATH=src python
-SEED ?= 1337
+SEED ?=
 LIMIT_PHISH ?= 500
 LIMIT_BENIGN ?= 500
+AUTO_CUTOFF ?= 80
+VAL_FRAC ?= 0.1
+CRAWL_CONCURRENCY ?= 12
+CRAWL_TIMEOUT ?= 2.0
 OUTDIR ?= artifacts/markup_run
 MAXLEN ?= 512
 BATCH ?= 4
@@ -33,14 +37,14 @@ unify:
 		--tranco data/feeds/tranco.csv \
 		--out data/seed.csv \
 		--limit-phish $(LIMIT_PHISH) --limit-benign $(LIMIT_BENIGN) \
-		--shuffle --seed $(SEED)
+		--shuffle $(if $(SEED),--seed $(SEED),)
 
 crawl:
 	@mkdir -p data
-	$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency 12 --timeout-s 2.0 --block-assets --no-external-js
+	$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js
 
 splits:
-	$(PY) scripts/make_splits.py --dataset data/pages.jsonl --out data/splits.json --auto-cutoff-percentile 80 --val-frac 0.1 --seed $(SEED)
+	$(PY) scripts/make_splits.py --dataset data/pages.jsonl --out data/splits.json --auto-cutoff-percentile $(AUTO_CUTOFF) --val-frac $(VAL_FRAC) $(if $(SEED),--seed $(SEED),)
 
 slice:
 	$(PY) scripts/slice_dataset.py --dataset data/pages.jsonl --splits data/splits.json --out-dir data

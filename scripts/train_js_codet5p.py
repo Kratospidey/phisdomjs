@@ -71,10 +71,11 @@ def main():
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-epochs", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=3e-5)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None, help="Seed for reproducibility; default is random")
     args = parser.parse_args()
 
-    set_seed(args.seed)
+    if args.seed is not None:
+        set_seed(args.seed)
     os.makedirs(args.output_dir, exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name)

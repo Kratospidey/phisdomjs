@@ -31,7 +31,9 @@ def main():
               "--phishtank", str(ROOT / "data/feeds/phishtank.csv"),
               "--tranco", str(ROOT / "data/feeds/tranco.csv"),
               "--out", str(ROOT / "data/seed.csv"),
-              "--limit-phish", "1000", "--limit-benign", "1000", "--shuffle", "--seed", "1337"])
+              "--limit-phish", os.environ.get("LIMIT_PHISH", "1000"),
+              "--limit-benign", os.environ.get("LIMIT_BENIGN", "1000"),
+              "--shuffle"])
 
     # 3) Crawl
     run(PY + [str(ROOT / "scripts/crawl_playwright.py"),
@@ -41,9 +43,10 @@ def main():
 
     # 4) Splits
     run(PY + [str(ROOT / "scripts/make_splits.py"),
-              "--jsonl", str(ROOT / "data/pages.jsonl"),
+              "--dataset", str(ROOT / "data/pages.jsonl"),
               "--out", str(ROOT / "data/splits.json"),
-              "--auto-cutoff-percentile", "80", "--val-fraction", "0.1"])
+              "--auto-cutoff-percentile", os.environ.get("AUTO_CUTOFF", "80"),
+              "--val-frac", os.environ.get("VAL_FRAC", "0.1")])
 
     # 5) Slice
     run(PY + [str(ROOT / "scripts/slice_dataset.py"),

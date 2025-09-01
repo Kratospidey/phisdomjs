@@ -1,7 +1,6 @@
 # Minimal config for DOM head fine-tuning with MarkupLM
 output_dir: artifacts/markup_run
 model_name: microsoft/markuplm-base
-seed: 42
 max_length: 512
 batch_size: 4
 num_epochs: 1
