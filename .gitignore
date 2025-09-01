@@ -17,3 +17,18 @@ ENV/
 *.log
 *.tmp
 .DS_Store
+# Datasets (store externally or as release assets)
+data/*.jsonl
+
+# Transient training artifacts
+artifacts/**/checkpoint-*/optimizer.pt
+artifacts/**/checkpoint-*/events.*
+artifacts/**/checkpoint-*/*.ckpt
+
+# Common build/log noise
+artifacts/**/wandb/
+dist/
+build/
+*.log
+__pycache__/
+.ipynb_checkpoints/
