@@ -141,28 +141,69 @@ def main():
     parser.add_argument("--phishtank", help="Path to PhishTank (CSV or txt)")
     parser.add_argument("--tranco", help="Path to Tranco URLs (csv/txt)")
     parser.add_argument("--out", required=True, help="Output CSV (url,label,source)")
+    # Legacy per-source limits
     parser.add_argument("--limit-phish", type=int, default=None, help="Limit number of phish URLs from each phish source")
     parser.add_argument("--limit-benign", type=int, default=None, help="Limit number of benign URLs")
+    # New: single target-size with phishing ratio control
+    parser.add_argument("--target-size", type=int, default=None, help="Approximate total rows (excluding header). Overrides per-source limits if set.")
+    parser.add_argument("--phish-ratio", type=float, default=0.5, help="Fraction of phishing rows when using --target-size (0..1). Default 0.5")
     parser.add_argument("--shuffle", action="store_true", help="Shuffle output rows")
     parser.add_argument("--seed", type=int, default=None, help="Seed for shuffling; default is random")
     args = parser.parse_args()
 
-    rows: List[Tuple[str, int, str]] = []
+    # Load sources (keep as lists for flexible allocation)
+    op: List[str] = []
+    pt: List[str] = []
+    tr: List[str] = []
     if args.openphish and os.path.exists(args.openphish):
         op = _read_urls_any(args.openphish)
-        if args.limit_phish is not None:
-            op = op[: args.limit_phish]
-        rows.extend(_tag(op, 1, "openphish"))
     if args.phishtank and os.path.exists(args.phishtank):
         pt = _read_urls_any(args.phishtank)
-        if args.limit_phish is not None:
-            pt = pt[: args.limit_phish]
-        rows.extend(_tag(pt, 1, "phishtank"))
     if args.tranco and os.path.exists(args.tranco):
         tr = _read_urls_any(args.tranco)
-        if args.limit_benign is not None:
-            tr = tr[: args.limit_benign]
-        rows.extend(_tag(tr, 0, "tranco"))
+
+    rows: List[Tuple[str, int, str]] = []
+
+    if args.target_size is not None and args.target_size > 0:
+        # Compute desired phishing and benign counts
+        pr = min(max(args.phish_ratio, 0.0), 1.0)
+        phish_target = int(round(args.target_size * pr))
+        benign_target = max(args.target_size - phish_target, 0)
+
+        # Allocate phishing between OpenPhish and PhishTank proportionally to availability
+        op_n = len(op)
+        pt_n = len(pt)
+        total_avail = max(op_n + pt_n, 1)
+        op_take = min(int(round(phish_target * (op_n / total_avail))), op_n)
+        pt_take = min(phish_target - op_take, pt_n)
+        # If rounding left some slack and one source still has items, fill
+        if op_take + pt_take < phish_target:
+            slack = phish_target - (op_take + pt_take)
+            # Prefer the larger remaining source
+            op_rem = max(op_n - op_take, 0)
+            take_more_op = min(slack, op_rem)
+            op_take += take_more_op
+            slack -= take_more_op
+            if slack > 0:
+                pt_take += min(slack, max(pt_n - pt_take, 0))
+
+        rows.extend(_tag(op[:op_take], 1, "openphish"))
+        rows.extend(_tag(pt[:pt_take], 1, "phishtank"))
+        rows.extend(_tag(tr[:benign_target], 0, "tranco"))
+    else:
+        # Legacy per-source limiting
+        if op:
+            if args.limit_phish is not None:
+                op = op[: args.limit_phish]
+            rows.extend(_tag(op, 1, "openphish"))
+        if pt:
+            if args.limit_phish is not None:
+                pt = pt[: args.limit_phish]
+            rows.extend(_tag(pt, 1, "phishtank"))
+        if tr:
+            if args.limit_benign is not None:
+                tr = tr[: args.limit_benign]
+            rows.extend(_tag(tr, 0, "tranco"))
 
     # Deduplicate by URL, preferring first occurrence
     seen = set()

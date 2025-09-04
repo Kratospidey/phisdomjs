@@ -6,6 +6,8 @@ import sys
 import time
 import bz2
 from typing import Dict, Any
+from urllib.parse import urlparse, unquote
+import shutil
 
 import requests
 import yaml
@@ -25,6 +27,23 @@ def unresolved_vars_present(s: str) -> bool:
 
 def fetch_to(path: str, url: str, headers: Dict[str, str] | None = None, timeout: float = 20.0) -> bytes:
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    # Support local file:// scheme by copying from disk
+    parsed = urlparse(url)
+    if parsed.scheme == "file":
+        src_path = unquote(parsed.path)
+        if not src_path:
+            raise ValueError(f"Invalid file URL: {url}")
+        # If output equals source, nothing to do; return existing bytes
+        if os.path.abspath(src_path) == os.path.abspath(path):
+            with open(src_path, "rb") as f:
+                return f.read()
+        if not os.path.exists(src_path):
+            raise FileNotFoundError(f"file URL not found: {src_path}")
+        shutil.copyfile(src_path, path)
+        with open(path, "rb") as f:
+            return f.read()
+
+    # Default: HTTP(S)
     r = requests.get(url, headers=headers or DEFAULT_HEADERS, timeout=timeout)
     r.raise_for_status()
     content = r.content

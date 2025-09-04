@@ -2,12 +2,18 @@
 
 PY := PYTHONPATH=src python
 SEED ?=
-LIMIT_PHISH ?= 500
-LIMIT_BENIGN ?= 500
+LIMIT_PHISH ?= 5000
+LIMIT_BENIGN ?= 5000
+# Single target size (overrides per-source limits when set)
+SEED_SIZE ?=
+PHISH_RATIO ?= 0.5
 AUTO_CUTOFF ?= 80
 VAL_FRAC ?= 0.1
 CRAWL_CONCURRENCY ?= 12
-CRAWL_TIMEOUT ?= 2.0
+CRAWL_TIMEOUT ?= 3.0
+CRAWL_RETRIES ?= 1
+# Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
+CRAWL ?= true
 OUTDIR ?= artifacts/markup_run
 MAXLEN ?= 512
 BATCH ?= 4
@@ -27,7 +33,7 @@ feeds: tranco
 # Generate Tranco CSV locally (requires `pip install tranco`)
 tranco:
 	@mkdir -p data/feeds
-	$(PY) scripts/gen_tranco.py
+	$(PY) scripts/gen_tranco.py $(if $(TRANCO_DATE),--date $(TRANCO_DATE),) $(if $(TRANCO_LIST_ID),--list-id $(TRANCO_LIST_ID),) $(if $(TRANCO_SUBDOMAINS),--subdomains,) $(if $(TRANCO_COUNT),--count $(TRANCO_COUNT),)
 
 unify:
 	@mkdir -p data
@@ -36,12 +42,20 @@ unify:
 		--phishtank data/feeds/phishtank.csv \
 		--tranco data/feeds/tranco.csv \
 		--out data/seed.csv \
-		--limit-phish $(LIMIT_PHISH) --limit-benign $(LIMIT_BENIGN) \
+		$(if $(SEED_SIZE),--target-size $(SEED_SIZE) --phish-ratio $(PHISH_RATIO),--limit-phish $(LIMIT_PHISH) --limit-benign $(LIMIT_BENIGN)) \
 		--shuffle $(if $(SEED),--seed $(SEED),)
 
 crawl:
 	@mkdir -p data
-	$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js
+	@if [ "$(CRAWL)" = "false" ] || [ "$(CRAWL)" = "0" ] || [ "$(CRAWL)" = "no" ]; then \
+		echo "[MAKE] Skipping crawl (CRAWL=$(CRAWL))"; \
+		if [ ! -s data/pages.jsonl ]; then \
+			echo "[MAKE][ERROR] data/pages.jsonl is missing. Cannot skip crawl."; \
+			exit 2; \
+		fi; \
+	else \
+		$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js --retries $(CRAWL_RETRIES); \
+	fi
 
 splits:
 	$(PY) scripts/make_splits.py --dataset data/pages.jsonl --out data/splits.json --auto-cutoff-percentile $(AUTO_CUTOFF) --val-frac $(VAL_FRAC) $(if $(SEED),--seed $(SEED),)
@@ -89,8 +103,25 @@ report-xai:
 		--lime --shap --num-expl 1 \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3
 
-# End-to-end: fetch feeds, unify to seed, crawl, split, train, eval
+# End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
+ifeq ($(CRAWL),false)
+all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+else ifeq ($(CRAWL),0)
+all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+else ifeq ($(CRAWL),no)
+all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+else
 all e2e: feeds unify crawl splits slice train eval report train-js eval-js fuse report report-xai
+endif
+
+.PHONY: crawl-verify
+crawl-verify:
+	@if [ ! -s data/pages.jsonl ]; then \
+		echo "[MAKE][ERROR] data/pages.jsonl missing; set CRAWL=true to generate it."; \
+		exit 2; \
+	else \
+		echo "[MAKE] Using existing data/pages.jsonl (skipped crawl)"; \
+	fi
 
 # Resume from splits onward
 .PHONY: resume

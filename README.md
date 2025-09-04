@@ -26,6 +26,10 @@ CLI demo:
 python -m phisdom.cli --url "http://login.example.co-security.com/reset?acct=123"
 ```
 
+## Documentation
+
+- Full project report: see `REPORT.md` for pipeline, configs, models, and results.
+
 ## Roadmap (abridged)
 - Data plumbing/crawl harness and data cards
 - DOM/JS feature extractors and vocab freeze

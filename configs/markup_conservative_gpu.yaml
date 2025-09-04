@@ -1,0 +1,22 @@
+# Very conservative GPU-safe config for MarkupLM training under low VRAM/WSL
+output_dir: artifacts/markup_run
+model_name: microsoft/markuplm-base
+# Keep sequence short to reduce memory; the trainer can adapt further if needed
+max_length: 256
+# Start small; script will back off to 1 if OOM and increase grad accumulation
+batch_size: 2
+num_epochs: 1
+learning_rate: 1e-5
+train_jsonl: data/pages_train.jsonl
+val_jsonl: data/pages_val.jsonl
+## GPU-conservative MarkupLM config (low memory, safe on WSL/GPU)
+output_dir: artifacts/markup_run
+model_name: microsoft/markuplm-base
+# Keep sequence length modest; script may further reduce if OOM
+max_length: 256
+# Start tiny; script will use grad accumulation to preserve effective batch
+batch_size: 2
+num_epochs: 1
+learning_rate: 2e-5
+train_jsonl: data/pages_train.jsonl
+val_jsonl: data/pages_val.jsonl

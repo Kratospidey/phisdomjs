@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 import sys
 import subprocess
-import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -26,14 +25,21 @@ def main():
 
     # 2) Unify feeds
     Path(ROOT / "data").mkdir(parents=True, exist_ok=True)
-    run(PY + [str(ROOT / "scripts/unify_feeds.py"),
-              "--openphish", str(ROOT / "data/feeds/openphish.txt"),
-              "--phishtank", str(ROOT / "data/feeds/phishtank.csv"),
-              "--tranco", str(ROOT / "data/feeds/tranco.csv"),
-              "--out", str(ROOT / "data/seed.csv"),
-              "--limit-phish", os.environ.get("LIMIT_PHISH", "1000"),
-              "--limit-benign", os.environ.get("LIMIT_BENIGN", "1000"),
-              "--shuffle"])
+    # Build unify args with either target-size or legacy per-source limits
+    unify_cmd = [str(ROOT / "scripts/unify_feeds.py"),
+                 "--openphish", str(ROOT / "data/feeds/openphish.txt"),
+                 "--phishtank", str(ROOT / "data/feeds/phishtank.csv"),
+                 "--tranco", str(ROOT / "data/feeds/tranco.csv"),
+                 "--out", str(ROOT / "data/seed.csv")]
+    seed_size = os.environ.get("SEED_SIZE")
+    if seed_size:
+        phish_ratio = os.environ.get("PHISH_RATIO", "0.5")
+        unify_cmd += ["--target-size", seed_size, "--phish-ratio", phish_ratio]
+    else:
+        unify_cmd += ["--limit-phish", os.environ.get("LIMIT_PHISH", "5000"),
+                      "--limit-benign", os.environ.get("LIMIT_BENIGN", "5000")]
+    unify_cmd += ["--shuffle"]
+    run(PY + unify_cmd)
 
     # 3) Crawl
     run(PY + [str(ROOT / "scripts/crawl_playwright.py"),
@@ -58,7 +64,6 @@ def main():
     run(PY + [str(ROOT / "scripts/train_markup.py"), "--config", str(ROOT / "configs/markup_base.yaml")])
 
     # 7) Eval
-    cfg_path = ROOT / "configs/markup_base.yaml"
     # Default output dir from config
     out_dir = ROOT / "artifacts/markup_run"
     run(PY + [str(ROOT / "scripts/eval_markup.py"),

@@ -1,0 +1,9 @@
+# Conservative config for DOM head fine-tuning with MarkupLM (for low-memory/WLS)
+output_dir: artifacts/markup_run
+model_name: microsoft/markuplm-base
+max_length: 128  # Lowered from 512
+batch_size: 1    # Lowered from 4
+num_epochs: 1
+learning_rate: 1e-5  # Lowered for stability
+train_jsonl: data/pages_train.jsonl
+val_jsonl: data/pages_val.jsonl
