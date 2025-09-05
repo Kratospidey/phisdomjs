@@ -1415,21 +1415,80 @@ def main():
     plot_train_val_loss(os.path.join(args.model_dir, "trainer_state.json"), report_dir, "dom")
     plot_train_val_loss(os.path.join(args.js_dir, "trainer_state.json"), report_dir, "js")
 
-    # Save a quick metrics summary
-    from sklearn.metrics import accuracy_score
-    summ = {
+    # Save a detailed metrics summary and build a pretty HTML table later
+    from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, log_loss, roc_auc_score, average_precision_score
+
+    def metrics_for(y: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
+        yhat = (p >= thr).astype(int)
+        m = {
+            "accuracy": float(accuracy_score(y, yhat)),
+            "precision": float(precision_score(y, yhat, zero_division=0)),
+            "recall": float(recall_score(y, yhat, zero_division=0)),
+            "f1": float(f1_score(y, yhat, zero_division=0)),
+            "log_loss": float(log_loss(y, np.clip(p, 1e-8, 1-1e-8))),
+            "roc_auc": float(roc_auc_score(y, p)),
+            "pr_auc": float(average_precision_score(y, p)),
+        }
+        return m
+
+    metrics_summary: Dict[str, Any] = {
         "thresholds": {"tpr95": thr_95, "tpr90": thr_90},
-        "acc": {
-            "train@tpr95": float(accuracy_score(y_tr, (p_tr >= thr_95).astype(int))),
-            "val@tpr95": float(accuracy_score(y_va, (p_va >= thr_95).astype(int))),
-            "test@tpr95": float(accuracy_score(y_te, (p_te >= thr_95).astype(int))),
-            "train@tpr90": float(accuracy_score(y_tr, (p_tr >= thr_90).astype(int))),
-            "val@tpr90": float(accuracy_score(y_va, (p_va >= thr_90).astype(int))),
-            "test@tpr90": float(accuracy_score(y_te, (p_te >= thr_90).astype(int))),
+        "dom": {
+            "train@tpr95": metrics_for(y_tr, p_tr, thr_95),
+            "val@tpr95": metrics_for(y_va, p_va, thr_95),
+            "test@tpr95": metrics_for(y_te, p_te, thr_95),
+            "train@tpr90": metrics_for(y_tr, p_tr, thr_90),
+            "val@tpr90": metrics_for(y_va, p_va, thr_90),
+            "test@tpr90": metrics_for(y_te, p_te, thr_90),
         },
     }
+    if js_val and js_test:
+        y_va_js, p_va_js = js_val
+        y_te_js, p_te_js = js_test
+        # Compute pseudo-train metrics if we computed train preds
+        if js_train:
+            _, y_tr_js, p_tr_js = js_train
+            metrics_summary["js"] = {
+                "train@tpr95": metrics_for(y_tr_js, p_tr_js, thr_95),
+                "val@tpr95": metrics_for(y_va_js, p_va_js, thr_95),
+                "test@tpr95": metrics_for(y_te_js, p_te_js, thr_95),
+                "train@tpr90": metrics_for(y_tr_js, p_tr_js, thr_90),
+                "val@tpr90": metrics_for(y_va_js, p_va_js, thr_90),
+                "test@tpr90": metrics_for(y_te_js, p_te_js, thr_90),
+            }
+        else:
+            metrics_summary["js"] = {
+                "val@tpr95": metrics_for(y_va_js, p_va_js, thr_95),
+                "test@tpr95": metrics_for(y_te_js, p_te_js, thr_95),
+                "val@tpr90": metrics_for(y_va_js, p_va_js, thr_90),
+                "test@tpr90": metrics_for(y_te_js, p_te_js, thr_90),
+            }
+    if fu_val and fu_test:
+        y_va_fu, p_va_fu = fu_val
+        y_te_fu, p_te_fu = fu_test
+        # Derive train fused metrics only if we computed fusion above
+        if (isinstance(locals().get("p_tr_fu"), np.ndarray)):
+            y_tr_fu_np = locals().get("y_tr_fu")
+            p_tr_fu_np = locals().get("p_tr_fu")
+            if y_tr_fu_np is not None and p_tr_fu_np is not None:
+                metrics_summary["fused"] = {
+                    "train@tpr95": metrics_for(y_tr_fu_np, p_tr_fu_np, thr_95),
+                    "val@tpr95": metrics_for(y_va_fu, p_va_fu, thr_95),
+                    "test@tpr95": metrics_for(y_te_fu, p_te_fu, thr_95),
+                    "train@tpr90": metrics_for(y_tr_fu_np, p_tr_fu_np, thr_90),
+                    "val@tpr90": metrics_for(y_va_fu, p_va_fu, thr_90),
+                    "test@tpr90": metrics_for(y_te_fu, p_te_fu, thr_90),
+                }
+        else:
+            metrics_summary["fused"] = {
+                "val@tpr95": metrics_for(y_va_fu, p_va_fu, thr_95),
+                "test@tpr95": metrics_for(y_te_fu, p_te_fu, thr_95),
+                "val@tpr90": metrics_for(y_va_fu, p_va_fu, thr_90),
+                "test@tpr90": metrics_for(y_te_fu, p_te_fu, thr_90),
+            }
+
     with open(os.path.join(report_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(summ, f, indent=2)
+        json.dump(metrics_summary, f, indent=2)
 
     # Interpretability samples
     if args.lime or args.shap:
@@ -1510,6 +1569,7 @@ def main():
         dom_cal = safe_load(os.path.join(args.model_dir, "calibration.json"))
         js_cal = safe_load(os.path.join(args.js_dir, "calibration.json"))
         fu_cal = safe_load(os.path.join(args.fusion_dir, "calibration.json"))
+        metrics_json = safe_load(os.path.join(report_dir, "summary.json"))
         pngs = [p for p in os.listdir(report_dir) if p.endswith(".png")]
         lime_dom_dir = os.path.join(report_dir, "lime_dom")
         shap_dom_dir = os.path.join(report_dir, "shap_dom")
@@ -1545,6 +1605,24 @@ def main():
                 f"<table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody>{rows}</tbody></table>"
             )
 
+        # Build a metrics table if available
+        def metrics_table(title: str, section: Dict[str, Any] | None):
+            if not section:
+                return f"<div class='card'><h3>{title}</h3><p>No metrics.</p></div>"
+            # Rows: split@thr, then columns of metrics
+            keys = sorted(section.keys())
+            cols = ["accuracy","precision","recall","f1","log_loss","roc_auc","pr_auc"]
+            rows_html = []
+            for k in keys:
+                m = section[k]
+                cells = "".join(f"<td class='mono' style='text-align:right'>{m.get(c, float('nan')):.4f}</td>" for c in cols)
+                rows_html.append(f"<tr><td class='mono'>{k}</td>{cells}</tr>")
+            head = "".join(f"<th>{c}</th>" for c in ["split@thr"]+cols)
+            return (
+                f"<div class='card'><h3>{title}</h3>"
+                f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>"
+            )
+
         html = [
             "<html><head><meta charset='utf-8'><title>PhisDOM Report</title>",
             "<style>",
@@ -1564,7 +1642,7 @@ def main():
             "</head><body>",
             "<div class='top'><div class='pill'>Report</div><div class='mono'>PhisDOM Evaluation</div>"
             f"<div style='margin-left:auto' class='mono'>{args.model_dir}</div></div>",
-            "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
+            "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#metrics'>Metrics</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
             "<div class='wrap'>",
             "<div id='dataset' class='section'><h2 style='margin:0 0 8px 0'>Dataset summary</h2>",
             f"<div class='subgrid'><div class='card'><b>Train</b><div>{tr_tot} docs</div><div>benign: {tr_neg}</div><div>phish: {tr_pos}</div></div>",
@@ -1574,6 +1652,11 @@ def main():
             f"<div class='grid'><div class='card'>{metric_block('DOM (MarkupLM)', dom_cal)}</div>",
             f"<div class='card'>{metric_block('JS (CodeT5+)', js_cal)}</div>",
             f"<div class='card'>{metric_block('Fused (DOM+JS)', fu_cal)}</div></div></div>",
+            "<div id='metrics' class='section'><h2 style='margin:0 0 8px 0'>ML Metrics</h2>",
+            metrics_table("DOM", metrics_json.get("dom") if metrics_json else None),
+            metrics_table("JS", metrics_json.get("js") if metrics_json else None),
+            metrics_table("Fused", metrics_json.get("fused") if metrics_json else None),
+            "</div>",
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
         ]
 

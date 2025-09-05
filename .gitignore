@@ -1,3 +1,31 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+
+# Data artifacts
+data/pages.jsonl
+data/pages_merged.jsonl
+data/pages_train.jsonl
+data/pages_val.jsonl
+data/pages_test.jsonl
+data/splits.json
+data/feeds/
+data/external/**/*.jsonl
+data/external/**/*.csv
+data/external/**/*.zip
+data/external/MTLP_Dataset/MTLP_Screenshots/
+
+# Model artifacts
+artifacts/
+
+# VS Code
+.vscode/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
