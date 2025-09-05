@@ -14,14 +14,8 @@ CRAWL_TIMEOUT ?= 3.0
 CRAWL_RETRIES ?= 1
 # Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
 CRAWL ?= true
-# Whether to include external datasets (e.g., MTLP) alongside internal pages.jsonl
-EXTERNAL ?= false
-# Paths for external dataset integration
-EXTERNAL_DIR ?= data/external/MTLP_Dataset
-EXTERNAL_CSV ?= $(EXTERNAL_DIR)/MTLP_Dataset.csv
-EXTERNAL_JSONL ?= data/external/mtlp.jsonl
-# Final dataset path used for splits/slice
-DATASET := $(if $(filter true 1 yes,$(EXTERNAL)),data/pages_merged.jsonl,data/pages.jsonl)
+# Final dataset path used for splits/slice (feeds-only workflow)
+DATASET := data/pages.jsonl
 OUTDIR ?= artifacts/markup_run
 MAXLEN ?= 512
 BATCH ?= 4
@@ -64,27 +58,6 @@ crawl:
 	else \
 		$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js --retries $(CRAWL_RETRIES); \
 	fi
-
-.PHONY: import-external
-import-external:
-	@if [ ! -s "$(EXTERNAL_CSV)" ]; then \
-		echo "[MAKE][WARN] External CSV not found at $(EXTERNAL_CSV); skipping import"; \
-	else \
-		$(PY) scripts/import_mtlp.py --csv $(EXTERNAL_CSV) --out $(EXTERNAL_JSONL); \
-	fi
-
-.PHONY: merge
-merge:
-	@mkdir -p data
-	@if [ ! -s "$(EXTERNAL_JSONL)" ]; then \
-		echo "[MAKE][ERROR] External JSONL $(EXTERNAL_JSONL) missing; run 'make import-external' or set EXTERNAL=false"; \
-		exit 2; \
-	fi
-	@if [ ! -s data/pages.jsonl ]; then \
-		echo "[MAKE][ERROR] data/pages.jsonl missing; generate or set CRAWL=false only if it exists"; \
-		exit 2; \
-	fi
-	$(PY) scripts/merge_datasets.py --inputs data/pages.jsonl $(EXTERNAL_JSONL) --out data/pages_merged.jsonl
 
 splits:
 	$(PY) scripts/make_splits.py --dataset $(DATASET) --out data/splits.json --auto-cutoff-percentile $(AUTO_CUTOFF) --val-frac $(VAL_FRAC) $(if $(SEED),--seed $(SEED),)
@@ -134,45 +107,13 @@ report-xai:
 
 # End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
 ifeq ($(CRAWL),false)
-ifeq ($(EXTERNAL),true)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),1)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),yes)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else
 all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
-endif
 else ifeq ($(CRAWL),0)
-ifeq ($(EXTERNAL),true)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),1)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),yes)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else
 all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
-endif
 else ifeq ($(CRAWL),no)
-ifeq ($(EXTERNAL),true)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),1)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),yes)
-all e2e: feeds unify crawl-verify import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else
 all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
-endif
-else
-ifeq ($(EXTERNAL),true)
-all e2e: feeds unify crawl import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),1)
-all e2e: feeds unify crawl import-external merge splits slice train eval report train-js eval-js fuse report report-xai
-else ifeq ($(EXTERNAL),yes)
-all e2e: feeds unify crawl import-external merge splits slice train eval report train-js eval-js fuse report report-xai
 else
 all e2e: feeds unify crawl splits slice train eval report train-js eval-js fuse report report-xai
-endif
 endif
 
 .PHONY: crawl-verify
