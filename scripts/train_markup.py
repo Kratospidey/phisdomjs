@@ -13,6 +13,7 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_callback import TrainerCallback, EarlyStoppingCallback
 from transformers.utils import logging as hf_logging
 from torch.utils.data import Dataset as TorchDataset
 import logging as py_logging
@@ -44,9 +45,34 @@ def compute_metrics(eval_pred):
     }
 
 
+class EpochProgressCallback(TrainerCallback):
+    def __init__(self, total_epochs: float):
+        super().__init__()
+        self.total_epochs = total_epochs
+
+    def on_epoch_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+        # state.epoch starts at 0 for the first epoch
+        try:
+            cur = int(state.epoch) + 1 if state.epoch is not None else 1
+        except Exception:
+            cur = 1
+        print(f"[EPOCH] {cur}/{int(self.total_epochs)} ")
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
+        if not metrics:
+            return
+        best = state.best_metric if state.best_metric is not None else float('nan')
+        metric = metrics.get("eval_pr_auc") or metrics.get("pr_auc")
+        if metric is not None:
+            print(f"[EPOCH] eval pr_auc={metric:.4f} | best={best}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train MarkupLM DOM head on JSONL dataset")
     parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--early-stopping-patience", type=int, default=3, help="Stop if metric doesn't improve for N evals")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0, help="Minimum improvement to reset patience")
+    parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bar")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -117,9 +143,15 @@ def main():
         greater_is_better=True,
         fp16=fp16_ok and not bf16_ok,
         bf16=bf16_ok,
-    # Keep raw 'html' in batch for custom collator
-    remove_unused_columns=False,
+        # Keep raw 'html' in batch for custom collator
+        remove_unused_columns=False,
+        disable_tqdm=bool(args.disable_tqdm),
     )
+
+    # Callbacks: pretty epoch progress + early stopping
+    callbacks = [EpochProgressCallback(total_epochs=num_epochs)]
+    if int(args.early_stopping_patience) > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=int(args.early_stopping_patience), early_stopping_threshold=float(args.early_stopping_min_delta)))
 
     trainer = Trainer(
         model=model,
@@ -128,6 +160,7 @@ def main():
         eval_dataset=cast(TorchDataset, val_ds),  # type: ignore[arg-type]
         data_collator=collator,
         compute_metrics=compute_metrics,
+        callbacks=callbacks,
     )
 
     trainer.train()

@@ -5,7 +5,7 @@ import json
 from typing import List
 import tldextract
 
-from phisdom.data.schema import load_jsonl
+from phisdom.data.schema import iter_jsonl
 from phisdom.utils.splits import time_group_split, export_split_indices
 
 
@@ -32,10 +32,10 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
 
-    rows = load_jsonl(args.dataset)
     groups: List[str] = []
     times: List[float] = []
-    for r in rows:
+    # Stream over the dataset to avoid loading everything into RAM
+    for r in iter_jsonl(args.dataset):
         if "etld1" in r and r["etld1"]:
             g = r["etld1"]
         else:

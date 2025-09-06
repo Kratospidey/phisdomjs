@@ -9,6 +9,8 @@ PhisDOM detects phishing pages using a two-head approach:
 - JS head: a transformer on JavaScript (CodeT5+)
 These heads are calibrated and optionally fused (logistic fusion) for improved accuracy. The dataset is built entirely from feeds you control (OpenPhish, PhishTank, Tranco) via an automated pipeline.
 
+Lightweight feature add-ons (storage-light): the crawler now collects optional URL/DNS/TLS/header/request-graph/form/JS/fingerprinting and tiny visual hashes (pHash/dHash). These add only a few hundred bytes per page and can be used by a small stacking model during fusion. See below.
+
 ## Data pipeline
 
 Inputs and steps:
@@ -48,6 +50,7 @@ Important Make variables:
 - Inputs: `--input-csv data/seed.csv` → CSV with url,label,source
 - Output: `--out-jsonl data/pages.jsonl` with records:
   - id (sha1(url)), url, etld1, timestamp, source, label, html, scripts[], headers
+  - plus optional lightweight fields like: url_final, redirect_hops, url_len, tld, dns_created_days_ago, tls_version, hdr_csp, req_unique_etld1, form_pw_count, js_entropy, fp_canvas, phash64, favicon_dhash, bitb_like_modal, qr_flag, etc.
 - Behavior:
   - Resumable: loads existing URLs from out JSONL and skips them
   - Concurrency: per-worker Playwright contexts
@@ -77,6 +80,7 @@ Resuming crawling:
 - Fusion: Logistic regression on calibrated DOM and JS scores
   - Script: `scripts/fuse_heads.py`
   - Output dir: `artifacts/fusion`
+  - Optional stacked fusion: pass `--use-cheap-features` (default True) to include the lightweight crawler features alongside DOM/JS probabilities.
 
 ## Training and evaluation
 
@@ -137,8 +141,23 @@ Filenames (examples):
   - CRAWL_CONCURRENCY, CRAWL_TIMEOUT, CRAWL_RETRIES
   - CRAWL (true/false)
   - AUTO_CUTOFF, VAL_FRAC, XAI_DEVICE, MAXLEN, BATCH, EPOCHS, LR
+  - TLS_TIMEOUT, DNS_TIMEOUT — timeouts for TLS metadata and DNS TTL/MX lookups
+  - MOBILE_PROFILE — when true, perform a quick mobile-profile load to compute cloaking deltas
+  - GPU — when true, enable GPU-friendly Chromium flags for faster rasterization
 - Feeds config: `configs/feeds.yaml`
 - Model configs: `configs/markup_*.yaml`
+ - Fusion: `scripts/fuse_heads.py --method logistic --use-cheap-features`
+
+## Smoke crawl (sanity check)
+
+Use the 5-URL smoke target to confirm storage-light fields populate without a full run:
+
+```bash
+make MOBILE_PROFILE=true GPU=true smoke
+```
+
+This writes `data/pages_smoke.jsonl` and prints a compact sample of new fields like `url_final`, `dns_created_days_ago`, `cert_age_days`, `hdr_csp`, `req_unique_etld1`, `form_pw_count`, `js_entropy`, `fp_canvas`, `phash64`, `favicon_dhash`, and `cloak_delta_domlen`.
+ - Fusion: `scripts/fuse_heads.py --method logistic --use-cheap-features`
 
 ## File map (selected)
 
@@ -180,6 +199,11 @@ make CRAWL=false e2e
 Resume crawling later (continues from where you left off):
 ```bash
 make CRAWL=true CRAWL_TIMEOUT=8.0 CRAWL_RETRIES=4 crawl
+```
+
+Backfill lightweight fields into existing JSONLs (no re-crawl):
+```bash
+make backfill DNS_TIMEOUT=2 TLS_TIMEOUT=3
 ```
 
 ## Troubleshooting

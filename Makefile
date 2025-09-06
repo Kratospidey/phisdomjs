@@ -12,6 +12,13 @@ VAL_FRAC ?= 0.1
 CRAWL_CONCURRENCY ?= 12
 CRAWL_TIMEOUT ?= 3.0
 CRAWL_RETRIES ?= 1
+# New lightweight feature toggles
+TLS_TIMEOUT ?= 3.0
+DNS_TIMEOUT ?= 2.0
+MOBILE_PROFILE ?= false
+GPU ?= false
+# Backfill network lookups toggle (1=true/0=false)
+BACKFILL_NETWORK ?= 1
 # Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
 CRAWL ?= true
 # Final dataset path used for splits/slice (feeds-only workflow)
@@ -22,6 +29,10 @@ BATCH ?= 4
 EPOCHS ?= 1
 LR ?= 3e-5
 XAI_DEVICE ?= cuda
+# Early stopping and logging controls
+ES_PATIENCE ?= 3
+ES_MIN_DELTA ?= 0.0
+DISABLE_TQDM ?= 0
 
 # Ensure env for PhishTank
 # export PHISHTANK_APP_KEY=your_key
@@ -56,7 +67,7 @@ crawl:
 			exit 2; \
 		fi; \
 	else \
-		$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js --retries $(CRAWL_RETRIES); \
+		$(PY) scripts/crawl_playwright.py --input-csv data/seed.csv --out-jsonl data/pages.jsonl --concurrency $(CRAWL_CONCURRENCY) --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js --retries $(CRAWL_RETRIES) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(filter $(MOBILE_PROFILE),true),--mobile-profile,) $(if $(filter $(GPU),true),--gpu,); \
 	fi
 
 splits:
@@ -66,7 +77,9 @@ slice:
 	$(PY) scripts/slice_dataset.py --dataset $(DATASET) --splits data/splits.json --out-dir data
 
 train:
-	$(PY) scripts/train_markup.py --config configs/markup_base.yaml
+	$(PY) scripts/train_markup.py --config configs/markup_base.yaml \
+		$(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) \
+		--early-stopping-patience $(ES_PATIENCE) --early-stopping-min-delta $(ES_MIN_DELTA)
 
 # Uses the trained model dir from markup_base.yaml
 # Adjust --max-length if needed
@@ -82,18 +95,20 @@ eval:
 
 .PHONY: train-js eval-js
 train-js:
-	$(PY) scripts/train_js_codet5p.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_codet5p --model-name Salesforce/codet5p-220m --max-length 512 --batch-size 4 --num-epochs 1 --lr 3e-5
+	$(PY) scripts/train_js_codet5p.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_codet5p --model-name Salesforce/codet5p-220m --max-length 512 --batch-size 4 --num-epochs 1 --lr 3e-5 \
+		$(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) \
+		--early-stopping-patience $(ES_PATIENCE) --early-stopping-min-delta $(ES_MIN_DELTA)
 
 eval-js:
 	$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length 512
 
 .PHONY: fuse
 fuse:
-	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic
+	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
 
 .PHONY: report
 report:
-	$(PY) scripts/report_eval.py --model-dir $(OUTDIR) --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length $(MAXLEN)
+	$(PY) scripts/report_eval.py --model-dir $(OUTDIR) --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length $(MAXLEN) --device cuda --eval-batch 4
 
 .PHONY: report-xai
 report-xai:
@@ -102,6 +117,7 @@ report-xai:
 		--val-jsonl data/pages_val.jsonl \
 		--test-jsonl data/pages_test.jsonl \
 		--max-length $(MAXLEN) \
+		--device cuda --eval-batch 4 \
 		--lime --shap --num-expl 1 \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3
 
@@ -113,7 +129,7 @@ all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-j
 else ifeq ($(CRAWL),no)
 all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
 else
-all e2e: feeds unify crawl splits slice train eval report train-js eval-js fuse report report-xai
+all e2e: feeds unify crawl auto-backfill splits slice auto-backfill train eval report train-js eval-js fuse report report-xai
 endif
 
 .PHONY: crawl-verify
@@ -132,3 +148,20 @@ resume: splits slice train eval
 clean:
 	rm -f data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl data/splits.json
 	rm -rf artifacts/markup_run
+
+# Quick smoke crawl of first 5 URLs to verify new fields populate
+.PHONY: smoke
+smoke:
+	@head -n 1 data/seed.csv > data/seed_smoke.csv
+	@head -n 6 data/seed.csv | tail -n +2 >> data/seed_smoke.csv
+	$(PY) scripts/crawl_playwright.py --input-csv data/seed_smoke.csv --out-jsonl data/pages_smoke.jsonl --concurrency 2 --timeout-s $(CRAWL_TIMEOUT) --block-assets --no-external-js --retries 1 --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(filter $(MOBILE_PROFILE),true),--mobile-profile,) $(if $(filter $(GPU),true),--gpu,)
+	@echo "--- sample record with lightweight fields ---" && head -n 1 data/pages_smoke.jsonl | $(PY) -c 'import sys,json;obj=json.loads(sys.stdin.read());keep=["url_final","redirect_hops","url_len","dns_created_days_ago","cert_age_days","hdr_csp","req_unique_etld1","form_pw_count","js_entropy","fp_canvas","phash64","favicon_dhash","bitb_like_modal","qr_flag","cloak_delta_domlen"];print(json.dumps({k:obj.get(k) for k in keep if k in obj}, indent=2))'
+
+.PHONY: backfill
+backfill:
+	$(PY) scripts/backfill_fields.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite --network --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT)
+
+.PHONY: auto-backfill
+auto-backfill:
+	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK))"
+	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT)

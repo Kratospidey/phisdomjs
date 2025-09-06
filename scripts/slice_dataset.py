@@ -4,16 +4,21 @@ import argparse
 import json
 from typing import Dict, List
 
-from phisdom.data.schema import load_jsonl
+from phisdom.data.schema import iter_jsonl
 
 
 def subset_jsonl(in_path: str, out_path: str, indices: List[int]) -> None:
-    rows = load_jsonl(in_path)
-    sel = [rows[i] for i in indices if 0 <= i < len(rows)]
+    # Stream over input and write out selected indices without loading all rows
+    wanted = set(int(i) for i in indices)
+    if not wanted:
+        # Create empty file
+        open(out_path, "w").close()
+        return
     with open(out_path, "w", encoding="utf-8") as f:
-        for r in sel:
-            f.write(json.dumps(r, ensure_ascii=False))
-            f.write("\n")
+        for i, r in enumerate(iter_jsonl(in_path)):
+            if i in wanted:
+                f.write(json.dumps(r, ensure_ascii=False))
+                f.write("\n")
 
 
 def main():

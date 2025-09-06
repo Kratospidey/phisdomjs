@@ -30,6 +30,22 @@ python -m phisdom.cli --url "http://login.example.co-security.com/reset?acct=123
 
 - Full project report: see `REPORT.md` for pipeline, configs, models, and results.
 
+## Make knobs (crawler)
+
+- CRAWL_CONCURRENCY: parallel browser contexts
+- CRAWL_TIMEOUT: per-navigation timeout seconds
+- CRAWL_RETRIES: retries per URL
+- TLS_TIMEOUT: timeout for TLS metadata fetch (per host)
+- DNS_TIMEOUT: timeout for DNS TTL/MX lookup (per domain)
+- MOBILE_PROFILE: when true, perform a second quick mobile-profile load to compute cloaking deltas
+- GPU: when true, enable GPU-friendly Chromium flags during crawling
+
+Quick 5-URL smoke crawl to verify lightweight fields:
+
+```bash
+make MOBILE_PROFILE=true GPU=true smoke
+```
+
 ## Roadmap (abridged)
 - Data plumbing/crawl harness and data cards
 - DOM/JS feature extractors and vocab freeze

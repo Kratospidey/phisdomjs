@@ -396,30 +396,88 @@ def _select_class_values(values: np.ndarray | list, class_index: int = 1) -> np.
     return vals
 
 
-def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512, device_preference: str = "cuda", per_device_eval_batch_size: int = 4) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
     if not os.path.isdir(model_dir):
         raise SystemExit(
             f"[ERROR] model_dir must be a fine-tuned local directory (got '{model_dir}').\n"
             "Pass your trained output directory (e.g., artifacts/markup_run)."
         )
+    # Lazy, streaming inference to minimize RAM
+    from phisdom.data.schema import iter_jsonl  # local import to avoid cycles
     model = AutoModelForSequenceClassification.from_pretrained(model_dir)
     processor = MarkupLMProcessor.from_pretrained(model_dir)
-    ds = JsonlPhishDataset(jsonl_path)
-    collator = MarkupLMDataCollator(processor=processor, max_length=max_length)
-    targs = TrainingArguments(output_dir=os.path.join(model_dir, "_report_tmp"), per_device_eval_batch_size=4, remove_unused_columns=False)
-    trainer = Trainer(model=model, args=targs, data_collator=collator)
-    out = trainer.predict(ds)  # type: ignore[arg-type]
-    logits = out.predictions
-    if isinstance(logits, tuple):
-        logits = logits[0]
-    if logits.ndim == 2 and logits.shape[1] == 2:
-        m = logits.max(axis=1, keepdims=True)
-        e = np.exp(logits - m)
-        probs = (e[:, 1] / (e[:, 0] + e[:, 1]))
-    else:
-        probs = 1 / (1 + np.exp(-logits.reshape(-1)))
-    y_true = np.array([int(r.get("label", 0)) for r in ds.rows], dtype=int)
-    return y_true, probs.astype(float), ds.rows
+    use_cuda = (device_preference == "cuda") and torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    model = model.to(device)  # type: ignore[assignment]
+    model.eval()
+    if use_cuda:
+        try:
+            gcount = torch.cuda.device_count()
+            gnames = [torch.cuda.get_device_name(i) for i in range(gcount)]
+            print(f"[INFO] Report preds using CUDA (gpus={gcount}): {gnames}")
+        except Exception:
+            print("[INFO] Report preds using CUDA")
+
+    y_list: List[int] = []
+    p_list: List[float] = []
+    rows_min: List[Dict[str, Any]] = []
+    batch_html: List[str] = []
+    batch_ids: List[Any] = []
+    batch_labels: List[int] = []
+    batch_urls: List[str | None] = []
+    bs = max(1, int(per_device_eval_batch_size))
+
+    def flush_batch():
+        nonlocal batch_html, batch_ids, batch_labels, batch_urls
+        if not batch_html:
+            return
+        with torch.no_grad():
+            enc = processor(html_strings=batch_html, truncation=True, max_length=max_length, return_tensors="pt", padding=True)
+            enc = {k: v.to(device) for k, v in enc.items()}
+            out = model(**enc)
+            logits = out.logits.detach().cpu().numpy()
+        if logits.ndim == 2 and logits.shape[1] == 2:
+            m = np.max(logits, axis=1, keepdims=True)
+            e = np.exp(logits - m)
+            p1 = (e[:, 1] / (e[:, 0] + e[:, 1]))
+        else:
+            p1 = 1 / (1 + np.exp(-logits.reshape(-1)))
+        y_list.extend(batch_labels)
+        p_list.extend(p1.tolist())
+        # Keep minimal row info to reduce memory
+        for rid, lab, url in zip(batch_ids, batch_labels, batch_urls):
+            rows_min.append({"id": rid, "label": int(lab), "url": url})
+        batch_html = []
+        batch_ids = []
+        batch_labels = []
+        batch_urls = []
+
+    # Progress bar over streaming iterator
+    try:
+        from tqdm import tqdm  # type: ignore
+        it = tqdm(iter_jsonl(jsonl_path), desc=f"predict {os.path.basename(jsonl_path)}", unit="rec")
+    except Exception:
+        it = iter_jsonl(jsonl_path)
+
+    for r in it:
+        html = r.get("html") or ""
+        if not html:
+            continue
+        batch_html.append(html)
+        batch_ids.append(r.get("id"))
+        try:
+            batch_labels.append(int(r.get("label", 0)))
+        except Exception:
+            batch_labels.append(0)
+        batch_urls.append(r.get("url"))
+        if len(batch_html) >= bs:
+            flush_batch()
+    # flush tail
+    flush_batch()
+
+    y_true = np.array(y_list, dtype=int)
+    probs = np.array(p_list, dtype=float)
+    return y_true, probs, rows_min
 
 
 def plot_curves(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
@@ -1176,6 +1234,8 @@ def main():
     parser.add_argument("--xai-num-samples", type=int, default=200, help="Perturbation samples for LIME/SHAP (smaller is faster)")
     parser.add_argument("--xai-background", type=int, default=3, help="Background size for SHAP KernelExplainer")
     parser.add_argument("--xai-tokenizer", choices=["whitespace", "model"], default="whitespace", help="Tokenization used for rendering explanations")
+    parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda", help="Device for prediction during reporting (DOM/JS)")
+    parser.add_argument("--eval-batch", type=int, default=4, help="Per-device eval batch size for reporting")
     args = parser.parse_args()
 
     ensure_deps()
@@ -1196,9 +1256,9 @@ def main():
             pass
 
     # Predictions (DOM)
-    y_tr, p_tr, rows_tr = load_preds(args.model_dir, args.train_jsonl, args.max_length)
-    y_va, p_va, rows_va = load_preds(args.model_dir, args.val_jsonl, args.max_length)
-    y_te, p_te, rows_te = load_preds(args.model_dir, args.test_jsonl, args.max_length)
+    y_tr, p_tr, rows_tr = load_preds(args.model_dir, args.train_jsonl, args.max_length, args.device, args.eval_batch)
+    y_va, p_va, rows_va = load_preds(args.model_dir, args.val_jsonl, args.max_length, args.device, args.eval_batch)
+    y_te, p_te, rows_te = load_preds(args.model_dir, args.test_jsonl, args.max_length, args.device, args.eval_batch)
 
     # Load JS preds if available (compute if missing)
     def read_preds(path: str):
@@ -1224,7 +1284,7 @@ def main():
         # Load dataset
         from phisdom.data.js import JsonlJsDataset
         ds = JsonlJsDataset(jsonl_path)
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
         enc = enc.to(device)  # type: ignore[assignment]
         enc.eval()
         # Load classifier head
@@ -1623,6 +1683,25 @@ def main():
                 f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>"
             )
 
+        # Tests overview (import dynamically)
+        tests_html = ""
+        try:
+            from tests import test_metrics as _tm  # type: ignore
+            from tests import test_calibration as _tc  # type: ignore
+            from tests import test_normalize as _tn  # type: ignore
+            tests_html = (
+                "<div class='card'><h3>Test suites</h3>"
+                "<ul>"
+                "<li><b>metrics</b>: roc_auc, pr_auc, fpr_at_tpr (sanity checks)</li>"
+                "<li><b>calibration</b>: TemperatureScaler reduces log-loss on synthetic data</li>"
+                "<li><b>normalize</b>: DOM normalization and script extraction behaviors</li>"
+                "</ul>"
+                "<div class='mono' style='opacity:.8'>Run: pytest -q (5 tests should pass)</div>"
+                "</div>"
+            )
+        except Exception:
+            tests_html = ""
+
         html = [
             "<html><head><meta charset='utf-8'><title>PhisDOM Report</title>",
             "<style>",
@@ -1644,6 +1723,7 @@ def main():
             f"<div style='margin-left:auto' class='mono'>{args.model_dir}</div></div>",
             "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#metrics'>Metrics</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
             "<div class='wrap'>",
+            "<div class='section'><p class='mono' style='opacity:.85'>This report summarizes training/evaluation of the DOM model (MarkupLM) and optionally JS (CodeT5+) and fused heads. It includes PR/ROC curves, reliability, confusion matrices at calibrated thresholds, and optional LIME/SHAP explanations. Below are dataset counts and calibration snapshots, followed by detailed metrics tables and plots. The Tests section summarizes unit tests included in this repo.</p></div>",
             "<div id='dataset' class='section'><h2 style='margin:0 0 8px 0'>Dataset summary</h2>",
             f"<div class='subgrid'><div class='card'><b>Train</b><div>{tr_tot} docs</div><div>benign: {tr_neg}</div><div>phish: {tr_pos}</div></div>",
             f"<div class='card'><b>Val</b><div>{va_tot} docs</div><div>benign: {va_neg}</div><div>phish: {va_pos}</div></div>",
@@ -1657,6 +1737,7 @@ def main():
             metrics_table("JS", metrics_json.get("js") if metrics_json else None),
             metrics_table("Fused", metrics_json.get("fused") if metrics_json else None),
             "</div>",
+            "<div id='tests' class='section'><h2 style='margin:0 0 8px 0'>Tests overview</h2>", tests_html, "</div>",
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
         ]
 

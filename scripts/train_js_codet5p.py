@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List, cast
 
 import torch
 from torch import nn
@@ -14,6 +14,8 @@ from transformers import (
     TrainingArguments,
     set_seed,
 )
+from transformers.trainer_callback import TrainerCallback, EarlyStoppingCallback
+from torch.utils.data import Dataset as TorchDataset
 
 from phisdom.data.js import JsonlJsDataset
 from phisdom.metrics import pr_auc as pr_auc_fn, roc_auc as roc_auc_fn
@@ -45,6 +47,27 @@ class T5EncoderClassifier(nn.Module):
         return {"loss": loss, "logits": logits}
 
 
+class EpochProgressCallback(TrainerCallback):
+    def __init__(self, total_epochs: float):
+        super().__init__()
+        self.total_epochs = total_epochs
+
+    def on_epoch_begin(self, args, state, control, **kwargs):  # type: ignore[override]
+        try:
+            cur = int(state.epoch) + 1 if state.epoch is not None else 1
+        except Exception:
+            cur = 1
+        print(f"[EPOCH] {cur}/{int(self.total_epochs)} ")
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
+        if not metrics:
+            return
+        best = state.best_metric if state.best_metric is not None else float('nan')
+        metric = metrics.get("eval_pr_auc") or metrics.get("pr_auc")
+        if metric is not None:
+            print(f"[EPOCH] eval pr_auc={metric:.4f} | best={best}")
+
+
 def compute_metrics(eval_pred):
     import numpy as np
     logits, labels = eval_pred
@@ -72,6 +95,9 @@ def main():
     parser.add_argument("--num-epochs", type=float, default=1.0)
     parser.add_argument("--lr", type=float, default=3e-5)
     parser.add_argument("--seed", type=int, default=None, help="Seed for reproducibility; default is random")
+    parser.add_argument("--early-stopping-patience", type=int, default=3)
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0)
+    parser.add_argument("--disable-tqdm", action="store_true")
     args = parser.parse_args()
 
     if args.seed is not None:
@@ -115,8 +141,8 @@ def main():
         num_train_epochs=args.num_epochs,
         eval_strategy="epoch",
         save_strategy="epoch",
-    save_safetensors=False,
-    save_total_limit=1,
+        save_safetensors=False,
+        save_total_limit=1,
         logging_steps=50,
         load_best_model_at_end=True,
         metric_for_best_model="pr_auc",
@@ -124,15 +150,21 @@ def main():
         fp16=fp16_ok and not bf16_ok,
         bf16=bf16_ok,
         remove_unused_columns=False,
+        disable_tqdm=bool(args.disable_tqdm),
     )
+
+    callbacks: List[TrainerCallback] = [EpochProgressCallback(total_epochs=args.num_epochs)]
+    if int(args.early_stopping_patience) > 0:
+        callbacks.append(EarlyStoppingCallback(early_stopping_patience=int(args.early_stopping_patience), early_stopping_threshold=float(args.early_stopping_min_delta)))
 
     trainer = Trainer(
         model=model,
         args=targs,
-        train_dataset=train_ds,
-        eval_dataset=val_ds,
+    train_dataset=cast(TorchDataset, train_ds),
+    eval_dataset=cast(TorchDataset, val_ds),
         data_collator=tok_batch,
         compute_metrics=compute_metrics,
+        callbacks=callbacks,
     )
 
     trainer.train()
