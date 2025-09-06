@@ -70,6 +70,7 @@ def main():
     ap.add_argument("--val-jsonl", required=True)
     ap.add_argument("--test-jsonl", required=True)
     ap.add_argument("--batch-size", type=int, default=64)
+    ap.add_argument("--train-jsonl", default=None, help="Optional: also dump preds_train.jsonl for this split")
     args = ap.parse_args()
 
     os.makedirs(args.model_dir, exist_ok=True)
@@ -120,6 +121,7 @@ def main():
         get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
     else:
         from phisdom.data.new_heads import CheapFeaturesDataset, CheapFeaturesCollator
+        from phisdom.data.cheap_features import CHEAP_FEATURES
         from phisdom.models.heads import CheapMLP
         tr_ds = CheapFeaturesDataset(args.val_jsonl)
         va_ds = CheapFeaturesDataset(args.val_jsonl)
@@ -127,8 +129,7 @@ def main():
         coll = CheapFeaturesCollator()
         va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
-        model = CheapMLP(in_dim=va_dl.dataset[0]["features"].shape[-1] if len(va_dl.dataset) else 128).to(device)  # type: ignore[index]
-        eval_fn = lambda m, dl, dev: eval_logits_graph(m, dl, dev)  # placeholder; will override below
+        model = CheapMLP(in_dim=len(CHEAP_FEATURES)).to(device)
         # redefine eval_fn for MLP
         @torch.no_grad()
         def eval_logits_mlp(model, loader, device):
@@ -190,6 +191,54 @@ def main():
     ids_test = get_ids(te_ds)
     save_preds(os.path.join(args.model_dir, "preds_val.jsonl"), ids_val, val_labels, p_val)
     save_preds(os.path.join(args.model_dir, "preds_test.jsonl"), ids_test, test_labels, p_test)
+
+    # Optional: compute and save train preds
+    if args.train_jsonl:
+        # Build train loader matching head type
+        if args.head == "url":
+            tr_ds = UrlSeqDataset(args.train_jsonl)
+            tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
+            tr_eval = eval_logits_seq
+            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+        elif args.head == "js":
+            tr_ds = JsSeqDataset(args.train_jsonl)
+            tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
+            tr_eval = eval_logits_seq
+            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+        elif args.head == "dom":
+            tr_ds = DomGraphDataset(args.train_jsonl)
+            tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=DomGraphCollator())  # type: ignore[arg-type]
+            tr_eval = eval_logits_graph
+            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+        elif args.head == "text":
+            from phisdom.data.new_heads import TextSeqDataset
+            tr_ds = TextSeqDataset(args.train_jsonl)
+            tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
+            tr_eval = eval_logits_seq
+            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+        else:
+            from phisdom.data.new_heads import CheapFeaturesDataset, CheapFeaturesCollator
+            tr_ds = CheapFeaturesDataset(args.train_jsonl)
+            tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=CheapFeaturesCollator())  # type: ignore[arg-type]
+            @torch.no_grad()
+            def tr_eval(model, loader, device):
+                model.eval()
+                logits_list: List[torch.Tensor] = []
+                labels_list: List[torch.Tensor] = []
+                for batch in loader:
+                    x = batch["features"].to(device)
+                    y = batch["labels"].to(device)
+                    logits = model(x)
+                    logits_list.append(logits.detach().cpu())
+                    labels_list.append(y.detach().cpu())
+                if not logits_list:
+                    return torch.empty((0,)), torch.empty((0,), dtype=torch.long)
+                return torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
+            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+        tr_logits, tr_labels_t = tr_eval(model, tr_dl, device)
+        with torch.no_grad():
+            p_train = torch.sigmoid(tr_logits / torch.exp(ts.log_T)).numpy() if tr_logits.numel() else np.zeros((0,), dtype=float)
+        save_preds(os.path.join(args.model_dir, "preds_train.jsonl"), tr_ids, tr_labels_t.numpy().astype(int) if tr_labels_t.numel() else np.zeros((0,), dtype=int), p_train)
 
     # Save calibration/metrics
     cal = {

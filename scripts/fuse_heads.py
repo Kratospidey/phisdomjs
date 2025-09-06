@@ -68,6 +68,8 @@ def main():
     ap.add_argument("--js-dir", default="artifacts/js_codet5p")
     ap.add_argument("--url-dir", default="artifacts/url_head")
     ap.add_argument("--dom-light-dir", default="artifacts/dom_gcn")
+    ap.add_argument("--text-dir", default="artifacts/text_head")
+    ap.add_argument("--cheap-mlp-dir", default="artifacts/cheap_mlp")
     ap.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     ap.add_argument("--test-jsonl", default="data/pages_test.jsonl")
     ap.add_argument("--out-dir", default="artifacts/fusion")
@@ -92,6 +94,8 @@ def main():
         "p_js": args.js_dir,
         "p_url": args.url_dir,
         "p_dom_light": args.dom_light_dir,
+        "p_text": args.text_dir,
+        "p_cheap": args.cheap_mlp_dir,
     }.items():
         if os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl")):
             heads[name] = d

@@ -33,6 +33,7 @@ XAI_DEVICE ?= cuda
 ES_PATIENCE ?= 3
 ES_MIN_DELTA ?= 0.0
 DISABLE_TQDM ?= 0
+SMOKE ?= 0
 
 # Ensure env for PhishTank
 # export PHISHTANK_APP_KEY=your_key
@@ -95,7 +96,7 @@ eval:
 
 .PHONY: train-js eval-js
 train-js:
-	$(PY) scripts/train_js_codet5p.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_codet5p --model-name Salesforce/codet5p-220m --max-length 512 --batch-size 4 --num-epochs 1 --lr 3e-5 \
+	$(PY) scripts/train_js_codet5p.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_codet5p --model-name Salesforce/codet5p-220m --max-length 512 --batch-size $(if $(filter $(SMOKE),1),2,4) --num-epochs $(if $(filter $(SMOKE),1),1,1) --lr 3e-5 \
 		$(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) \
 		--early-stopping-patience $(ES_PATIENCE) --early-stopping-min-delta $(ES_MIN_DELTA)
 
@@ -105,25 +106,29 @@ eval-js:
 # Lightweight heads (URL/JS CharCNN and DOM GCN)
 .PHONY: train-url-head train-js-head train-dom-gcn
 train-url-head:
-	$(PY) scripts/train_url_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/url_head --batch-size 64 --epochs 3 --lr 1e-3 --weight-decay 1e-4
+	$(PY) scripts/train_url_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/url_head --batch-size $(if $(filter $(SMOKE),1),32,64) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4
 
 train-js-head:
-	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size 32 --epochs 3 --lr 1e-3 --weight-decay 1e-4
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4
 
 train-dom-gcn:
-	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size 16 --epochs 3 --lr 2e-3 --weight-decay 1e-4
+	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size $(if $(filter $(SMOKE),1),8,16) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 2e-3 --weight-decay 1e-4
 
 # Phase 3: Text and Cheap-feature heads
 .PHONY: train-text-head train-cheap-mlp
 train-text-head:
-	$(PY) scripts/train_text_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/text_head --batch-size 32 --epochs 3 --lr 1e-3 --weight-decay 1e-4 --max-len 1024
+	$(PY) scripts/train_text_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/text_head --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --max-len $(if $(filter $(SMOKE),1),512,1024)
 
 train-cheap-mlp:
-	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size 128 --epochs 5 --lr 2e-3 --weight-decay 1e-4 --hidden 128
+	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size $(if $(filter $(SMOKE),1),64,128) --epochs $(if $(filter $(SMOKE),1),2,5) --lr 2e-3 --weight-decay 1e-4 --hidden 128
 
 .PHONY: fuse
 fuse:
-	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
+	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
+# Run cascade after fusion
+.PHONY: cascade
+cascade:
+	$(PY) scripts/cascade.py --url-dir artifacts/url_head --cheap-dir artifacts/cheap_mlp --fusion-dir artifacts/fusion --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/cascade --target-precision 0.99 --target-benign-precision 0.995
 
 .PHONY: report
 report:
@@ -165,13 +170,13 @@ plot-heads:
 
 # End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
 ifeq ($(CRAWL),false)
-all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+all e2e: feeds unify crawl-verify splits slice phase4
 else ifeq ($(CRAWL),0)
-all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+all e2e: feeds unify crawl-verify splits slice phase4
 else ifeq ($(CRAWL),no)
-all e2e: feeds unify crawl-verify splits slice train eval report train-js eval-js fuse report report-xai
+all e2e: feeds unify crawl-verify splits slice phase4
 else
-all e2e: feeds unify crawl auto-backfill splits slice auto-backfill train eval report train-js eval-js fuse report report-xai
+all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4
 endif
 
 .PHONY: crawl-verify
@@ -190,6 +195,7 @@ resume: splits slice train eval
 clean:
 	rm -f data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl data/splits.json
 	rm -rf artifacts/markup_run
+	rm -rf artifacts/url_head artifacts/js_charcnn artifacts/dom_gcn artifacts/text_head artifacts/cheap_mlp artifacts/fusion
 
 # Quick smoke crawl of first 5 URLs to verify new fields populate
 .PHONY: smoke
@@ -207,3 +213,7 @@ backfill:
 auto-backfill:
 	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK))"
 	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT)
+
+# Phase 4 end-to-end: train/eval all heads, fuse, plot, report
+.PHONY: phase4
+phase4: train eval report train-js eval-js train-url-head eval-url-head train-js-head eval-js-head train-dom-gcn eval-dom-gcn train-text-head eval-text-head train-cheap-mlp eval-cheap-mlp fuse cascade report report-xai plot-heads
