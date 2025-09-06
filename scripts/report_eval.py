@@ -119,6 +119,18 @@ def _inject_link_into_html(file_path: str, url: str | None, extra_html: str = ""
         pass
 
 
+def _safe_float(x: Any, default: float = float("nan")) -> float:
+    """Best-effort float conversion that tolerates None/unknowns.
+    Returns `default` (NaN by default) on failure.
+    """
+    if x is None:
+        return default
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
 def _base_expl_css() -> str:
     return (
         "<style>"
@@ -1547,8 +1559,30 @@ def main():
                 "test@tpr90": metrics_for(y_te_fu, p_te_fu, thr_90),
             }
 
+    # Write enriched summary including light heads and cascade (if present)
+    def _safe_load_json(p: str):
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    light_dirs = {
+        "url": "artifacts/url_head",
+        "js_charcnn": "artifacts/js_charcnn",
+        "js_charcnn_aug": "artifacts/js_charcnn_aug",
+        "dom_light": "artifacts/dom_gcn",
+        "text": "artifacts/text_head",
+        "cheap": "artifacts/cheap_mlp",
+    }
+    light_cal: Dict[str, Any] = {}
+    for name, d in light_dirs.items():
+        cal = _safe_load_json(os.path.join(d, "calibration_eval.json"))
+        if cal:
+            light_cal[name] = cal
+    cascade_json = _safe_load_json(os.path.join("artifacts/cascade", "cascade.json"))
+    summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json}
     with open(os.path.join(report_dir, "summary.json"), "w", encoding="utf-8") as f:
-        json.dump(metrics_summary, f, indent=2)
+        json.dump(summary_bundle, f, indent=2)
 
     # Interpretability samples
     if args.lime or args.shap:
@@ -1626,6 +1660,13 @@ def main():
             except Exception:
                 return None
 
+        # Safe float formatter for HTML (avoids formatting None)
+        def fmt4(x) -> str:
+            try:
+                return f"{float(x):.4f}"
+            except Exception:
+                return "n/a"
+
         dom_cal = safe_load(os.path.join(args.model_dir, "calibration.json"))
         js_cal = safe_load(os.path.join(args.js_dir, "calibration.json"))
         fu_cal = safe_load(os.path.join(args.fusion_dir, "calibration.json"))
@@ -1653,15 +1694,16 @@ def main():
         def metric_block(title, cal):
             if not cal:
                 return f"<h3>{title}</h3><p>No calibration found.</p>"
-            pr = cal.get("metrics", {}).get("pr_auc")
-            roc = cal.get("metrics", {}).get("roc_auc")
-            thr = cal.get("thresholds", {})
+            pr = (cal.get("metrics", {}) or {}).get("pr_auc")
+            roc = (cal.get("metrics", {}) or {}).get("roc_auc")
+            thr = cal.get("thresholds", {}) or {}
             rows = "".join(
-                f"<tr><td>{k}</td><td>{v.get('threshold')}</td><td>{v.get('fpr')}</td></tr>" for k, v in thr.items()
+                f"<tr><td>{k}</td><td>{fmt4((v or {}).get('threshold'))}</td><td>{fmt4((v or {}).get('fpr'))}</td></tr>"
+                for k, v in thr.items()
             )
             return (
                 f"<h3>{title}</h3>"
-                f"<p>PR-AUC: {pr:.4f} | ROC-AUC: {roc:.4f}</p>"
+                f"<p>PR-AUC: {fmt4(pr)} | ROC-AUC: {fmt4(roc)}</p>"
                 f"<table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody>{rows}</tbody></table>"
             )
 
@@ -1669,13 +1711,12 @@ def main():
         def metrics_table(title: str, section: Dict[str, Any] | None):
             if not section:
                 return f"<div class='card'><h3>{title}</h3><p>No metrics.</p></div>"
-            # Rows: split@thr, then columns of metrics
             keys = sorted(section.keys())
             cols = ["accuracy","precision","recall","f1","log_loss","roc_auc","pr_auc"]
             rows_html = []
             for k in keys:
-                m = section[k]
-                cells = "".join(f"<td class='mono' style='text-align:right'>{m.get(c, float('nan')):.4f}</td>" for c in cols)
+                m = section.get(k, {}) or {}
+                cells = "".join(f"<td class='mono' style='text-align:right'>{fmt4(m.get(c))}</td>" for c in cols)
                 rows_html.append(f"<tr><td class='mono'>{k}</td>{cells}</tr>")
             head = "".join(f"<th>{c}</th>" for c in ["split@thr"]+cols)
             return (
@@ -1731,11 +1772,21 @@ def main():
             "<div id='cal' class='section'><h2 style='margin:0 0 8px 0'>Calibration & Metrics</h2>",
             f"<div class='grid'><div class='card'>{metric_block('DOM (MarkupLM)', dom_cal)}</div>",
             f"<div class='card'>{metric_block('JS (CodeT5+)', js_cal)}</div>",
-            f"<div class='card'>{metric_block('Fused (DOM+JS)', fu_cal)}</div></div></div>",
+            f"<div class='card'>{metric_block('Fused (DOM+JS)', fu_cal)}</div>",
+            # Include light heads if present
+            (lambda light: ''.join([
+                f"<div class='card'>{metric_block('URL CharCNN', light.get('url'))}</div>",
+                f"<div class='card'>{metric_block('DOM GCN (light)', light.get('dom_light'))}</div>",
+                f"<div class='card'>{metric_block('Text CharCNN', light.get('text'))}</div>",
+                f"<div class='card'>{metric_block('Cheap MLP', light.get('cheap'))}</div>",
+                f"<div class='card'>{metric_block('JS CharCNN (base)', light.get('js_charcnn'))}</div>",
+                f"<div class='card'>{metric_block('JS CharCNN (aug)', light.get('js_charcnn_aug'))}</div>",
+            ]) if isinstance(light, dict) else '')((metrics_json or {}).get('light_heads')),
+            "</div></div>",
             "<div id='metrics' class='section'><h2 style='margin:0 0 8px 0'>ML Metrics</h2>",
-            metrics_table("DOM", metrics_json.get("dom") if metrics_json else None),
-            metrics_table("JS", metrics_json.get("js") if metrics_json else None),
-            metrics_table("Fused", metrics_json.get("fused") if metrics_json else None),
+            metrics_table("DOM", (metrics_json or {}).get("core", {}).get("dom")),
+            metrics_table("JS", (metrics_json or {}).get("core", {}).get("js")),
+            metrics_table("Fused", (metrics_json or {}).get("core", {}).get("fused")),
             "</div>",
             "<div id='tests' class='section'><h2 style='margin:0 0 8px 0'>Tests overview</h2>", tests_html, "</div>",
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
@@ -1782,6 +1833,52 @@ def main():
                     html.append(f"<li><a href='shap_js/{f}' target='_blank'>{f}</a>{url_html}</li>")
                 html.append("</ul></div>")
             html.append("</div></div>")
+
+        # Cascade coverage (if available)
+        cas = (metrics_json or {}).get('cascade')
+        if cas and isinstance(cas, dict):
+            cov = cas.get('coverage', {}) or {}
+            s1 = cas.get('stage1', {}) or {}
+            rows_cov = []
+            for split in ['val','test']:
+                c = cov.get(split, {}) or {}
+                try:
+                    rows_cov.append(f"<tr><td class='mono'>{split}</td><td class='mono' style='text-align:right'>{float(c.get('overall', float('nan'))):.3f}</td><td class='mono' style='text-align:right'>{float(c.get('phish', float('nan'))):.3f}</td><td class='mono' style='text-align:right'>{float(c.get('benign', float('nan'))):.3f}</td></tr>")
+                except Exception:
+                    continue
+            html.append("<div id='cascade' class='section'><h2 style='margin:0 0 8px 0'>Cascade Coverage</h2><div class='card'>")
+            html.append("<table><thead><tr><th>split</th><th>overall</th><th>phish</th><th>benign</th></tr></thead><tbody>"+"".join(rows_cov)+"</tbody></table>")
+            try:
+                html.append(f"<div class='mono' style='opacity:.85'>stage1 thr_hi={float(s1.get('thr_hi', float('nan'))):.4f}, thr_lo={float(s1.get('thr_lo', float('nan'))):.4f}</div>")
+            except Exception:
+                pass
+            html.append("</div></div>")
+
+        # Robustness delta card: JS base vs augmented (if both present)
+        def _rob_card(light):
+            if not isinstance(light, dict):
+                return ""
+            base = light.get('js_charcnn') or {}
+            aug = light.get('js_charcnn_aug') or {}
+            pr_b = _safe_float((base.get('metrics') or {}).get('pr_auc'))
+            pr_a = _safe_float((aug.get('metrics') or {}).get('pr_auc'))
+            roc_b = _safe_float((base.get('metrics') or {}).get('roc_auc'))
+            roc_a = _safe_float((aug.get('metrics') or {}).get('roc_auc'))
+            # If any metric is missing/unparseable, skip the card (preserve prior behavior)
+            if any(np.isnan(v) for v in (pr_b, pr_a, roc_b, roc_a)):
+                return ""
+            d_pr = pr_a - pr_b
+            d_roc = roc_a - roc_b
+            sign = lambda v: "+" if v >= 0 else ""
+            return (
+                "<div id='robust' class='section'><h2 style='margin:0 0 8px 0'>Robustness: JS Augmentation</h2>"
+                "<div class='grid'><div class='card'>"
+                f"<h3>JS CharCNN (aug vs base)</h3>"
+                f"<div class='mono'>PR-AUC: {pr_b:.4f} → {pr_a:.4f} (<b>{sign(d_pr)}{d_pr:.4f}</b>)</div>"
+                f"<div class='mono'>ROC-AUC: {roc_b:.4f} → {roc_a:.4f} (<b>{sign(d_roc)}{d_roc:.4f}</b>)</div>"
+                "</div></div></div>"
+            )
+        html.append(_rob_card((metrics_json or {}).get('light_heads')))
 
         html.append("</div></body></html>")
         with open(os.path.join(report_dir, "index.html"), "w", encoding="utf-8") as f:

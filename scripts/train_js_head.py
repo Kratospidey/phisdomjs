@@ -64,6 +64,8 @@ def main():
     ap.add_argument("--dropout", type=float, default=0.15)
     # Phase 6: allow training from raw augmented text when js_charseq missing
     ap.add_argument("--raw-field", type=str, default=None, help="Optional raw JS text field to encode on-the-fly (e.g., js_augmented)")
+    ap.add_argument("--mix-aug", action="store_true", help="If set, mix original and augmented examples during training (requires --raw-field and augmented train file)")
+    ap.add_argument("--aug-jsonl", type=str, default="data/pages_train_aug.jsonl", help="Path to augmented training JSONL when using --mix-aug")
     ap.add_argument("--max-len", type=int, default=None)
     args = ap.parse_args()
 
@@ -71,7 +73,23 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tr_ds = JsSeqDataset(args.train_jsonl, raw_field=args.raw_field)
+    tr_primary = JsSeqDataset(args.train_jsonl, raw_field=None if args.mix_aug else args.raw_field)
+    if args.mix_aug:
+        # For augmented set, prefer raw_field (augmented) encoding
+        tr_aug = JsSeqDataset(args.aug_jsonl, raw_field=args.raw_field)
+        # Simple concatenation dataset
+        class _Concat:
+            def __init__(self, a, b):
+                self.a, self.b = a, b
+                self._len_a = len(a)
+                self._len_b = len(b)
+            def __len__(self):
+                return self._len_a + self._len_b
+            def __getitem__(self, i):
+                return self.a[i] if i < self._len_a else self.b[i - self._len_a]
+        tr_ds = _Concat(tr_primary, tr_aug)
+    else:
+        tr_ds = tr_primary
     va_ds = JsSeqDataset(args.val_jsonl, raw_field=args.raw_field)
     coll = PaddedSeqCollator(pad_idx=0, max_len=args.max_len)
     tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll)  # type: ignore[arg-type]

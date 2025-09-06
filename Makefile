@@ -19,6 +19,8 @@ MOBILE_PROFILE ?= false
 GPU ?= false
 # Backfill network lookups toggle (1=true/0=false)
 BACKFILL_NETWORK ?= 1
+# Phase 6 (augmentation) toggle (1=true/0=false)
+AUGMENT_JS ?= 0
 # Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
 CRAWL ?= true
 # Final dataset path used for splits/slice (feeds-only workflow)
@@ -153,6 +155,10 @@ eval-url-head:
 eval-js-head:
 	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
 
+# Phase 6 (optional): JS augmentation and augmented head
+.PHONY: phase6
+phase6: augment-js train-js-head-aug eval-js-head-aug report
+
 # Phase 6: JS augmentation and optional retraining using augmented field
 .PHONY: augment-js train-js-head-aug eval-js-head-aug
 augment-js:
@@ -187,7 +193,7 @@ all e2e: feeds unify crawl-verify splits slice phase4
 else ifeq ($(CRAWL),no)
 all e2e: feeds unify crawl-verify splits slice phase4
 else
-all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4
+all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4 $(if $(filter $(AUGMENT_JS),1),phase6,)
 endif
 
 .PHONY: crawl-verify
