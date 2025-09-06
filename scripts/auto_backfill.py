@@ -24,11 +24,14 @@ def needs_backfill(path: Path) -> bool:
                     continue
                 keys = obj.keys()
                 markers = [
+                    # legacy compact fields
                     "host_hyphens", "has_punycode",
                     "form_fp_hash64", "num_pw", "form_css_sig_hash64",
                     "js_eval_like", "key_listeners_total",
                     "favicon_dhash64", "logo_phash64",
                     "title_host_jaccard_q8",
+                    # Phase 1 additions
+                    "url_charseq", "js_charseq", "dom_graph", "text_title", "text_visible",
                 ]
                 return not any(k in keys for k in markers)
     except Exception:

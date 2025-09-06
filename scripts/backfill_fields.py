@@ -16,6 +16,13 @@ import requests
 import ssl
 import socket
 import dns.resolver  # type: ignore
+from phisdom.features import (
+    extract_url_charseq,
+    extract_js_charseq,
+    extract_dom_graph,
+    extract_text_title,
+    extract_text_visible,
+)
 
 try:
     # Optional: richer TLS parsing for SPKI hash
@@ -558,6 +565,13 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
             r.setdefault(k, v)
         # Basic: set url_final if missing
         r.setdefault("url_final", final_url)
+        # Phase 1: raw url and char sequence
+        r.setdefault("url_raw", r.get("url") or final_url)
+        try:
+            if "url_charseq" not in r:
+                r["url_charseq"] = extract_url_charseq(final_url)
+        except Exception:
+            pass
         # Title-host overlap
         if "title_host_jaccard_q8" not in r and isinstance(r.get("html"), str):
             tj = title_host_jaccard_q8(r.get("html") or "", final_url)
@@ -582,7 +596,7 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
                 for k, v in ti.items():
                     if v is not None:
                         r.setdefault(k, v)
-        # Redirect sketch best-effort
+    # Redirect sketch best-effort
         try:
             html = r.get("html") or ""
             # meta refresh
@@ -623,6 +637,14 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
     html = r.get("html") or ""
     etld1 = str(r.get("etld1") or "")
     if isinstance(html, str):
+        # Phase 1: text fields and DOM graph
+        try:
+            r.setdefault("text_title", extract_text_title(html))
+            r.setdefault("text_visible", extract_text_visible(html))
+            if "dom_graph" not in r:
+                r["dom_graph"] = extract_dom_graph(html)
+        except Exception:
+            pass
         # Form
         f = form_semantics(html, etld1, urlparse(final_url).scheme if isinstance(final_url, str) else None)
         for k, v in f.items():
@@ -630,6 +652,13 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
                 r.setdefault(k, v)
         scripts = r.get("scripts") or []
         if isinstance(scripts, list):
+            # JS char sequence from concatenated code
+            try:
+                if "js_charseq" not in r:
+                    code = "\n".join(str(s.get("text") or "") for s in scripts)
+                    r["js_charseq"] = extract_js_charseq(code)
+            except Exception:
+                pass
             for k, v in js_heuristics(scripts).items():
                 if v is not None:
                     r.setdefault(k, v)

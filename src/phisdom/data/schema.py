@@ -151,6 +151,17 @@ class PageRecord:
     cloak_delta_domlen: Optional[int] = None
     cloak_profile_mismatch: Optional[bool] = None
 
+    # Phase 1 additive fields (storage-light)
+    # Raw/canonical text
+    url_raw: Optional[str] = None  # original URL string if available
+    text_title: Optional[str] = None  # <title> (capped)
+    text_visible: Optional[str] = None  # visible text (capped)
+    # Char-CNN sequences (compact int lists)
+    url_charseq: Optional[List[int]] = None  # URL indices (<=256)
+    js_charseq: Optional[List[int]] = None  # concatenated JS indices (<=2048)
+    # DOM graph compact representation
+    dom_graph: Optional[Dict[str, Any]] = None  # {n:int, nodes:[{t,c,d,x}], edges:[[i,j]]}
+
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
         # Drop None optional fields to keep storage light (top-level only)

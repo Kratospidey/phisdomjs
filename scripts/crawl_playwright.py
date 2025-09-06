@@ -20,6 +20,13 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import tldextract
 from phisdom.data.schema import PageRecord, ScriptItem, append_jsonl
+from phisdom.features import (
+    extract_url_charseq,
+    extract_js_charseq,
+    extract_dom_graph,
+    extract_text_title,
+    extract_text_visible,
+)
 from phisdom.data.normalize import normalize_dom, extract_scripts
 from bs4 import BeautifulSoup
 from bs4.element import Tag
@@ -428,6 +435,8 @@ def _tls_info_for_host(host: str, timeout: float = 3.0) -> Dict[str, Any]:
                 if x509 is not None and serialization is not None and ExtensionOID is not None:
                     try:
                         der = ssock.getpeercert(True)
+                        if not der:
+                            raise ValueError("no DER cert")
                         cert = x509.load_der_x509_certificate(der)
                         nb2 = cert.not_valid_before
                         if isinstance(nb2, datetime):
@@ -887,6 +896,12 @@ async def fetch_page(
     # URL & redirect chain
     final_url = main_response_url or url
     rec.url_final = final_url
+    # Phase 1: raw URL and URL char sequence
+    rec.url_raw = url
+    try:
+        rec.url_charseq = extract_url_charseq(final_url or url)
+    except Exception:
+        rec.url_charseq = None
     # Approximate redirect hops by counting document responses
     if document_resp_times:
         hops = max(0, len(document_resp_times) - 1)
@@ -1087,6 +1102,10 @@ async def fetch_page(
         title_toks = set([t for t in re.split(r"[^a-z0-9]+", (page_title or "").lower()) if t])
         j = (len(host_toks & title_toks) / float(max(1, len(host_toks | title_toks))))
         rec.title_host_jaccard_q8 = int(round(j * 255))
+        # Phase 1: text fields (title/visible) and DOM graph
+        rec.text_title = extract_text_title(norm_html)
+        rec.text_visible = extract_text_visible(norm_html)
+        rec.dom_graph = extract_dom_graph(norm_html)
     except Exception:
         pass
     try:
@@ -1099,6 +1118,11 @@ async def fetch_page(
         # has_js_loc_replace via combined JS code
         js_code = "\n".join([(s.text or "") for s in scripts])
         rec.has_js_loc_replace = bool(re.search(r"(?:window\.|document\.)?location\.replace\s*\(", js_code))
+        # Phase 1: JS char sequence from concatenated code (cap inside extractor)
+        try:
+            rec.js_charseq = extract_js_charseq(js_code)
+        except Exception:
+            rec.js_charseq = None
     except Exception:
         pass
 

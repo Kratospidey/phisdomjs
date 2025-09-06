@@ -1,3 +1,15 @@
+# Phase 1: Schema and Extractors (URL/JS char-CNN, DOM graph, Visible Text)
+
+This phase adds storage-light fields to `PageRecord` and deterministic extractors:
+
+- url_raw: original URL string
+- url_charseq: list[int] (<=256) URL character indices
+- js_charseq: list[int] (<=2048) JS character indices (concatenated)
+- text_title: capped `<title>`
+- text_visible: capped visible text (scripts/styles/hidden removed)
+- dom_graph: compact DOM tree graph `{n, nodes:[{t,c,d,x}], edges:[[i,j]]}`
+
+These are populated during crawl and via `scripts/backfill_fields.py` for existing JSONL.
 # End-to-end pipeline (feeds → seed → crawl → splits → train → eval)
 
 This repo provides an automated, leak-safe pipeline to build a phishing detection dataset and train a DOM transformer (MarkupLM) end-to-end.
