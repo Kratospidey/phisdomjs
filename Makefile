@@ -113,6 +113,14 @@ train-js-head:
 train-dom-gcn:
 	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size 16 --epochs 3 --lr 2e-3 --weight-decay 1e-4
 
+# Phase 3: Text and Cheap-feature heads
+.PHONY: train-text-head train-cheap-mlp
+train-text-head:
+	$(PY) scripts/train_text_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/text_head --batch-size 32 --epochs 3 --lr 1e-3 --weight-decay 1e-4 --max-len 1024
+
+train-cheap-mlp:
+	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size 128 --epochs 5 --lr 2e-3 --weight-decay 1e-4 --hidden 128
+
 .PHONY: fuse
 fuse:
 	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
@@ -131,6 +139,29 @@ report-xai:
 		--device cuda --eval-batch 4 \
 		--lime --shap --num-expl 1 \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3
+
+# Evaluate calibrated lightweight heads and generate preds jsonl
+.PHONY: eval-url-head eval-js-head eval-dom-gcn
+eval-url-head:
+	$(PY) scripts/eval_light_heads.py --head url --model-dir artifacts/url_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 128
+
+eval-js-head:
+	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+
+eval-dom-gcn:
+	$(PY) scripts/eval_light_heads.py --head dom --model-dir artifacts/dom_gcn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 32
+
+.PHONY: eval-text-head eval-cheap-mlp
+eval-text-head:
+	$(PY) scripts/eval_light_heads.py --head text --model-dir artifacts/text_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+
+eval-cheap-mlp:
+	$(PY) scripts/eval_light_heads.py --head cheap --model-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 256
+
+# Plot PR curves comparing individual heads and fused output
+.PHONY: plot-heads
+plot-heads:
+	$(PY) scripts/plot_eval_heads.py --url-dir artifacts/url_head --js-dir artifacts/js_charcnn --dom-dir artifacts/dom_gcn --fusion-dir artifacts/fusion --split test --out artifacts/fusion/heads_pr_curves.png
 
 # End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
 ifeq ($(CRAWL),false)

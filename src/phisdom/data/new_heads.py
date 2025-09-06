@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from phisdom.data.schema import load_jsonl
+from phisdom.data.cheap_features import row_to_features, CHEAP_FEATURES
 
 
 # ---- Datasets ----
@@ -151,3 +152,97 @@ class DomGraphCollator:
         ei = torch.tensor([edge_src, edge_dst], dtype=torch.long) if edge_src else torch.zeros((2, 0), dtype=torch.long)
         bidx = torch.tensor(batch_index, dtype=torch.long) if batch_index else torch.zeros((0,), dtype=torch.long)
         return {"ids": ids, "node_feats_raw": nf, "edge_index": ei, "batch_index": bidx, "labels": labels}
+
+
+# ---- Text dataset (title + visible) ----
+
+
+def _default_text_alphabet() -> Dict[str, int]:
+    # 0=PAD, 1=UNK; letters (case-sensitive), digits, space, basic punctuation
+    alphabet = {}
+    idx = 2
+    for ch in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 ":
+        alphabet[ch] = idx; idx += 1
+    for ch in "-_.:,;!?/'\"()[]{}@#%&*+=<>|\\\n\t":
+        if ch not in alphabet:
+            alphabet[ch] = idx; idx += 1
+    return alphabet
+
+
+_TEXT_ALPHA = _default_text_alphabet()
+
+
+def _encode_text_to_charseq(s: str, max_len: Optional[int] = None) -> List[int]:
+    if not isinstance(s, str):
+        s = ""
+    ids: List[int] = []
+    for ch in s:
+        ids.append(_TEXT_ALPHA.get(ch, 1))  # 1 = UNK
+        if max_len is not None and len(ids) >= max_len:
+            break
+    return ids
+
+
+@dataclass
+class TextSeqDataset:
+    path: str
+    title_field: str = "text_title"
+    visible_field: str = "text_visible"
+    label_field: str = "label"
+    id_field: str = "id"
+    max_len: Optional[int] = None
+
+    def __post_init__(self):
+        rows = load_jsonl(self.path)
+        self.rows: List[Dict[str, Any]] = rows
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        r = self.rows[idx]
+        title = r.get(self.title_field) or ""
+        visible = r.get(self.visible_field) or ""
+        # simple concat with separator
+        text = str(title) + "\n[SEP]\n" + str(visible)
+        seq = _encode_text_to_charseq(text, self.max_len)
+        return {
+            "id": r.get(self.id_field, str(idx)),
+            "seq": seq,
+            "label": int(r.get(self.label_field, 0)),
+        }
+
+
+# ---- Cheap features dataset ----
+
+
+@dataclass
+class CheapFeaturesDataset:
+    path: str
+    label_field: str = "label"
+    id_field: str = "id"
+
+    def __post_init__(self):
+        self.rows: List[Dict[str, Any]] = load_jsonl(self.path)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        r = self.rows[idx]
+        feats = row_to_features(r, use_features=True)
+        return {
+            "id": r.get(self.id_field, str(idx)),
+            "feats": feats,
+            "label": int(r.get(self.label_field, 0)),
+        }
+
+
+class CheapFeaturesCollator:
+    def __call__(self, batch: List[Dict[str, Any]]):
+        import torch
+        ids = [b["id"] for b in batch]
+        labels = torch.tensor([int(b.get("label", 0)) for b in batch], dtype=torch.long)
+        feats = [b.get("feats") or [0.0] * len(CHEAP_FEATURES) for b in batch]
+        X = torch.tensor(feats, dtype=torch.float32)
+        return {"ids": ids, "features": X, "labels": labels}

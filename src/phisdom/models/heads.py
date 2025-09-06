@@ -65,6 +65,42 @@ class JsCharCNN(nn.Module):
         return torch.sigmoid(logits)
 
 
+class TextCharCNN(nn.Module):
+    def __init__(self, vocab_size: int = 2 + 26 + 26 + 10 + 2 + 32, emb_dim: int = 64, out_dim: int = 128, dropout: float = 0.1, pad_idx: int = 0):
+        super().__init__()
+        # Reuse ConvBlock1D with a slightly larger vocab (letters+digits+space+punct)
+        self.block = ConvBlock1D(vocab_size=vocab_size, emb_dim=emb_dim, out_dim=out_dim, dropout=dropout, pad_idx=pad_idx)
+        self.cls = nn.Linear(out_dim, 1)
+
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None, return_logits: bool = True):
+        z = self.block(input_ids, attention_mask)
+        logits = self.cls(z).squeeze(-1)
+        if return_logits:
+            return logits
+        return torch.sigmoid(logits)
+
+
+class CheapMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int = 64, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+        )
+        self.cls = nn.Linear(hidden, 1)
+
+    def forward(self, x: torch.Tensor, return_logits: bool = True):
+        z = self.net(x)
+        logits = self.cls(z).squeeze(-1)
+        if return_logits:
+            return logits
+        return torch.sigmoid(logits)
+
+
 class GraphConv(nn.Module):
     def __init__(self, in_dim: int, out_dim: int):
         super().__init__()

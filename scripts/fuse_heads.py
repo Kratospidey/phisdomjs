@@ -8,6 +8,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 
 from phisdom.data.schema import load_jsonl
+from phisdom.data.cheap_features import CHEAP_FEATURES, row_to_features
 from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
 
 
@@ -26,77 +27,33 @@ def read_preds(path: str) -> Dict[str, float]:
     return m
 
 
-CHEAP_FEATURES: List[str] = [
-    # URL/redirect
-    "redirect_hops", "redirect_max_ms", "url_len", "num_dots", "num_pct", "has_at", "host_is_ip",
-    # New tiny lexicals
-    "host_hyphens", "has_punycode",
-    # Redirect sketch
-    "redir_hops", "redir_cross_host", "has_meta_refresh", "has_js_loc_replace",
-    # DNS/RDAP
-    "dns_created_days_ago", "dns_updated_days_ago", "ns_count", "mx_present", "ttl_min", "ttl_mean",
-    # New RDAP compact
-    "rdap_age_days", "rdap_registrar_hash64", "rdap_ns_count", "rdap_has_privacy",
-    # TLS
-    "cert_age_days", "san_count",
-    # New TLS compact
-    "tls_not_before_days", "tls_san_count", "tls_issuer_spki_hash64",
-    # Headers snapshot: skip string values; optionally presence as bools
-    # Request graph
-    "req_unique_etld1", "req_thirdparty_ratio", "req_counts_script", "req_counts_css", "req_counts_xhr", "req_counts_img",
-    # Form semantics
-    "form_pw_count", "form_cross_site", "form_login_tokens", "form_hidden_count", "form_autocomplete_off", "onsubmit_handlers",
-    # New compact form/action
-    "form_fp_hash64", "num_pw", "num_email", "num_hidden", "form_method_get", "action_cross_origin", "action_proto_mismatch", "iframe_login", "top_form_count", "iframe_form_count", "form_css_sig_hash64",
-    # JS heuristics
-    "js_entropy", "js_eval_ct", "js_atob_ct", "js_b64_blob_ct", "js_keylog_listeners",
-    # New micro-counters
-    "js_eval_like", "js_hex_ratio", "js_fromcharcode", "js_hi_entropy_ratio", "js_atob", "key_listener_pw", "key_listeners_total",
-    # Fingerprinting
-    "fp_canvas", "fp_webgl", "fp_audio", "fp_font_enum", "fp_webrtc",
-    # Visual-lite (skip raw hashes by default)
-    "favicon_dhash64", "fav_rel_count", "fav_cross_origin", "logo_phash64", "logo_from_alt_or_name",
-    # Title↔host
-    "title_host_jaccard_q8",
-]
-
-
 def _row_features(r: Dict[str, object], use_features: bool) -> List[float]:
-    feats: List[float] = []
-    if not use_features:
-        return feats
-    for name in CHEAP_FEATURES:
-        v = r.get(name)
-        if isinstance(v, bool):
-            feats.append(1.0 if v else 0.0)
-        elif v is None:
-            feats.append(0.0)
-        else:
-            try:
-                feats.append(float(str(v)))
-            except Exception:
-                feats.append(0.0)
-    return feats
+    return row_to_features(r, use_features)
 
 
-def align(dom_dir: str, js_dir: str, jsonl_path: str, use_features: bool) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    dom_preds = read_preds(os.path.join(dom_dir, f"preds_{os.path.splitext(os.path.basename(jsonl_path))[0].split('_')[-1]}.jsonl"))
-    js_preds = read_preds(os.path.join(js_dir, f"preds_{os.path.splitext(os.path.basename(jsonl_path))[0].split('_')[-1]}.jsonl"))
+def align(jsonl_path: str, use_features: bool, **head_dirs: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    # head_dirs: mapping from head name -> directory containing preds_{split}.jsonl
+    split = os.path.splitext(os.path.basename(jsonl_path))[0].split('_')[-1]
+    preds_by_head: Dict[str, Dict[str, float]] = {}
+    for name, d in head_dirs.items():
+        preds_by_head[name] = read_preds(os.path.join(d, f"preds_{split}.jsonl"))
     rows = load_jsonl(jsonl_path)
     xs: List[List[float]] = []
     ys: List[int] = []
     ids: List[str] = []
     for r in rows:
         id_ = str(r.get("id"))
-        if id_ in dom_preds and id_ in js_preds:
-            base = [dom_preds[id_], js_preds[id_]]
-            base.extend(_row_features(r, use_features))
-            xs.append(base)
-            ys.append(int(r.get("label", 0)))
-            ids.append(id_)
+        # Require presence across all provided heads
+        if not all(id_ in preds for preds in preds_by_head.values()):
+            continue
+        base = [preds_by_head[name][id_] for name in head_dirs.keys()]
+        base.extend(_row_features(r, use_features))
+        xs.append(base)
+        ys.append(int(r.get("label", 0)))
+        ids.append(id_)
     X = np.array(xs, dtype=float)
     y = np.array(ys, dtype=int)
-    return X, y, np.array(ids)
+    return X, y, np.array(ids), list(head_dirs.keys())
 
 
 def fuse_average(p_dom: np.ndarray, p_js: np.ndarray, w_dom: float = 0.5) -> np.ndarray:
@@ -105,9 +62,12 @@ def fuse_average(p_dom: np.ndarray, p_js: np.ndarray, w_dom: float = 0.5) -> np.
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Fuse DOM and JS heads into a single probability")
+    ap = argparse.ArgumentParser(description="Fuse one or more calibrated heads (DOM/JS/URL/light) and optional cheap features")
+    # Default to baselines; allow overriding with lightweight heads
     ap.add_argument("--dom-dir", default="artifacts/markup_run")
     ap.add_argument("--js-dir", default="artifacts/js_codet5p")
+    ap.add_argument("--url-dir", default="artifacts/url_head")
+    ap.add_argument("--dom-light-dir", default="artifacts/dom_gcn")
     ap.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     ap.add_argument("--test-jsonl", default="data/pages_test.jsonl")
     ap.add_argument("--out-dir", default="artifacts/fusion")
@@ -125,17 +85,29 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # Align data
-    Xv, yv, ids_v = align(args.dom_dir, args.js_dir, args.val_jsonl, bool(getattr(args, "use_cheap_features", True)))
-    Xt, yt, ids_t = align(args.dom_dir, args.js_dir, args.test_jsonl, bool(getattr(args, "use_cheap_features", True)))
+    # Build the heads to include: only keep ones that have preds files
+    heads = {}
+    for name, d in {
+        "p_dom": args.dom_dir,
+        "p_js": args.js_dir,
+        "p_url": args.url_dir,
+        "p_dom_light": args.dom_light_dir,
+    }.items():
+        if os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl")):
+            heads[name] = d
+
+    # Align data with available heads
+    Xv, yv, ids_v, feature_names = align(args.val_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
+    Xt, yt, ids_t, _ = align(args.test_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
     if Xv.size == 0 or Xt.size == 0:
         print("WARN: No overlap between DOM and JS predictions; ensure eval scripts were run and IDs match.")
     pv: np.ndarray
     pt: np.ndarray
 
     if args.method == "average":
-        pv = fuse_average(Xv[:, 0], Xv[:, 1])
-        pt = fuse_average(Xt[:, 0], Xt[:, 1])
+        # Simple equal-weight average across all heads
+        pv = np.clip(np.mean(Xv[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+        pt = np.clip(np.mean(Xt[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
     else:
         # Logistic regression fusion
         try:
@@ -151,7 +123,11 @@ def main():
             pv = clf.predict_proba(Xv)[:, 1]
             pt = clf.predict_proba(Xt)[:, 1]
             # Save fusion weights
-            w = {"coef": clf.coef_.tolist(), "intercept": clf.intercept_.tolist(), "feature_names": ["p_dom", "p_js"] + (CHEAP_FEATURES if bool(getattr(args, "use_cheap_features", True)) else [])}
+            w = {
+                "coef": clf.coef_.tolist(),
+                "intercept": clf.intercept_.tolist(),
+                "feature_names": list(heads.keys()) + (CHEAP_FEATURES if bool(getattr(args, "use_cheap_features", True)) else []),
+            }
             with open(os.path.join(args.out_dir, "fusion_weights.json"), "w", encoding="utf-8") as f:
                 json.dump(w, f, indent=2)
 
