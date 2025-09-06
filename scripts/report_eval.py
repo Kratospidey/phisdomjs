@@ -1341,6 +1341,10 @@ def main():
     js_test_path = os.path.join(args.js_dir, "preds_test.jsonl")
     fu_val_path = os.path.join(args.fusion_dir, "preds_val.jsonl")
     fu_test_path = os.path.join(args.fusion_dir, "preds_test.jsonl")
+    # Optional: cross-attention fusion
+    xfu_dir = os.path.join(os.path.dirname(args.fusion_dir), "fusion_xattn") if os.path.isabs(args.fusion_dir) else os.path.join("artifacts", "fusion_xattn")
+    xfu_val_path = os.path.join(xfu_dir, "preds_val.jsonl")
+    xfu_test_path = os.path.join(xfu_dir, "preds_test.jsonl")
 
     js_val = read_preds(js_val_path)
     js_test = read_preds(js_test_path)
@@ -1348,6 +1352,8 @@ def main():
     js_train = compute_js_preds(args.train_jsonl)
     fu_val = read_preds(fu_val_path)
     fu_test = read_preds(fu_test_path)
+    xfu_val = read_preds(xfu_val_path)
+    xfu_test = read_preds(xfu_test_path)
 
     # Curves & reliability
     plot_curves(y_tr, p_tr, report_dir, "train")
@@ -1373,6 +1379,14 @@ def main():
         plot_curves(y_te_fu, p_te_fu, report_dir, "test_fused")
         plot_reliability(y_va_fu, p_va_fu, report_dir, "val_fused")
         plot_reliability(y_te_fu, p_te_fu, report_dir, "test_fused")
+    # XAttn Fusion curves if present
+    if xfu_val and xfu_test:
+        y_va_xf, p_va_xf = xfu_val
+        y_te_xf, p_te_xf = xfu_test
+        plot_curves(y_va_xf, p_va_xf, report_dir, "val_xfusion")
+        plot_curves(y_te_xf, p_te_xf, report_dir, "test_xfusion")
+        plot_reliability(y_va_xf, p_va_xf, report_dir, "val_xfusion")
+        plot_reliability(y_te_xf, p_te_xf, report_dir, "test_xfusion")
 
     # Build multi-split overlays for DOM
     plot_pr_multi_splits([("train", y_tr, p_tr), ("val", y_va, p_va), ("test", y_te, p_te)], report_dir, "dom")
@@ -1478,6 +1492,9 @@ def main():
     if fu_test:
         y_te_fu, p_te_fu = fu_test
         combined.append(("Fused", y_te_fu, p_te_fu))
+    if xfu_test:
+        y_te_xf, p_te_xf = xfu_test
+        combined.append(("XFusion", y_te_xf, p_te_xf))
     if len(combined) > 1:
         plot_roc_multi(combined, report_dir, "test")
         plot_pr_multi(combined, report_dir, "test")

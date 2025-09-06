@@ -36,6 +36,15 @@ ES_PATIENCE ?= 3
 ES_MIN_DELTA ?= 0.0
 DISABLE_TQDM ?= 0
 SMOKE ?= 0
+XF_NO_URL ?= 0
+XF_NO_JS ?= 0
+XF_NO_TEXT ?= 1
+XF_NO_DOM ?= 0
+XF_NO_CHEAP ?= 0
+XF_JS_RAW_FIELD ?=
+XF_NO_JS_CANON ?= 0
+XF_HTML_CANON ?= 0
+XF_HTML_FIELD ?= html
 
 # Ensure env for PhishTank
 # export PHISHTANK_APP_KEY=your_key
@@ -127,10 +136,28 @@ train-cheap-mlp:
 .PHONY: fuse
 fuse:
 	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
+# Cross-attention fusion (XFusion)
+.PHONY: train-xfusion eval-xfusion
+train-xfusion:
+	$(PY) scripts/train_fusion_xattn.py \
+		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_xattn \
+		$(if $(filter $(XF_NO_URL),1),--no-url,) \
+		$(if $(filter $(XF_NO_JS),1),--no-js,) \
+		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
+		$(if $(filter $(XF_NO_DOM),1),--no-dom,) \
+		$(if $(filter $(XF_NO_CHEAP),1),--no-cheap,) \
+		$(if $(XF_JS_RAW_FIELD),--js-raw-field $(XF_JS_RAW_FIELD),) \
+		$(if $(filter $(XF_NO_JS_CANON),1),--no-js-canonicalize,) \
+		$(if $(filter $(XF_HTML_CANON),1),--html-canonicalize,) \
+		$(if $(XF_HTML_FIELD),--html-field $(XF_HTML_FIELD),)
+
+eval-xfusion: train-xfusion
+	@echo "[MAKE] XFusion trained and preds/calibration written to artifacts/fusion_xattn"
 # Run cascade after fusion
 .PHONY: cascade
 cascade:
-	$(PY) scripts/cascade.py --url-dir artifacts/url_head --cheap-dir artifacts/cheap_mlp --fusion-dir artifacts/fusion --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/cascade --target-precision 0.99 --target-benign-precision 0.995
+	$(PY) scripts/cascade.py --url-dir artifacts/url_head --cheap-dir artifacts/cheap_mlp --fusion-dir $(if $(filter $(USE_XFUSION),1),artifacts/fusion_xattn,artifacts/fusion) --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/cascade --target-precision 0.99 --target-benign-precision 0.995
 
 .PHONY: report
 report:
@@ -234,3 +261,7 @@ auto-backfill:
 # Phase 4 end-to-end: train/eval all heads, fuse, plot, report
 .PHONY: phase4
 phase4: train eval report train-js eval-js train-url-head eval-url-head train-js-head eval-js-head train-dom-gcn eval-dom-gcn train-text-head eval-text-head train-cheap-mlp eval-cheap-mlp fuse cascade report report-xai plot-heads
+
+# Phase 8: Cross-attention + robustness (HTML/JS canonicalization)
+.PHONY: phase8
+phase8: phase4 $(if $(filter $(AUGMENT_JS),1),phase6,) train-xfusion cascade report report-xai
