@@ -102,6 +102,17 @@ train-js:
 eval-js:
 	$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length 512
 
+# Lightweight heads (URL/JS CharCNN and DOM GCN)
+.PHONY: train-url-head train-js-head train-dom-gcn
+train-url-head:
+	$(PY) scripts/train_url_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/url_head --batch-size 64 --epochs 3 --lr 1e-3 --weight-decay 1e-4
+
+train-js-head:
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size 32 --epochs 3 --lr 1e-3 --weight-decay 1e-4
+
+train-dom-gcn:
+	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size 16 --epochs 3 --lr 2e-3 --weight-decay 1e-4
+
 .PHONY: fuse
 fuse:
 	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
