@@ -153,6 +153,17 @@ eval-url-head:
 eval-js-head:
 	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
 
+# Phase 6: JS augmentation and optional retraining using augmented field
+.PHONY: augment-js train-js-head-aug eval-js-head-aug
+augment-js:
+	$(PY) scripts/augment_js.py --in-jsonl data/pages_train.jsonl --out-jsonl data/pages_train_aug.jsonl --prob-hex $(if $(filter $(SMOKE),1),0.01,0.05) --prob-split $(if $(filter $(SMOKE),1),0.01,0.05) --seed $(if $(SEED),$(SEED),42)
+
+train-js-head-aug:
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train_aug.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn_aug --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --raw-field js_augmented
+
+eval-js-head-aug:
+	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn_aug --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+
 eval-dom-gcn:
 	$(PY) scripts/eval_light_heads.py --head dom --model-dir artifacts/dom_gcn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 32
 

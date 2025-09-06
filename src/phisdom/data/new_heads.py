@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from phisdom.data.schema import load_jsonl
+from phisdom.features.extractors import extract_js_charseq
 from phisdom.data.cheap_features import row_to_features, CHEAP_FEATURES
 
 
@@ -39,19 +40,36 @@ class JsSeqDataset:
     seq_field: str = "js_charseq"
     label_field: str = "label"
     id_field: str = "id"
+    raw_field: Optional[str] = None  # e.g., "js_augmented" or "js_raw"; if provided and seq missing, encode on-the-fly
 
     def __post_init__(self):
         rows = load_jsonl(self.path)
-        self.rows: List[Dict[str, Any]] = [r for r in rows if isinstance(r.get(self.seq_field), list) and len(r[self.seq_field]) > 0]
+        def ok_row(r: Dict[str, Any]) -> bool:
+            if isinstance(r.get(self.seq_field), list) and len(r[self.seq_field]) > 0:
+                return True
+            if self.raw_field is not None and isinstance(r.get(self.raw_field), (str, list)):
+                return True
+            return False
+        self.rows: List[Dict[str, Any]] = [r for r in rows if ok_row(r)]
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         r = self.rows[idx]
+        seq: List[int]
+        if isinstance(r.get(self.seq_field), list) and len(r[self.seq_field]) > 0:
+            seq = list(r.get(self.seq_field) or [])
+        elif self.raw_field is not None:
+            raw = r.get(self.raw_field)
+            if isinstance(raw, list):
+                raw = "\n".join(str(x) for x in raw)
+            seq = extract_js_charseq(str(raw or ""), max_len=2048)
+        else:
+            seq = []
         return {
             "id": r.get(self.id_field, str(idx)),
-            "seq": r.get(self.seq_field) or [],
+            "seq": seq,
             "label": int(r.get(self.label_field, 0)),
         }
 

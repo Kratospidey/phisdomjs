@@ -62,14 +62,17 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--dropout", type=float, default=0.15)
+    # Phase 6: allow training from raw augmented text when js_charseq missing
+    ap.add_argument("--raw-field", type=str, default=None, help="Optional raw JS text field to encode on-the-fly (e.g., js_augmented)")
+    ap.add_argument("--max-len", type=int, default=None)
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tr_ds = JsSeqDataset(args.train_jsonl)
-    va_ds = JsSeqDataset(args.val_jsonl)
+    tr_ds = JsSeqDataset(args.train_jsonl, raw_field=args.raw_field)
+    va_ds = JsSeqDataset(args.val_jsonl, raw_field=args.raw_field)
     coll = PaddedSeqCollator(pad_idx=0, max_len=args.max_len)
     tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll)  # type: ignore[arg-type]
     va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]

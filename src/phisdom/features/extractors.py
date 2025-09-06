@@ -10,7 +10,7 @@ Adds:
 
 All outputs are capped and use small integer encodings to keep JSONL size low.
 """
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 from bs4 import BeautifulSoup
 from bs4.element import Tag, NavigableString
 import hashlib
@@ -35,6 +35,17 @@ _URL_IDX = {ch: i + 2 for i, ch in enumerate(_URL_ALPHABET)}  # 0=pad,1=unk
 _JS_IDX = {ch: i + 2 for i, ch in enumerate(_JS_ALPHABET)}
 
 
+def get_js_vocab() -> Dict[str, Union[str, Dict[str, int], Dict[int, str]]]:
+    """Return JS vocab dictionaries: {'alphabet': str, 'idx': {ch->id}, 'inv': {id->ch}}"""
+    inv = {v: k for k, v in _JS_IDX.items()}
+    return {"alphabet": _JS_ALPHABET, "idx": _JS_IDX, "inv": inv}
+
+
+def get_url_vocab() -> Dict[str, Union[str, Dict[str, int], Dict[int, str]]]:
+    inv = {v: k for k, v in _URL_IDX.items()}
+    return {"alphabet": _URL_ALPHABET, "idx": _URL_IDX, "inv": inv}
+
+
 def _encode_chars(text: str, *, alphabet: str, idx: Dict[str, int], max_len: int) -> List[int]:
     if not isinstance(text, str):
         return []
@@ -52,6 +63,11 @@ def extract_url_charseq(url: str, max_len: int = 256) -> List[int]:
 def extract_js_charseq(js_text: str, max_len: int = 2048) -> List[int]:
     """Encode JavaScript text to small alphabet indexes with cap."""
     return _encode_chars(js_text or "", alphabet=_JS_ALPHABET, idx=_JS_IDX, max_len=max_len)
+
+
+def decode_js_charseq(seq: List[int]) -> str:
+    inv = {v: k for k, v in _JS_IDX.items()}
+    return "".join(inv.get(int(t), "") for t in (seq or []))
 
 
 def _hash32(s: str) -> int:
@@ -163,3 +179,45 @@ def extract_text_visible(html: str, max_chars: int = 4000) -> str:
         return text[:max_chars]
     except Exception:
         return ""
+
+
+# --- Simple JS canonicalization / obfuscation helpers (Phase 6) ---
+
+def js_minify_whitespace(s: str) -> str:
+    try:
+        # remove /* */ comments
+        s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)
+        # remove // comments
+        s = re.sub(r"//.*", " ", s)
+        # collapse whitespace
+        s = re.sub(r"\s+", " ", s)
+        return s.strip()
+    except Exception:
+        return s
+
+
+def js_hex_escape_subset(s: str, prob: float = 0.05, seed: Optional[int] = None) -> str:
+    import random
+    rng = random.Random(seed)
+    out = []
+    for ch in s:
+        if ch.isalnum() and rng.random() < prob:
+            out.append("\\x%02x" % (ord(ch) & 0xFF))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def js_split_string_concat(s: str, prob: float = 0.05, seed: Optional[int] = None) -> str:
+    import re as _re
+    import random
+    rng = random.Random(seed)
+    def split_token(m):
+        q = m.group(1)
+        body = m.group(2)
+        if len(body) < 4 or rng.random() >= prob:
+            return m.group(0)
+        k = rng.randint(1, len(body) - 1)
+        return f"{q}{body[:k]}{q}+{q}{body[k:]}{q}"
+    return _re.sub(r"([\'\"])([^\1]{2,}?)\1", split_token, s)
+
