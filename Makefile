@@ -94,6 +94,11 @@ splits:
 slice:
 	$(PY) scripts/slice_dataset.py --dataset $(DATASET) --splits data/splits.json --out-dir data
 
+# Aliases for convenience/compatibility with some docs/logs
+.PHONY: make_splits slice_dataset
+make_splits: splits
+slice_dataset: slice
+
 train:
 	$(PY) scripts/train_markup.py --config configs/markup_base.yaml \
 		$(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) \
