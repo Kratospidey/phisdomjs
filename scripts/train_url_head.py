@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import json
-from typing import List
+from typing import List, cast
 
 import torch
 import torch.nn as nn
@@ -62,6 +62,7 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--max-len", type=int, default=None)
     ap.add_argument("--dropout", type=float, default=0.1)
+    ap.add_argument("--num-workers", type=int, default=2)
     ap.add_argument("--disable-tqdm", action="store_true")
     args = ap.parse_args()
 
@@ -69,12 +70,36 @@ def main():
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    tr_ds = UrlSeqDataset(args.train_jsonl)
-    va_ds = UrlSeqDataset(args.val_jsonl)
+    tr_ds = UrlSeqDataset(args.train_jsonl, max_len=args.max_len)
+    va_ds = UrlSeqDataset(args.val_jsonl, max_len=args.max_len)
+    if len(tr_ds) == 0:
+        raise SystemExit(
+            "[ERROR] URL training dataset is empty after filtering. Ensure records contain 'url_charseq' or raw URL fields ('url_final', 'url_raw', 'url').\n"
+            "You can run scripts/backfill_fields.py to populate sequences."
+        )
+    if len(va_ds) == 0:
+        raise SystemExit("[ERROR] URL validation dataset is empty after filtering.")
     coll = PaddedSeqCollator(pad_idx=0, max_len=args.max_len)
     from torch.utils.data import Dataset as TorchDataset  # type: ignore
-    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll)  # type: ignore[arg-type]
-    va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
+    pin = bool(device.type == "cuda")
+    tr_dl = DataLoader(
+        cast(TorchDataset, tr_ds),
+        batch_size=args.batch_size,
+        shuffle=True,
+        collate_fn=coll,  # type: ignore[arg-type]
+        num_workers=max(0, int(args.num_workers)),
+        pin_memory=pin,
+        persistent_workers=bool(args.num_workers > 0),
+    )
+    va_dl = DataLoader(
+        cast(TorchDataset, va_ds),
+        batch_size=args.batch_size,
+        shuffle=False,
+        collate_fn=coll,  # type: ignore[arg-type]
+        num_workers=max(0, int(args.num_workers)),
+        pin_memory=pin,
+        persistent_workers=bool(args.num_workers > 0),
+    )
 
     model = UrlCharCNN(dropout=args.dropout).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

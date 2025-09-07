@@ -15,35 +15,36 @@ from bs4 import BeautifulSoup
 from bs4.element import Tag, NavigableString
 import hashlib
 import re
+import os
 
 
 # Fixed small alphabets with 0=PAD, 1=UNK
-_URL_ALPHABET = (
+_DEFAULT_URL_ALPHABET = (
     "abcdefghijklmnopqrstuvwxyz"  # 26
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # 26
     "0123456789"                  # 10
     ":/?#[]@!$&'()*+,;=%._-~"     # RFC3986 + common URL chars
 )
-_JS_ALPHABET = (
+_DEFAULT_JS_ALPHABET = (
     "abcdefghijklmnopqrstuvwxyz"  # 26
     "ABCDEFGHIJKLMNOPQRSTUVWXYZ"  # 26
     "0123456789"                  # 10
     "{}[]()<>;:,.!@#$%^&*-_=+|\\/\"'`?\n\r\t "  # structural + whitespace
 )
 
-_URL_IDX = {ch: i + 2 for i, ch in enumerate(_URL_ALPHABET)}  # 0=pad,1=unk
-_JS_IDX = {ch: i + 2 for i, ch in enumerate(_JS_ALPHABET)}
+_URL_IDX = {ch: i + 2 for i, ch in enumerate(_DEFAULT_URL_ALPHABET)}  # 0=pad,1=unk
+_JS_IDX = {ch: i + 2 for i, ch in enumerate(_DEFAULT_JS_ALPHABET)}
 
 
 def get_js_vocab() -> Dict[str, Union[str, Dict[str, int], Dict[int, str]]]:
     """Return JS vocab dictionaries: {'alphabet': str, 'idx': {ch->id}, 'inv': {id->ch}}"""
     inv = {v: k for k, v in _JS_IDX.items()}
-    return {"alphabet": _JS_ALPHABET, "idx": _JS_IDX, "inv": inv}
+    return {"alphabet": _DEFAULT_JS_ALPHABET, "idx": _JS_IDX, "inv": inv}
 
 
 def get_url_vocab() -> Dict[str, Union[str, Dict[str, int], Dict[int, str]]]:
     inv = {v: k for k, v in _URL_IDX.items()}
-    return {"alphabet": _URL_ALPHABET, "idx": _URL_IDX, "inv": inv}
+    return {"alphabet": _DEFAULT_URL_ALPHABET, "idx": _URL_IDX, "inv": inv}
 
 
 def _encode_chars(text: str, *, alphabet: str, idx: Dict[str, int], max_len: int) -> List[int]:
@@ -57,12 +58,12 @@ def _encode_chars(text: str, *, alphabet: str, idx: Dict[str, int], max_len: int
 
 def extract_url_charseq(url: str, max_len: int = 256) -> List[int]:
     """Encode raw URL into fixed small alphabet indexes, capped length."""
-    return _encode_chars(url or "", alphabet=_URL_ALPHABET, idx=_URL_IDX, max_len=max_len)
+    return _encode_chars(url or "", alphabet=_DEFAULT_URL_ALPHABET, idx=_URL_IDX, max_len=max_len)
 
 
 def extract_js_charseq(js_text: str, max_len: int = 2048) -> List[int]:
     """Encode JavaScript text to small alphabet indexes with cap."""
-    return _encode_chars(js_text or "", alphabet=_JS_ALPHABET, idx=_JS_IDX, max_len=max_len)
+    return _encode_chars(js_text or "", alphabet=_DEFAULT_JS_ALPHABET, idx=_JS_IDX, max_len=max_len)
 
 
 def decode_js_charseq(seq: List[int]) -> str:
@@ -220,4 +221,51 @@ def js_split_string_concat(s: str, prob: float = 0.05, seed: Optional[int] = Non
         k = rng.randint(1, len(body) - 1)
         return f"{q}{body[:k]}{q}+{q}{body[k:]}{q}"
     return _re.sub(r"([\'\"])([^\1]{2,}?)\1", split_token, s)
+
+
+def _dedupe_preserve(s: str) -> str:
+    seen = set(); out = []
+    for ch in s:
+        if ch not in seen:
+            seen.add(ch); out.append(ch)
+    return "".join(out)
+
+def _load_alpha(env_chars: str, env_file: str, default: str, env_extra: str | None = None, extra_file_env: str | None = None) -> str:
+    s = os.getenv(env_chars)
+    if s:
+        base = s.replace("\\n", "\n").replace("\\t", "\t")
+    else:
+        path = os.getenv(env_file)
+        if path:
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    base = fh.read()
+            except Exception:
+                base = default
+        else:
+            base = default
+    base = _dedupe_preserve(base)
+    if env_extra:
+        extra = os.getenv(env_extra)
+        if extra:
+            base = _dedupe_preserve(base + extra.replace("\\n", "\n").replace("\\t", "\t"))
+    if extra_file_env:
+        ep = os.getenv(extra_file_env)
+        if ep:
+            try:
+                with open(ep, "r", encoding="utf-8") as fh:
+                    extra2 = fh.read()
+                base = _dedupe_preserve(base + extra2.replace("\\n", "\n").replace("\\t", "\t"))
+            except Exception:
+                pass
+    return base
+
+_URL_ALPHABET = _load_alpha(
+    "PHISDOM_URL_ALPHABET", "PHISDOM_URL_ALPHA_FILE", _DEFAULT_URL_ALPHABET,
+    "PHISDOM_URL_ALPHABET_EXTRA", "PHISDOM_URL_ALPHA_EXTRA_FILE"
+)
+_JS_ALPHABET = _load_alpha(
+    "PHISDOM_JS_ALPHABET", "PHISDOM_JS_ALPHA_FILE", _DEFAULT_JS_ALPHABET,
+    "PHISDOM_JS_ALPHABET_EXTRA", "PHISDOM_JS_ALPHA_EXTRA_FILE"
+)
 

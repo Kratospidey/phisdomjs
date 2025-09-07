@@ -23,6 +23,22 @@ from phisdom.features import (
     extract_text_title,
     extract_text_visible,
 )
+from tqdm import tqdm  # type: ignore
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+
+# Fast JSON if available
+try:
+    import orjson  # type: ignore
+    def _json_loads(s: str) -> Any:
+        return orjson.loads(s)
+    def _json_dumps(obj: Any) -> str:
+        return orjson.dumps(obj, option=orjson.OPT_NON_STR_KEYS).decode("utf-8")
+except Exception:  # pragma: no cover
+    def _json_loads(s: str) -> Any:
+        return json.loads(s)
+    def _json_dumps(obj: Any) -> str:
+        return json.dumps(obj, ensure_ascii=False)
 
 try:
     # Optional: richer TLS parsing for SPKI hash
@@ -115,7 +131,13 @@ def security_headers_snapshot(headers: Dict[str, Any]) -> Dict[str, Optional[str
 
 def form_semantics(html: str, page_etld1: str, page_scheme: Optional[str] = None) -> Dict[str, Any]:
     try:
-        soup = BeautifulSoup(html or "", "html.parser")
+        # Prefer lxml parser for speed if available
+        parser = "lxml"
+        try:
+            import lxml  # type: ignore  # noqa: F401
+        except Exception:
+            parser = "html.parser"
+        soup = BeautifulSoup(html or "", parser)
     except Exception:
         return {}
     forms = [f for f in soup.find_all("form") if isinstance(f, Tag)]
@@ -289,7 +311,12 @@ def fingerprint_flags(html: str, scripts: List[Dict[str, Any]]) -> Dict[str, boo
 
 def title_host_jaccard_q8(html: str, url: str) -> Optional[int]:
     try:
-        soup = BeautifulSoup(html or "", "html.parser")
+        parser = "lxml"
+        try:
+            import lxml  # type: ignore  # noqa: F401
+        except Exception:
+            parser = "html.parser"
+        soup = BeautifulSoup(html or "", parser)
         title = soup.title.get_text(" ") if soup.title else ""
     except Exception:
         title = ""
@@ -325,9 +352,14 @@ def tls_info_for_host(host: str, timeout: float = 3.0) -> Dict[str, Any]:
                         cert = x509.load_der_x509_certificate(cert_bin, default_backend())
                         issuer = cert.issuer.rfc4514_string()
                         info["cert_issuer"] = issuer
-                        nb = cert.not_valid_before
+                        # Prefer timezone-aware API to avoid deprecation warnings
+                        nb = getattr(cert, "not_valid_before_utc", None)
+                        if nb is None:
+                            nb = cert.not_valid_before  # may be naive; fallback only when _utc is unavailable
+                            if nb:
+                                nb = nb.replace(tzinfo=timezone.utc)
                         if nb:
-                            info["cert_age_days"] = int((datetime.now(timezone.utc) - nb.replace(tzinfo=timezone.utc)).total_seconds() / 86400)
+                            info["cert_age_days"] = int((datetime.now(timezone.utc) - nb).total_seconds() / 86400)
                         try:
                             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value
                             try:
@@ -442,7 +474,7 @@ def dns_ttl_mx(domain: str, timeout: float, cache: Dict[str, Any]) -> Dict[str, 
     return out
 
 
-def favicon_info(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, Any]:
+def favicon_info(html: str, base_url: str, timeout: float = 3.0, max_image_bytes: int = 262144) -> Dict[str, Any]:
     try:
         from PIL import Image  # type: ignore
         from io import BytesIO
@@ -450,7 +482,12 @@ def favicon_info(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, An
     except Exception:
         return {}
     try:
-        soup = BeautifulSoup(html or "", "html.parser")
+        parser = "lxml"
+        try:
+            import lxml  # type: ignore  # noqa: F401
+        except Exception:
+            parser = "html.parser"
+        soup = BeautifulSoup(html or "", parser)
         parsed = urlparse(base_url)
         base = f"{parsed.scheme}://{parsed.netloc}" if parsed.scheme and parsed.netloc else None
         # gather icons
@@ -486,9 +523,42 @@ def favicon_info(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, An
         fav_cross = False
         if icons:
             u = icons[0]
-            r = requests.get(u, timeout=timeout)
-            if r.ok and r.content:
-                img = Image.open(BytesIO(r.content)).convert('L').resize((9, 8))
+            # Avoid downloading huge images: try HEAD first
+            try:
+                rh = requests.head(u, timeout=timeout, allow_redirects=True)
+                cl = int(rh.headers.get("Content-Length", "0") or 0)
+                if cl and cl > max_image_bytes:
+                    return {
+                        "fav_rel_count": fav_rel_count,
+                        "fav_cross_origin": bool(cross.get(u, False)),
+                    }
+            except Exception:
+                pass
+            r = requests.get(u, timeout=timeout, stream=True)
+            if r.ok:
+                data = b""
+                try:
+                    for chunk in r.iter_content(16384):
+                        if not chunk:
+                            break
+                        data += chunk
+                        if len(data) >= max_image_bytes:
+                            break
+                except Exception:
+                    data = r.content or b""
+                if not data:
+                    return {
+                        "fav_rel_count": fav_rel_count,
+                        "fav_cross_origin": bool(cross.get(u, False)),
+                    }
+                img = Image.open(BytesIO(data))
+                # If palette image with transparency, convert to RGBA first to avoid PIL warning
+                try:
+                    if img.mode == 'P' and 'transparency' in getattr(img, 'info', {}):
+                        img = img.convert('RGBA')
+                except Exception:
+                    pass
+                img = img.convert('L').resize((9, 8))
                 arr = np.asarray(img, dtype=np.int16)
                 diff = (arr[:, 1:] > arr[:, :-1]).astype(np.uint8).flatten()
                 h = 0
@@ -507,7 +577,7 @@ def favicon_info(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, An
         return {}
 
 
-def logo_phash(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, Any]:
+def logo_phash(html: str, base_url: str, timeout: float = 3.0, max_image_bytes: int = 262144) -> Dict[str, Any]:
     try:
         from PIL import Image  # type: ignore
         from io import BytesIO
@@ -538,11 +608,37 @@ def logo_phash(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, Any]
         if not cand:
             return {}
         u, from_alt = cand[0]
-        r = requests.get(u, timeout=timeout)
-        if not r.ok or not r.content:
+        try:
+            rh = requests.head(u, timeout=timeout, allow_redirects=True)
+            cl = int(rh.headers.get("Content-Length", "0") or 0)
+            if cl and cl > max_image_bytes:
+                return {}
+        except Exception:
+            pass
+        r = requests.get(u, timeout=timeout, stream=True)
+        if not r.ok:
+            return {}
+        data = b""
+        try:
+            for chunk in r.iter_content(32768):
+                if not chunk:
+                    break
+                data += chunk
+                if len(data) >= max_image_bytes:
+                    break
+        except Exception:
+            data = r.content or b""
+        if not data:
             return {}
         # Compute simple pHash (8x8 DCT of grayscale 32x32)
-        img = Image.open(BytesIO(r.content)).convert('L').resize((32, 32))
+        img = Image.open(BytesIO(data))
+        # If palette image with transparency, convert to RGBA first to avoid PIL warning
+        try:
+            if img.mode == 'P' and 'transparency' in getattr(img, 'info', {}):
+                img = img.convert('RGBA')
+        except Exception:
+            pass
+        img = img.convert('L').resize((32, 32))
         arr = np.asarray(img, dtype=np.float32)
         dct = np.fft.fft2(arr)
         low = dct[:8, :8].real
@@ -556,7 +652,7 @@ def logo_phash(html: str, base_url: str, timeout: float = 3.0) -> Dict[str, Any]
         return {}
 
 
-def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float, dns_timeout: float, rdap_cache: Dict[str, Any], dns_cache: Dict[str, Any]) -> Dict[str, Any]:
+def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float, dns_timeout: float, rdap_cache: Dict[str, Any], dns_cache: Dict[str, Any], allow_visuals: bool = True, max_image_bytes: int = 262144) -> Dict[str, Any]:
     # Use url_final if present else url
     final_url = r.get("url_final") or r.get("url")
     if isinstance(final_url, str):
@@ -675,11 +771,11 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
         except Exception:
             pass
         # Visuals (network optional)
-        if allow_network and isinstance(final_url, str):
-            fav = favicon_info(html, final_url)
+        if allow_network and allow_visuals and isinstance(final_url, str):
+            fav = favicon_info(html, final_url, timeout=tls_timeout, max_image_bytes=max_image_bytes)
             for k, v in fav.items():
                 r.setdefault(k, v)
-            logo = logo_phash(html, final_url)
+            logo = logo_phash(html, final_url, timeout=tls_timeout, max_image_bytes=max_image_bytes)
             for k, v in logo.items():
                 r.setdefault(k, v)
         # TLS compact mapping
@@ -710,27 +806,140 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
     return r
 
 
-def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout: float, dns_timeout: float) -> None:
+_WK_CTX: Dict[str, Any] = {}
+
+
+def _worker_init(allow_network: bool, tls_timeout: float, dns_timeout: float, allow_visuals: bool, max_image_bytes: int) -> None:
+    # Per-process context (lightweight caches to avoid repeated lookups within a worker)
+    _WK_CTX.clear()
+    _WK_CTX["allow_network"] = bool(allow_network)
+    _WK_CTX["tls_timeout"] = float(tls_timeout)
+    _WK_CTX["dns_timeout"] = float(dns_timeout)
+    _WK_CTX["allow_visuals"] = bool(allow_visuals)
+    _WK_CTX["max_image_bytes"] = int(max_image_bytes)
+    _WK_CTX["rdap_cache"] = {}
+    _WK_CTX["dns_cache"] = {}
+
+
+def _process_batch(lines: List[str]) -> List[Optional[str]]:
+    out: List[Optional[str]] = []
+    for line in lines:
+        s = line.strip()
+        if not s:
+            out.append(None)
+            continue
+        try:
+            obj = _json_loads(s)
+        except Exception:
+            out.append(None)
+            continue
+        try:
+            obj = enrich_record(
+                obj,
+                allow_network=_WK_CTX.get("allow_network", False),
+                tls_timeout=_WK_CTX.get("tls_timeout", 3.0),
+                dns_timeout=_WK_CTX.get("dns_timeout", 2.0),
+                rdap_cache=_WK_CTX.get("rdap_cache", {}),
+                dns_cache=_WK_CTX.get("dns_cache", {}),
+                allow_visuals=_WK_CTX.get("allow_visuals", True),
+                max_image_bytes=int(_WK_CTX.get("max_image_bytes", 262144)),
+            )
+            out.append(_json_dumps(obj))
+        except Exception:
+            out.append(None)
+    return out
+
+
+def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout: float, dns_timeout: float, disable_tqdm: bool = False, workers: int = 1, batch_lines: int = 2000, allow_visuals: bool = True, max_image_bytes: int = 262144) -> None:
     if not os.path.exists(path):
         return
-    rdap_cache = load_cache(RDAP_CACHE_PATH)
-    dns_cache = load_cache(DNS_CACHE_PATH)
+    rdap_cache = {} if workers and workers > 1 else load_cache(RDAP_CACHE_PATH)
+    dns_cache = {} if workers and workers > 1 else load_cache(DNS_CACHE_PATH)
     tmp_path = path + ".tmp"
     out = open(tmp_path, "w", encoding="utf-8")
     n = 0
+    fsize = 0
+    try:
+        fsize = os.path.getsize(path)
+    except Exception:
+        fsize = 0
+    desc = f"backfill {os.path.basename(path)}"
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except Exception:
-                continue
-            obj = enrich_record(obj, allow_network=allow_network, tls_timeout=tls_timeout, dns_timeout=dns_timeout, rdap_cache=rdap_cache, dns_cache=dns_cache)
-            out.write(json.dumps(obj, ensure_ascii=False))
-            out.write("\n")
-            n += 1
+        pbar = None
+        if not disable_tqdm:
+            pbar = tqdm(total=fsize if fsize > 0 else None, unit="B", unit_scale=True, desc=desc, dynamic_ncols=True)
+        if workers and workers > 1:
+            # Multi-process: submit batches, preserve order by writing futures in submission order
+            executor = ProcessPoolExecutor(max_workers=int(workers), initializer=_worker_init, initargs=(allow_network, tls_timeout, dns_timeout, allow_visuals, max_image_bytes))
+            futures: List[Any] = []
+            buf: List[str] = []
+            bytes_since = 0
+            def _flush():
+                nonlocal buf
+                if buf:
+                    futures.append(executor.submit(_process_batch, buf))
+                    buf = []
+            for raw in f:
+                if pbar is not None:
+                    try:
+                        pbar.update(len(raw))
+                    except Exception:
+                        pass
+                buf.append(raw)
+                if len(buf) >= batch_lines:
+                    _flush()
+                # Limit in-flight futures to avoid high memory
+                if len(futures) >= int(workers) * 2:
+                    fut = futures.pop(0)
+                    res = fut.result()
+                    for item in res:
+                        if not item:
+                            continue
+                        out.write(item)
+                        out.write("\n")
+                        n += 1
+            _flush()
+            # Write results in order
+            for fut in futures:
+                res = fut.result()
+                for item in res:
+                    if not item:
+                        continue
+                    out.write(item)
+                    out.write("\n")
+                    n += 1
+            executor.shutdown(wait=True)
+        else:
+            # Single-process (original path, faster JSON and lxml enabled)
+            for raw in f:
+                s = raw.strip()
+                if not s:
+                    if pbar is not None:
+                        try:
+                            pbar.update(len(raw))
+                        except Exception:
+                            pass
+                    continue
+                try:
+                    obj = _json_loads(s)
+                except Exception:
+                    if pbar is not None:
+                        try:
+                            pbar.update(len(raw))
+                        except Exception:
+                            pass
+                    continue
+                obj = enrich_record(obj, allow_network=allow_network, tls_timeout=tls_timeout, dns_timeout=dns_timeout, rdap_cache=rdap_cache, dns_cache=dns_cache, allow_visuals=allow_visuals, max_image_bytes=max_image_bytes)
+                out.write(_json_dumps(obj))
+                out.write("\n")
+                n += 1
+                if pbar is not None:
+                    try:
+                        pbar.update(len(raw))
+                    except Exception:
+                        pass
+        if pbar is not None:
+            pbar.close()
     out.close()
     save_cache(RDAP_CACHE_PATH, rdap_cache)
     save_cache(DNS_CACHE_PATH, dns_cache)
@@ -751,9 +960,26 @@ def main():
     ap.add_argument("--network", action="store_true", help="Allow network lookups (RDAP/DNS/TLS/favicon)")
     ap.add_argument("--tls-timeout", type=float, default=3.0)
     ap.add_argument("--dns-timeout", type=float, default=2.0)
+    ap.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bar")
+    ap.add_argument("--workers", type=int, default=1, help="Number of worker processes for parallel backfill")
+    ap.add_argument("--batch-lines", type=int, default=2000, help="Lines per task batch when using --workers > 1")
+    ap.add_argument("--disable-visuals", action="store_true", help="Skip favicon/logo network fetch and hashing to reduce memory")
+    ap.add_argument("--max-image-bytes", type=int, default=262144, help="Max bytes to download per image (favicon/logo)")
     args = ap.parse_args()
     for p in args.inputs:
-        process_file(p, overwrite=bool(args.overwrite), allow_network=bool(args.network), tls_timeout=float(args.tls_timeout), dns_timeout=float(args.dns_timeout))
+        print(f"[BACKFILL] file={p} overwrite={bool(args.overwrite)} network={bool(args.network)} tls_timeout={args.tls_timeout} dns_timeout={args.dns_timeout} workers={args.workers} batch_lines={args.batch_lines} visuals={not bool(args.disable_visuals)} max_image_bytes={args.max_image_bytes}")
+        process_file(
+            p,
+            overwrite=bool(args.overwrite),
+            allow_network=bool(args.network),
+            tls_timeout=float(args.tls_timeout),
+            dns_timeout=float(args.dns_timeout),
+            disable_tqdm=bool(args.disable_tqdm),
+            workers=int(args.workers),
+            batch_lines=int(args.batch_lines),
+            allow_visuals=not bool(args.disable_visuals),
+            max_image_bytes=int(args.max_image_bytes),
+        )
 
 
 if __name__ == "__main__":

@@ -46,6 +46,10 @@ def main():
     ap.add_argument("--network", action="store_true")
     ap.add_argument("--tls-timeout", type=float, default=3.0)
     ap.add_argument("--dns-timeout", type=float, default=2.0)
+    ap.add_argument("--workers", type=int, default=1)
+    ap.add_argument("--batch-lines", type=int, default=2000)
+    ap.add_argument("--disable-visuals", action="store_true", help="Skip favicon/logo to reduce memory")
+    ap.add_argument("--max-image-bytes", type=int, default=262144)
     args = ap.parse_args()
 
     any_run = False
@@ -61,6 +65,18 @@ def main():
             if args.network:
                 cmd.append("--network")
             cmd.extend(["--tls-timeout", str(args.tls_timeout), "--dns-timeout", str(args.dns_timeout)])
+            if args.workers and args.workers > 1:
+                cmd.extend(["--workers", str(args.workers), "--batch-lines", str(args.batch_lines)])
+            # Adaptive: for very large base files, disable visuals by default unless explicitly allowed
+            try:
+                sz = path.stat().st_size
+            except Exception:
+                sz = 0
+            disable_visuals_flag = args.disable_visuals or (sz > 1_500_000_000)
+            if disable_visuals_flag:
+                cmd.append("--disable-visuals")
+            if args.max_image_bytes:
+                cmd.extend(["--max-image-bytes", str(args.max_image_bytes)])
             r = subprocess.run(cmd)
             if r.returncode != 0:
                 sys.exit(r.returncode)

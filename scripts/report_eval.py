@@ -408,12 +408,51 @@ def _select_class_values(values: np.ndarray | list, class_index: int = 1) -> np.
     return vals
 
 
-def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512, device_preference: str = "cuda", per_device_eval_batch_size: int = 4) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
+def _read_dom_preds(path: str) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]] | None:
+    try:
+        if not os.path.exists(path):
+            return None
+        y: List[int] = []
+        p: List[float] = []
+        rows: List[Dict[str, Any]] = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                y.append(int(obj.get("label", 0)))
+                p.append(float(obj.get("prob", 0.0)))
+                rows.append({"id": obj.get("id"), "label": int(obj.get("label", 0)), "url": obj.get("url")})
+        if not y:
+            return None
+        return np.array(y, dtype=int), np.array(p, dtype=float), rows
+    except Exception:
+        return None
+
+
+def _write_dom_preds(path: str, rows: List[Dict[str, Any]], probs: np.ndarray) -> None:
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            for r, pr in zip(rows, probs.tolist()):
+                obj = {"id": r.get("id"), "label": int(r.get("label", 0)), "url": r.get("url"), "prob": float(pr)}
+                f.write(json.dumps(obj))
+                f.write("\n")
+    except Exception:
+        pass
+
+
+def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512, device_preference: str = "cuda", per_device_eval_batch_size: int = 4, cache_path: str | None = None) -> Tuple[np.ndarray, np.ndarray, List[Dict[str, Any]]]:
     if not os.path.isdir(model_dir):
         raise SystemExit(
             f"[ERROR] model_dir must be a fine-tuned local directory (got '{model_dir}').\n"
             "Pass your trained output directory (e.g., artifacts/markup_run)."
         )
+    # Try cache
+    if cache_path:
+        cached = _read_dom_preds(cache_path)
+        if cached is not None:
+            return cached
     # Lazy, streaming inference to minimize RAM
     from phisdom.data.schema import iter_jsonl  # local import to avoid cycles
     model = AutoModelForSequenceClassification.from_pretrained(model_dir)
@@ -438,27 +477,82 @@ def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512, device_pr
     batch_labels: List[int] = []
     batch_urls: List[str | None] = []
     bs = max(1, int(per_device_eval_batch_size))
+    max_bs_cap = 32
+    adapt_up = use_cuda
+    # For peak mem tracking
+    total_mem = None
+    if use_cuda:
+        try:
+            props = torch.cuda.get_device_properties(0)
+            total_mem = float(props.total_memory)
+        except Exception:
+            total_mem = None
 
-    def flush_batch():
-        nonlocal batch_html, batch_ids, batch_labels, batch_urls
-        if not batch_html:
-            return
-        with torch.no_grad():
-            enc = processor(html_strings=batch_html, truncation=True, max_length=max_length, return_tensors="pt", padding=True)
-            enc = {k: v.to(device) for k, v in enc.items()}
-            out = model(**enc)
-            logits = out.logits.detach().cpu().numpy()
+    def run_subbatch(start: int, end: int):
+        nonlocal y_list, p_list, rows_min
+        sb_html = batch_html[start:end]
+        sb_ids = batch_ids[start:end]
+        sb_labels = batch_labels[start:end]
+        sb_urls = batch_urls[start:end]
+        enc = processor(html_strings=sb_html, truncation=True, max_length=max_length, return_tensors="pt", padding=True)
+        enc = {k: v.to(device) for k, v in enc.items()}
+        out = model(**enc)
+        logits = out.logits.detach().cpu().numpy()
         if logits.ndim == 2 and logits.shape[1] == 2:
             m = np.max(logits, axis=1, keepdims=True)
             e = np.exp(logits - m)
             p1 = (e[:, 1] / (e[:, 0] + e[:, 1]))
         else:
             p1 = 1 / (1 + np.exp(-logits.reshape(-1)))
-        y_list.extend(batch_labels)
+        y_list.extend(sb_labels)
         p_list.extend(p1.tolist())
-        # Keep minimal row info to reduce memory
-        for rid, lab, url in zip(batch_ids, batch_labels, batch_urls):
+        for rid, lab, url in zip(sb_ids, sb_labels, sb_urls):
             rows_min.append({"id": rid, "label": int(lab), "url": url})
+
+    def flush_batch():
+        nonlocal batch_html, batch_ids, batch_labels, batch_urls, bs
+        if not batch_html:
+            return
+        with torch.no_grad():
+            try:
+                if use_cuda:
+                    try:
+                        torch.cuda.reset_peak_memory_stats()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                # If current batch exceeds bs (e.g., last bump), process in windows of bs
+                if len(batch_html) <= bs:
+                    run_subbatch(0, len(batch_html))
+                else:
+                    for k in range(0, len(batch_html), bs):
+                        run_subbatch(k, min(len(batch_html), k + bs))
+                # Adaptive scale-up: if we used less than ~75% of VRAM, bump bs up
+                if adapt_up and total_mem:
+                    try:
+                        peak = float(torch.cuda.max_memory_allocated())  # type: ignore[attr-defined]
+                        if peak > 0 and (total_mem and (peak / total_mem) < 0.75) and bs < max_bs_cap:
+                            bs_new = min(max_bs_cap, max(bs + 1, int(bs * 3 / 2)))
+                            if bs_new != bs:
+                                bs = bs_new
+                    except Exception:
+                        pass
+            except RuntimeError as e:
+                # OOM backoff: halve batch and retry in chunks
+                if "out of memory" in str(e).lower() and use_cuda:
+                    try:
+                        torch.cuda.empty_cache()
+                    except Exception:
+                        pass
+                    new_bs = max(1, bs // 2)
+                    if new_bs == bs:
+                        # give up and fall back to per-sample
+                        new_bs = 1
+                    # process in smaller windows
+                    for k in range(0, len(batch_html), new_bs):
+                        run_subbatch(k, min(len(batch_html), k + new_bs))
+                    bs = new_bs
+                else:
+                    raise
         batch_html = []
         batch_ids = []
         batch_labels = []
@@ -489,6 +583,12 @@ def load_preds(model_dir: str, jsonl_path: str, max_length: int = 512, device_pr
 
     y_true = np.array(y_list, dtype=int)
     probs = np.array(p_list, dtype=float)
+    # Save cache if requested
+    if cache_path:
+        try:
+            _write_dom_preds(cache_path, rows_min, probs)
+        except Exception:
+            pass
     return y_true, probs, rows_min
 
 
@@ -1267,10 +1367,36 @@ def main():
         except Exception:
             pass
 
-    # Predictions (DOM)
-    y_tr, p_tr, rows_tr = load_preds(args.model_dir, args.train_jsonl, args.max_length, args.device, args.eval_batch)
-    y_va, p_va, rows_va = load_preds(args.model_dir, args.val_jsonl, args.max_length, args.device, args.eval_batch)
-    y_te, p_te, rows_te = load_preds(args.model_dir, args.test_jsonl, args.max_length, args.device, args.eval_batch)
+    # Predictions (DOM) with caching to avoid recomputing
+    cache_dir = os.path.join(args.model_dir, "report", "preds_cache")
+    os.makedirs(cache_dir, exist_ok=True)
+    y_tr, p_tr, rows_tr = load_preds(
+        args.model_dir,
+        args.train_jsonl,
+        args.max_length,
+        args.device,
+        args.eval_batch,
+        cache_path=os.path.join(cache_dir, "train_dom.jsonl"),
+    )
+    # Prefer existing preds_{split}.jsonl in model_dir for val/test if present
+    val_cache = os.path.join(args.model_dir, "preds_val.jsonl")
+    test_cache = os.path.join(args.model_dir, "preds_test.jsonl")
+    y_va, p_va, rows_va = load_preds(
+        args.model_dir,
+        args.val_jsonl,
+        args.max_length,
+        args.device,
+        args.eval_batch,
+        cache_path=val_cache if os.path.exists(val_cache) else os.path.join(cache_dir, "val_dom.jsonl"),
+    )
+    y_te, p_te, rows_te = load_preds(
+        args.model_dir,
+        args.test_jsonl,
+        args.max_length,
+        args.device,
+        args.eval_batch,
+        cache_path=test_cache if os.path.exists(test_cache) else os.path.join(cache_dir, "test_dom.jsonl"),
+    )
 
     # Load JS preds if available (compute if missing)
     def read_preds(path: str):
@@ -1315,25 +1441,61 @@ def main():
         ids: List[Any] = []
         probs: List[float] = []
         bs = 8
+        max_bs_cap = 64
+        total_mem = None
+        if device.type == "cuda":
+            try:
+                total_mem = float(torch.cuda.get_device_properties(0).total_memory)
+            except Exception:
+                total_mem = None
         with torch.no_grad():
-            for i in range(0, len(ds), bs):
-                batch = ds.rows[i : i + bs]
+            i = 0
+            while i < len(ds):
+                end = min(len(ds), i + bs)
+                batch = ds.rows[i:end]
                 texts = [r["text"] for r in batch]
                 ids.extend([r.get("id") for r in batch])
-                batch_tok = tok(texts, truncation=True, padding=True, max_length=args.max_length, return_tensors="pt")
-                batch_tok = {k: v.to(device) for k, v in batch_tok.items()}
-                out = enc(**batch_tok)
-                last_hidden = out.last_hidden_state
-                mask = batch_tok["attention_mask"].unsqueeze(-1).type_as(last_hidden)
-                pooled = (last_hidden * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-6)
-                logits = pooled @ W.T
-                if B is not None:
-                    logits = logits + B
-                logits = logits.detach().cpu().numpy()
-                m = np.max(logits, axis=1, keepdims=True)
-                e = np.exp(logits - m)
-                p1 = (e[:, 1] / (e[:, 0] + e[:, 1]))
-                probs.extend(p1.tolist())
+                try:
+                    if device.type == "cuda":
+                        try:
+                            torch.cuda.reset_peak_memory_stats()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                    batch_tok = tok(texts, truncation=True, padding=True, max_length=args.max_length, return_tensors="pt")
+                    batch_tok = {k: v.to(device) for k, v in batch_tok.items()}
+                    out = enc(**batch_tok)
+                    last_hidden = out.last_hidden_state
+                    mask = batch_tok["attention_mask"].unsqueeze(-1).type_as(last_hidden)
+                    pooled = (last_hidden * mask).sum(dim=1) / torch.clamp(mask.sum(dim=1), min=1e-6)
+                    logits = pooled @ W.T
+                    if B is not None:
+                        logits = logits + B
+                    logits = logits.detach().cpu().numpy()
+                    m = np.max(logits, axis=1, keepdims=True)
+                    e = np.exp(logits - m)
+                    p1 = (e[:, 1] / (e[:, 0] + e[:, 1]))
+                    probs.extend(p1.tolist())
+                    # adaptive increase if headroom
+                    if device.type == "cuda" and total_mem:
+                        try:
+                            peak = float(torch.cuda.max_memory_allocated())  # type: ignore[attr-defined]
+                            if peak > 0 and peak / total_mem < 0.60 and bs < max_bs_cap:
+                                bs = min(max_bs_cap, max(bs + 1, int(bs * 3 / 2)))
+                        except Exception:
+                            pass
+                    i = end
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower() and device.type == "cuda" and bs > 1:
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                        # back off and retry smaller batch
+                        ids[:] = ids[:-(end - i)]  # remove ids we appended for this failed chunk
+                        bs = max(1, bs // 2)
+                        continue
+                    else:
+                        raise
         y = np.array([int(r["label"]) for r in ds.rows], dtype=int)
         return ids, y, np.array(probs, dtype=float)
 

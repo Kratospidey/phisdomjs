@@ -19,6 +19,10 @@ MOBILE_PROFILE ?= false
 GPU ?= false
 # Backfill network lookups toggle (1=true/0=false)
 BACKFILL_NETWORK ?= 1
+BACKFILL_WORKERS ?= 4
+BACKFILL_BATCH ?= 4000
+BACKFILL_DISABLE_VISUALS ?= 1
+BACKFILL_MAX_IMAGE_BYTES ?= 262144
 # Phase 6 (augmentation) toggle (1=true/0=false)
 AUGMENT_JS ?= 0
 # Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
@@ -45,6 +49,7 @@ XF_JS_RAW_FIELD ?=
 XF_NO_JS_CANON ?= 0
 XF_HTML_CANON ?= 0
 XF_HTML_FIELD ?= html
+JS_HEAD_NUM_WORKERS ?= 4
 
 # Ensure env for PhishTank
 # export PHISHTANK_APP_KEY=your_key
@@ -120,7 +125,7 @@ train-url-head:
 	$(PY) scripts/train_url_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/url_head --batch-size $(if $(filter $(SMOKE),1),32,64) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4
 
 train-js-head:
-	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --num-workers $(JS_HEAD_NUM_WORKERS) --resume $(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) $(if $(filter $(AUGMENT_JS),1),--raw-field js_augmented,)
 
 train-dom-gcn:
 	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size $(if $(filter $(SMOKE),1),8,16) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 2e-3 --weight-decay 1e-4
@@ -192,7 +197,7 @@ augment-js:
 	$(PY) scripts/augment_js.py --in-jsonl data/pages_train.jsonl --out-jsonl data/pages_train_aug.jsonl --prob-hex $(if $(filter $(SMOKE),1),0.01,0.05) --prob-split $(if $(filter $(SMOKE),1),0.01,0.05) --seed $(if $(SEED),$(SEED),42)
 
 train-js-head-aug:
-	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train_aug.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn_aug --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --raw-field js_augmented
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train_aug.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn_aug --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --raw-field js_augmented --num-workers $(JS_HEAD_NUM_WORKERS) --resume $(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,)
 
 eval-js-head-aug:
 	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn_aug --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
@@ -214,13 +219,13 @@ plot-heads:
 
 # End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
 ifeq ($(CRAWL),false)
-all e2e: feeds unify crawl-verify splits slice phase4
+all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else ifeq ($(CRAWL),0)
-all e2e: feeds unify crawl-verify splits slice phase4
+all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else ifeq ($(CRAWL),no)
-all e2e: feeds unify crawl-verify splits slice phase4
+all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else
-all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4 $(if $(filter $(AUGMENT_JS),1),phase6,)
+all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4 $(if $(filter $(AUGMENT_JS),1),phase6,) $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 endif
 
 .PHONY: crawl-verify
@@ -234,7 +239,7 @@ crawl-verify:
 
 # Resume from splits onward
 .PHONY: resume
-resume: splits slice train eval
+resume: splits slice train eval train-js-head eval-js-head train-dom-gcn eval-dom-gcn train-text-head eval-text-head train-cheap-mlp eval-cheap-mlp
 
 clean:
 	rm -f data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl data/splits.json
@@ -255,8 +260,8 @@ backfill:
 
 .PHONY: auto-backfill
 auto-backfill:
-	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK))"
-	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT)
+	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK)) [parallel workers=$(BACKFILL_WORKERS) batch=$(BACKFILL_BATCH) visuals=$(if $(filter $(BACKFILL_DISABLE_VISUALS),1),off,on) max_img=$(BACKFILL_MAX_IMAGE_BYTES)B]"
+	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(BACKFILL_WORKERS),--workers $(BACKFILL_WORKERS),) $(if $(BACKFILL_BATCH),--batch-lines $(BACKFILL_BATCH),) $(if $(filter $(BACKFILL_DISABLE_VISUALS),1),--disable-visuals,) $(if $(BACKFILL_MAX_IMAGE_BYTES),--max-image-bytes $(BACKFILL_MAX_IMAGE_BYTES),)
 
 # Phase 4 end-to-end: train/eval all heads, fuse, plot, report
 .PHONY: phase4
