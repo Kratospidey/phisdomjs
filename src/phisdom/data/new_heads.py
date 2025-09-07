@@ -3,12 +3,41 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 import os
 
-from phisdom.data.schema import load_jsonl
 from phisdom.features.extractors import extract_js_charseq, extract_url_charseq
 from phisdom.data.cheap_features import row_to_features, CHEAP_FEATURES
 
 
-# ---- Datasets ----
+# ---- Shared lazy JSONL index ----
+
+
+class _LazyIndex:
+    def __init__(self, path: str):
+        self.path = path
+        self.offsets: List[int] = []
+        off = 0
+        with open(path, "rb") as f:
+            for line in f:
+                self.offsets.append(off)
+                off += len(line)
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def read_row(self, i: int) -> Dict[str, Any]:
+        import json as _json
+        try:
+            import orjson as _orjson  # type: ignore
+        except Exception:
+            _orjson = None  # type: ignore
+        with open(self.path, "rb") as f:
+            f.seek(self.offsets[i])
+            raw = f.readline()
+        if _orjson is not None:
+            return _orjson.loads(raw)
+        return _json.loads(raw)
+
+
+# ---- URL char-seq dataset ----
 
 
 @dataclass
@@ -17,45 +46,51 @@ class UrlSeqDataset:
     seq_field: str = "url_charseq"
     label_field: str = "label"
     id_field: str = "id"
-    # If seq is missing/empty, encode from these raw fields (first non-empty wins)
     raw_fields: Tuple[str, ...] = ("url_final", "url_raw", "url")
     max_len: Optional[int] = 256
 
     def __post_init__(self):
-        rows = load_jsonl(self.path)
-
-        def make_seq(r: Dict[str, Any]) -> List[int]:
-            # Use precomputed if present and non-empty
+        base = _LazyIndex(self.path)
+        keep: List[int] = []
+        for i in range(len(base)):
+            r = base.read_row(i)
             seq = r.get(self.seq_field)
             if isinstance(seq, list) and len(seq) > 0:
-                return seq[: self.max_len] if self.max_len is not None else list(seq)
-            # Else encode from first available raw URL field
+                keep.append(i)
+                continue
+            # If any raw URL field exists
             for k in self.raw_fields:
                 v = r.get(k)
                 if isinstance(v, str) and v:
-                    ml = self.max_len if self.max_len is not None else len(v)
-                    return extract_url_charseq(v, max_len=int(ml))
-            return []
-
-        kept: List[Dict[str, Any]] = []
-        for r in rows:
-            seq = make_seq(r)
-            if not seq:
-                continue
-            r[self.seq_field] = seq
-            kept.append(r)
-        self.rows = kept
+                    keep.append(i)
+                    break
+        self._base = base
+        self._index = keep
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
-        return {
-            "id": r.get(self.id_field, str(idx)),
-            "seq": r.get(self.seq_field) or [],
-            "label": int(r.get(self.label_field, 0)),
-        }
+        r = self._base.read_row(self._index[idx])
+        seq = r.get(self.seq_field)
+        if not (isinstance(seq, list) and len(seq) > 0):
+            s: Optional[str] = None
+            for k in self.raw_fields:
+                v = r.get(k)
+                if isinstance(v, str) and v:
+                    s = v
+                    break
+            if s is None:
+                enc: List[int] = []
+            else:
+                ml = self.max_len if self.max_len is not None else len(s)
+                enc = extract_url_charseq(s, max_len=int(ml))
+        else:
+            enc = seq[: self.max_len] if (self.max_len is not None) else list(seq)
+        return {"id": r.get(self.id_field, str(idx)), "seq": enc, "label": int(r.get(self.label_field, 0))}
+
+
+# ---- JS char-seq dataset ----
 
 
 @dataclass
@@ -64,30 +99,26 @@ class JsSeqDataset:
     seq_field: str = "js_charseq"
     label_field: str = "label"
     id_field: str = "id"
-    raw_field: Optional[str] = None  # e.g., "js_augmented" or "js_raw"; if provided and seq missing, encode on-the-fly
-    # Fallback candidates if raw_field isn't set
+    raw_field: Optional[str] = None
     raw_candidates: Tuple[str, ...] = ("js_augmented", "js_raw")
-    # When falling back to scripts aggregation, cap collected characters for lightweight encoding
     scripts_budget: int = 8192
 
     def __post_init__(self):
-        rows = load_jsonl(self.path)
+        base = _LazyIndex(self.path)
+
         def _has_raw(r: Dict[str, Any]) -> bool:
-            # explicit raw field
             if self.raw_field:
                 raw = r.get(self.raw_field)
                 if isinstance(raw, str) and raw:
                     return True
                 if isinstance(raw, list) and any(str(x) for x in raw):
                     return True
-            # candidate fields
             for k in self.raw_candidates:
                 v = r.get(k)
                 if isinstance(v, str) and v:
                     return True
                 if isinstance(v, list) and any(str(x) for x in v):
                     return True
-            # scripts aggregation
             scr = r.get("scripts")
             if isinstance(scr, list):
                 for it in scr:
@@ -104,18 +135,24 @@ class JsSeqDataset:
             if isinstance(seq, list) and len(seq) > 0:
                 return True
             return _has_raw(r)
-        self.rows: List[Dict[str, Any]] = [r for r in rows if ok_row(r)]
+
+        keep: List[int] = []
+        for i in range(len(base)):
+            r = base.read_row(i)
+            if ok_row(r):
+                keep.append(i)
+        self._base = base
+        self._index = keep
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
+        r = self._base.read_row(self._index[idx])
         seq: List[int]
         if isinstance(r.get(self.seq_field), list) and len(r[self.seq_field]) > 0:
             seq = list(r[self.seq_field])
         else:
-            # Try explicit raw field
             s: Optional[str] = None
             if self.raw_field is not None:
                 raw = r.get(self.raw_field)
@@ -123,7 +160,6 @@ class JsSeqDataset:
                     s = "\n".join(str(x) for x in raw)
                 elif isinstance(raw, str):
                     s = raw
-            # Try candidates
             if not s:
                 for k in self.raw_candidates:
                     v = r.get(k)
@@ -133,7 +169,6 @@ class JsSeqDataset:
                     if isinstance(v, str) and v:
                         s = v
                         break
-            # Aggregate from scripts if still missing
             if not s:
                 scr = r.get("scripts")
                 if isinstance(scr, list):
@@ -168,6 +203,9 @@ class JsSeqDataset:
         }
 
 
+# ---- DOM graph dataset ----
+
+
 @dataclass
 class DomGraphDataset:
     path: str
@@ -176,20 +214,28 @@ class DomGraphDataset:
     id_field: str = "id"
 
     def __post_init__(self):
-        rows = load_jsonl(self.path)
+        base = _LazyIndex(self.path)
+
         def ok(r: Dict[str, Any]) -> bool:
             g = r.get(self.graph_field)
             if not isinstance(g, dict):
                 return False
             nodes = g.get("nodes") or []
             return isinstance(nodes, list) and len(nodes) > 0
-        self.rows: List[Dict[str, Any]] = [r for r in rows if ok(r)]
+
+        keep: List[int] = []
+        for i in range(len(base)):
+            r = base.read_row(i)
+            if ok(r):
+                keep.append(i)
+        self._base = base
+        self._index = keep
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
+        r = self._base.read_row(self._index[idx])
         return {
             "id": r.get(self.id_field, str(idx)),
             "graph": r.get(self.graph_field, {}),
@@ -206,7 +252,6 @@ class PaddedSeqCollator:
         self.max_len = max_len
 
     def __call__(self, batch: List[Dict[str, Any]]):
-        # late import
         import torch
         ids = [b["id"] for b in batch]
         labels = torch.tensor([int(b.get("label", 0)) for b in batch], dtype=torch.long)
@@ -224,21 +269,15 @@ class PaddedSeqCollator:
 
 
 class DomGraphCollator:
-    def __init__(self):
-        pass
-
     def __call__(self, batch: List[Dict[str, Any]]):
-        # late import
         import torch
         ids = [b["id"] for b in batch]
         labels = torch.tensor([int(b.get("label", 0)) for b in batch], dtype=torch.long)
-        # Build batched graph tensors with index offsets
-        node_features: List[List[int]] = []  # list of [t_hash, c_hash, depth, xbin]
+        node_features: List[List[int]] = []
         edge_src: List[int] = []
         edge_dst: List[int] = []
         batch_index: List[int] = []
         node_offset = 0
-        graph_ptr: List[Tuple[int, int]] = []  # (start_idx, n_nodes)
 
         for gi, b in enumerate(batch):
             g = b.get("graph") or b.get("dom_graph") or {}
@@ -247,7 +286,6 @@ class DomGraphCollator:
             n_nodes = len(nodes)
             if n_nodes == 0:
                 continue
-            # nodes can be dicts or lists
             for _n in nodes:
                 if isinstance(_n, dict):
                     t = int(_n.get("t_hash", 0))
@@ -260,7 +298,6 @@ class DomGraphCollator:
                     t = c = d = xb = 0
                 node_features.append([t, c, d, xb])
                 batch_index.append(gi)
-            # edges as list of pairs or 2xE
             if isinstance(edges, list):
                 for e in edges:
                     if isinstance(e, (list, tuple)) and len(e) >= 2:
@@ -277,13 +314,9 @@ class DomGraphCollator:
                 for s, d in zip(srcs, dsts):
                     edge_src.append(int(s) + node_offset)
                     edge_dst.append(int(d) + node_offset)
-            graph_ptr.append((node_offset, n_nodes))
             node_offset += n_nodes
 
-        if node_features:
-            nf = torch.tensor(node_features, dtype=torch.long)
-        else:
-            nf = torch.zeros((0, 4), dtype=torch.long)
+        nf = torch.tensor(node_features, dtype=torch.long) if node_features else torch.zeros((0, 4), dtype=torch.long)
         ei = torch.tensor([edge_src, edge_dst], dtype=torch.long) if edge_src else torch.zeros((2, 0), dtype=torch.long)
         bidx = torch.tensor(batch_index, dtype=torch.long) if batch_index else torch.zeros((0,), dtype=torch.long)
         return {"ids": ids, "node_feats_raw": nf, "edge_index": ei, "batch_index": bidx, "labels": labels}
@@ -318,7 +351,7 @@ def _default_text_alphabet() -> Dict[str, int]:
         except Exception:
             pass
     seen = set(); chars: List[str] = []
-    for ch in raw.replace("\\n","\n").replace("\\t","\t"):
+    for ch in raw.replace("\\n", "\n").replace("\\t", "\t"):
         if ch not in seen:
             seen.add(ch); chars.append(ch)
     alpha: Dict[str, int] = {}; i = 2
@@ -351,28 +384,26 @@ class TextSeqDataset:
     max_len: Optional[int] = None
 
     def __post_init__(self):
-        rows = load_jsonl(self.path)
-        kept: List[Dict[str, Any]] = []
-        for r in rows:
+        base = _LazyIndex(self.path)
+        keep: List[int] = []
+        for i in range(len(base)):
+            r = base.read_row(i)
             title = r.get(self.title_field) or ""
             visible = r.get(self.visible_field) or ""
-            seq = _encode_text_to_charseq((title + "\n" + visible), self.max_len)
-            if not seq:
-                continue
-            r["seq"] = seq
-            kept.append(r)
-        self.rows = kept
+            if title or visible:
+                keep.append(i)
+        self._base = base
+        self._index = keep
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
-        return {
-            "id": r.get(self.id_field, str(idx)),
-            "seq": r.get("seq") or [],
-            "label": int(r.get(self.label_field, 0)),
-        }
+        r = self._base.read_row(self._index[idx])
+        title = r.get(self.title_field) or ""
+        visible = r.get(self.visible_field) or ""
+        seq = _encode_text_to_charseq((title + "\n" + visible), self.max_len)
+        return {"id": r.get(self.id_field, str(idx)), "seq": seq, "label": int(r.get(self.label_field, 0))}
 
 
 # ---- Cheap features dataset ----
@@ -385,13 +416,14 @@ class CheapFeaturesDataset:
     id_field: str = "id"
 
     def __post_init__(self):
-        self.rows: List[Dict[str, Any]] = load_jsonl(self.path)
+        self._base = _LazyIndex(self.path)
+        self._index = list(range(len(self._base)))
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
+        r = self._base.read_row(self._index[idx])
         feats = row_to_features(r, use_features=True)
         return {
             "id": r.get(self.id_field, str(idx)),
@@ -402,7 +434,6 @@ class CheapFeaturesDataset:
 
 class CheapFeaturesCollator:
     def __call__(self, batch: List[Dict[str, Any]]):
-        # late import
         import torch
         ids = [b["id"] for b in batch]
         labels = torch.tensor([int(b.get("label", 0)) for b in batch], dtype=torch.long)
