@@ -50,6 +50,7 @@ def main():
     ap.add_argument("--batch-lines", type=int, default=2000)
     ap.add_argument("--disable-visuals", action="store_true", help="Skip favicon/logo to reduce memory")
     ap.add_argument("--max-image-bytes", type=int, default=262144)
+    ap.add_argument("--drop-raw", action="store_true", help="Drop large raw fields after enrichment")
     args = ap.parse_args()
 
     any_run = False
@@ -77,6 +78,8 @@ def main():
                 cmd.append("--disable-visuals")
             if args.max_image_bytes:
                 cmd.extend(["--max-image-bytes", str(args.max_image_bytes)])
+            if args.drop_raw:
+                cmd.append("--drop-raw")
             r = subprocess.run(cmd)
             if r.returncode != 0:
                 sys.exit(r.returncode)

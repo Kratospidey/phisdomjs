@@ -23,6 +23,7 @@ BACKFILL_WORKERS ?= 4
 BACKFILL_BATCH ?= 4000
 BACKFILL_DISABLE_VISUALS ?= 1
 BACKFILL_MAX_IMAGE_BYTES ?= 262144
+BACKFILL_DROP_RAW ?= 1
 # Phase 6 (augmentation) toggle (1=true/0=false)
 AUGMENT_JS ?= 0
 # Control whether to run the crawler (set to false/0/no to skip and use existing data/pages.jsonl)
@@ -260,8 +261,8 @@ backfill:
 
 .PHONY: auto-backfill
 auto-backfill:
-	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK)) [parallel workers=$(BACKFILL_WORKERS) batch=$(BACKFILL_BATCH) visuals=$(if $(filter $(BACKFILL_DISABLE_VISUALS),1),off,on) max_img=$(BACKFILL_MAX_IMAGE_BYTES)B]"
-	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(BACKFILL_WORKERS),--workers $(BACKFILL_WORKERS),) $(if $(BACKFILL_BATCH),--batch-lines $(BACKFILL_BATCH),) $(if $(filter $(BACKFILL_DISABLE_VISUALS),1),--disable-visuals,) $(if $(BACKFILL_MAX_IMAGE_BYTES),--max-image-bytes $(BACKFILL_MAX_IMAGE_BYTES),)
+	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK)) [parallel workers=$(BACKFILL_WORKERS) batch=$(BACKFILL_BATCH) visuals=$(if $(filter $(BACKFILL_DISABLE_VISUALS),1),off,on) drop_raw=$(BACKFILL_DROP_RAW) max_img=$(BACKFILL_MAX_IMAGE_BYTES)B]"
+	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(BACKFILL_WORKERS),--workers $(BACKFILL_WORKERS),) $(if $(BACKFILL_BATCH),--batch-lines $(BACKFILL_BATCH),) $(if $(filter $(BACKFILL_DISABLE_VISUALS),1),--disable-visuals,) $(if $(BACKFILL_MAX_IMAGE_BYTES),--max-image-bytes $(BACKFILL_MAX_IMAGE_BYTES),) $(if $(filter $(BACKFILL_DROP_RAW),1),--drop-raw,)
 
 # Phase 4 end-to-end: train/eval all heads, fuse, plot, report
 .PHONY: phase4

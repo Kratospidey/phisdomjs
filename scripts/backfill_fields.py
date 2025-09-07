@@ -808,8 +808,7 @@ def enrich_record(r: Dict[str, Any], *, allow_network: bool, tls_timeout: float,
 
 _WK_CTX: Dict[str, Any] = {}
 
-
-def _worker_init(allow_network: bool, tls_timeout: float, dns_timeout: float, allow_visuals: bool, max_image_bytes: int) -> None:
+def _worker_init(allow_network: bool, tls_timeout: float, dns_timeout: float, allow_visuals: bool, max_image_bytes: int, drop_raw: bool) -> None:
     # Per-process context (lightweight caches to avoid repeated lookups within a worker)
     _WK_CTX.clear()
     _WK_CTX["allow_network"] = bool(allow_network)
@@ -817,6 +816,7 @@ def _worker_init(allow_network: bool, tls_timeout: float, dns_timeout: float, al
     _WK_CTX["dns_timeout"] = float(dns_timeout)
     _WK_CTX["allow_visuals"] = bool(allow_visuals)
     _WK_CTX["max_image_bytes"] = int(max_image_bytes)
+    _WK_CTX["drop_raw"] = bool(drop_raw)
     _WK_CTX["rdap_cache"] = {}
     _WK_CTX["dns_cache"] = {}
 
@@ -844,13 +844,20 @@ def _process_batch(lines: List[str]) -> List[Optional[str]]:
                 allow_visuals=_WK_CTX.get("allow_visuals", True),
                 max_image_bytes=int(_WK_CTX.get("max_image_bytes", 262144)),
             )
+            if _WK_CTX.get("drop_raw", False):
+                # prune heavy fields
+                try:
+                    obj.pop("html", None)
+                    obj.pop("scripts", None)
+                except Exception:
+                    pass
             out.append(_json_dumps(obj))
         except Exception:
             out.append(None)
     return out
 
 
-def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout: float, dns_timeout: float, disable_tqdm: bool = False, workers: int = 1, batch_lines: int = 2000, allow_visuals: bool = True, max_image_bytes: int = 262144) -> None:
+def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout: float, dns_timeout: float, disable_tqdm: bool = False, workers: int = 1, batch_lines: int = 2000, allow_visuals: bool = True, max_image_bytes: int = 262144, drop_raw: bool = False) -> None:
     if not os.path.exists(path):
         return
     rdap_cache = {} if workers and workers > 1 else load_cache(RDAP_CACHE_PATH)
@@ -870,7 +877,7 @@ def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout
             pbar = tqdm(total=fsize if fsize > 0 else None, unit="B", unit_scale=True, desc=desc, dynamic_ncols=True)
         if workers and workers > 1:
             # Multi-process: submit batches, preserve order by writing futures in submission order
-            executor = ProcessPoolExecutor(max_workers=int(workers), initializer=_worker_init, initargs=(allow_network, tls_timeout, dns_timeout, allow_visuals, max_image_bytes))
+            executor = ProcessPoolExecutor(max_workers=int(workers), initializer=_worker_init, initargs=(allow_network, tls_timeout, dns_timeout, allow_visuals, max_image_bytes, drop_raw))
             futures: List[Any] = []
             buf: List[str] = []
             bytes_since = 0
@@ -930,6 +937,12 @@ def process_file(path: str, *, overwrite: bool, allow_network: bool, tls_timeout
                             pass
                     continue
                 obj = enrich_record(obj, allow_network=allow_network, tls_timeout=tls_timeout, dns_timeout=dns_timeout, rdap_cache=rdap_cache, dns_cache=dns_cache, allow_visuals=allow_visuals, max_image_bytes=max_image_bytes)
+                if drop_raw:
+                    try:
+                        obj.pop("html", None)
+                        obj.pop("scripts", None)
+                    except Exception:
+                        pass
                 out.write(_json_dumps(obj))
                 out.write("\n")
                 n += 1
@@ -965,9 +978,10 @@ def main():
     ap.add_argument("--batch-lines", type=int, default=2000, help="Lines per task batch when using --workers > 1")
     ap.add_argument("--disable-visuals", action="store_true", help="Skip favicon/logo network fetch and hashing to reduce memory")
     ap.add_argument("--max-image-bytes", type=int, default=262144, help="Max bytes to download per image (favicon/logo)")
+    ap.add_argument("--drop-raw", action="store_true", help="Drop large raw fields (html, scripts) after enrichment")
     args = ap.parse_args()
     for p in args.inputs:
-        print(f"[BACKFILL] file={p} overwrite={bool(args.overwrite)} network={bool(args.network)} tls_timeout={args.tls_timeout} dns_timeout={args.dns_timeout} workers={args.workers} batch_lines={args.batch_lines} visuals={not bool(args.disable_visuals)} max_image_bytes={args.max_image_bytes}")
+        print(f"[BACKFILL] file={p} overwrite={bool(args.overwrite)} network={bool(args.network)} tls_timeout={args.tls_timeout} dns_timeout={args.dns_timeout} workers={args.workers} batch_lines={args.batch_lines} visuals={not bool(args.disable_visuals)} max_image_bytes={args.max_image_bytes} drop_raw={bool(args.drop_raw)}")
         process_file(
             p,
             overwrite=bool(args.overwrite),
@@ -979,6 +993,7 @@ def main():
             batch_lines=int(args.batch_lines),
             allow_visuals=not bool(args.disable_visuals),
             max_image_bytes=int(args.max_image_bytes),
+            drop_raw=bool(args.drop_raw),
         )
 
 

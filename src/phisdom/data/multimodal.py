@@ -16,6 +16,33 @@ from ..features.extractors import (
 )
 
 
+class LazyJsonlIndex:
+    def __init__(self, path: str):
+        self.path = path
+        self.offsets: List[int] = []
+        off = 0
+        with open(path, "rb") as f:
+            for line in f:
+                self.offsets.append(off)
+                off += len(line)
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def read_row(self, idx: int) -> Dict[str, Any]:
+        import json as _json
+        try:
+            import orjson as _orjson  # type: ignore
+        except Exception:
+            _orjson = None  # type: ignore
+        with open(self.path, "rb") as f:
+            f.seek(self.offsets[idx])
+            raw = f.readline()
+        if _orjson is not None:
+            return _orjson.loads(raw)
+        return _json.loads(raw)
+
+
 @dataclass
 class MultiModalDataset:
     path: str
@@ -33,14 +60,18 @@ class MultiModalDataset:
     label_field: str = "label"
 
     def __post_init__(self):
-        self.rows: List[Dict[str, Any]] = load_jsonl(self.path)
+        # Avoid loading entire file; build a byte-offset index and read rows lazily
+        self._index = LazyJsonlIndex(self.path)
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
-        out: Dict[str, Any] = {"id": r.get(self.id_field, str(idx)), "label": int(r.get(self.label_field, 0))}
+        r = self._index.read_row(idx)
+        out: Dict[str, Any] = {
+            "id": r.get(self.id_field, str(idx)),
+            "label": int(r.get(self.label_field, 0)),
+        }
         if self.use_url:
             out["url_seq"] = list(r.get("url_charseq") or [])
         if self.use_js:

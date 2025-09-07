@@ -80,6 +80,10 @@ def main():
     ap.add_argument("--no-js-canonicalize", action="store_true")
     ap.add_argument("--html-canonicalize", action="store_true")
     ap.add_argument("--html-field", default="html")
+    ap.add_argument("--num-workers", type=int, default=0)
+    ap.add_argument("--pin-memory", action="store_true")
+    ap.add_argument("--persistent-workers", action="store_true")
+    ap.add_argument("--disable-tqdm", action="store_true")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -123,9 +127,10 @@ def main():
     html_field=args.html_field,
     )
     coll = MultiModalCollator()
-    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll)  # type: ignore[arg-type]
-    va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
-    te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
+    dl_kwargs = dict(num_workers=int(args.num_workers), pin_memory=bool(args.pin_memory), persistent_workers=bool(args.persistent_workers) and int(args.num_workers) > 0)
+    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
+    va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
+    te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
 
     model = CrossModalTransformerFusion().to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)

@@ -10,6 +10,33 @@ except Exception:  # pragma: no cover
     torch = None  # type: ignore
 
 
+class _LazyIndex:
+    def __init__(self, path: str):
+        self.path = path
+        self.offsets: List[int] = []
+        off = 0
+        with open(path, "rb") as f:
+            for line in f:
+                self.offsets.append(off)
+                off += len(line)
+
+    def __len__(self) -> int:
+        return len(self.offsets)
+
+    def read_row(self, i: int) -> Dict[str, Any]:
+        import json as _json
+        try:
+            import orjson as _orjson  # type: ignore
+        except Exception:
+            _orjson = None  # type: ignore
+        with open(self.path, "rb") as f:
+            f.seek(self.offsets[i])
+            raw = f.readline()
+        if _orjson is not None:
+            return _orjson.loads(raw)
+        return _json.loads(raw)
+
+
 @dataclass
 class JsonlPhishDataset:
     path: str
@@ -18,14 +45,20 @@ class JsonlPhishDataset:
     label_field: str = "label"
 
     def __post_init__(self):
-        rows = load_jsonl(self.path)
-        self.rows: List[Dict[str, Any]] = [r for r in rows if self.html_field in r and r[self.html_field]]
+        # Build lazy index; filter by presence of html field by scanning once to collect eligible offsets
+        base = _LazyIndex(self.path)
+        self._index: List[int] = []
+        for i in range(len(base)):
+            r = base.read_row(i)
+            if self.html_field in r and r[self.html_field]:
+                self._index.append(i)
+        self._base = base
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        r = self.rows[idx]
+        r = self._base.read_row(self._index[idx])
         return {
             "id": r.get(self.id_field, str(idx)),
             "html": r.get(self.html_field, ""),
