@@ -89,7 +89,8 @@ def main():
         z_val = logits_val[:, 1] - logits_val[:, 0]
     else:
         z_val = logits_val.reshape(-1)
-    y_val = np.array([r["label"] for r in val_ds.rows], dtype=int)
+    # Extract labels without relying on deprecated `.rows`
+    y_val = np.array([val_ds[i]["label"] for i in range(len(val_ds))], dtype=int)
 
     ts = TemperatureScaler(is_logit=True)
     T = ts.fit(y_val.tolist(), z_val.tolist())
@@ -103,7 +104,7 @@ def main():
         z_test = logits_test[:, 1] - logits_test[:, 0]
     else:
         z_test = logits_test.reshape(-1)
-    y_test = np.array([r["label"] for r in test_ds.rows], dtype=int)
+    y_test = np.array([test_ds[i]["label"] for i in range(len(test_ds))], dtype=int)
 
     # Calibrated probabilities
     p_val = np.array(ts.transform(z_val.tolist()))
@@ -130,8 +131,9 @@ def main():
     # Save predictions
     def dump_preds(path: str, ds: JsonlPhishDataset, probs: np.ndarray):
         with open(path, "w", encoding="utf-8") as f:
-            for r, p in zip(ds.rows, probs.tolist()):
-                obj = {"id": r.get("id"), "label": int(r.get("label", 0)), "prob": float(p)}
+            for i, p in enumerate(probs.tolist()):
+                r = ds[i]
+                obj = {"id": r.get("id", str(i)), "label": int(r.get("label", 0)), "prob": float(p)}
                 f.write(json.dumps(obj))
                 f.write("\n")
 

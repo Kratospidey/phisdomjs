@@ -5,37 +5,94 @@ import json
 import subprocess
 import sys
 from pathlib import Path
+from collections import deque
 
 
-def needs_backfill(path: Path) -> bool:
+def needs_backfill(path: Path, scan_lines: int = 200) -> bool:
+    """Return True if file appears to need backfilling.
+    Heuristic scans up to `scan_lines` JSON rows from the head and tail.
+    - If both compact and non-compact rows are seen (mixed), return True.
+    - If only compact rows are seen, return False.
+    - If only non-compact rows are seen, return True.
+    - If nothing can be parsed, return True (be conservative).
+    """
     if not path.exists() or path.stat().st_size == 0:
+        # Nothing to do (or empty file)
         return False
+    # Keys that indicate compact/enriched fields already present
+    markers = {
+        # legacy compact fields
+        "host_hyphens", "has_punycode",
+        "form_fp_hash64", "num_pw", "form_css_sig_hash64",
+        "js_eval_like", "key_listeners_total",
+        "favicon_dhash64", "logo_phash64",
+        "title_host_jaccard_q8",
+        # Phase 1 additions
+        "url_charseq", "js_charseq", "dom_graph", "text_title", "text_visible",
+    }
+    head_has = head_no = 0
+    tail_has = tail_no = 0
+    parsed_any = False
     try:
+        tail_buf = deque(maxlen=max(1, scan_lines * 4))  # keep more raw lines to ensure enough JSON rows in tail
         with path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
+            # Scan head while building tail buffer
+            head_seen = 0
+            for raw in f:
+                s = raw.strip()
+                if not s:
+                    tail_buf.append(raw)
                     continue
+                # Always feed into tail buffer
+                tail_buf.append(raw)
                 try:
-                    obj = json.loads(line)
+                    obj = json.loads(s)
                 except Exception:
                     continue
                 if not isinstance(obj, dict):
                     continue
-                keys = obj.keys()
-                markers = [
-                    # legacy compact fields
-                    "host_hyphens", "has_punycode",
-                    "form_fp_hash64", "num_pw", "form_css_sig_hash64",
-                    "js_eval_like", "key_listeners_total",
-                    "favicon_dhash64", "logo_phash64",
-                    "title_host_jaccard_q8",
-                    # Phase 1 additions
-                    "url_charseq", "js_charseq", "dom_graph", "text_title", "text_visible",
-                ]
-                return not any(k in keys for k in markers)
+                parsed_any = True
+                if head_seen < scan_lines:
+                    head_seen += 1
+                    if any(k in obj for k in markers):
+                        head_has += 1
+                    else:
+                        head_no += 1
+        # Now scan tail buffer for up to scan_lines JSON rows
+        tail_seen = 0
+        for raw in reversed(tail_buf):
+            if tail_seen >= scan_lines:
+                break
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                obj = json.loads(s)
+            except Exception:
+                continue
+            if not isinstance(obj, dict):
+                continue
+            tail_seen += 1
+            parsed_any = True
+            if any(k in obj for k in markers):
+                tail_has += 1
+            else:
+                tail_no += 1
     except Exception:
+        # If any IO/parsing error at file level, err on processing
         return True
+
+    any_has = (head_has + tail_has) > 0
+    any_no = (head_no + tail_no) > 0
+    if not parsed_any:
+        return True
+    if any_has and any_no:
+        # Mixed: likely appended new rows without compact fields
+        return True
+    if any_has and not any_no:
+        # All scanned rows look compact -> skip
+        return False
+    # Only non-compact seen (or insufficient head indicators) -> process
     return True
 
 
@@ -51,6 +108,8 @@ def main():
     ap.add_argument("--disable-visuals", action="store_true", help="Skip favicon/logo to reduce memory")
     ap.add_argument("--max-image-bytes", type=int, default=262144)
     ap.add_argument("--drop-raw", action="store_true", help="Drop large raw fields after enrichment")
+    ap.add_argument("--force", action="store_true", help="Force backfill regardless of existing compact fields")
+    ap.add_argument("--scan-lines", type=int, default=200, help="How many JSON rows to sample from head/tail when deciding if backfill is needed")
     args = ap.parse_args()
 
     any_run = False
@@ -58,8 +117,9 @@ def main():
         path = Path(p)
         if not path.exists():
             continue
-        if needs_backfill(path):
-            print(f"[AUTO-BACKFILL] Updating {path} ...", flush=True)
+        if args.force or needs_backfill(path, scan_lines=max(1, int(args.scan_lines))):
+            reason = "(forced)" if args.force else ""
+            print(f"[AUTO-BACKFILL] Updating {path} {reason}...", flush=True)
             cmd = [sys.executable, "scripts/backfill_fields.py", "--inputs", str(path)]
             if args.overwrite:
                 cmd.append("--overwrite")
