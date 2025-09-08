@@ -65,10 +65,12 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
     
     # Check if fusion directory has predictions, fall back to logistic fusion if needed
+    def _has_preds(d: str) -> bool:
+        return os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl"))
     fusion_dir = args.fusion_dir
-    if not os.path.isdir(fusion_dir) or not any(name.endswith("_preds.jsonl") for name in os.listdir(fusion_dir)):
+    if not _has_preds(fusion_dir):
         alt = "artifacts/fusion"
-        if os.path.isdir(alt) and any(name.endswith("_preds.jsonl") for name in os.listdir(alt)):
+        if _has_preds(alt):
             print(f"[CASCADE][WARN] '{fusion_dir}' has no predictions; falling back to '{alt}'.")
             fusion_dir = alt
         else:

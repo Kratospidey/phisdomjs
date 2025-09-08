@@ -655,7 +655,6 @@ def plot_reliability(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
 
 def plot_confusion(y: np.ndarray, p: np.ndarray, thr: float, out_dir: str, split: str):
     import matplotlib.pyplot as plt
-    import seaborn as sns
     from sklearn.metrics import confusion_matrix
     os.makedirs(out_dir, exist_ok=True)
     if len(set(map(int, y.tolist()))) < 2:
@@ -664,7 +663,12 @@ def plot_confusion(y: np.ndarray, p: np.ndarray, thr: float, out_dir: str, split
     yhat = (p >= thr).astype(int)
     cm = confusion_matrix(y, yhat, labels=[0, 1])
     plt.figure()
-    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues", cbar=False, xticklabels=["benign", "phish"], yticklabels=["benign", "phish"])
+    plt.imshow(cm, interpolation="nearest")
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+    plt.xticks([0,1], ["benign","phish"])
+    plt.yticks([0,1], ["benign","phish"])
     plt.xlabel("Predicted")
     plt.ylabel("True")
     plt.title(f"Confusion @ thr={thr:.3f} ({split})")
@@ -1423,7 +1427,10 @@ def main():
             with open(cal_path, "r", encoding="utf-8") as f:
                 cal = json.load(f)
             thr_95 = float(cal.get("thresholds", {}).get("0.95", {}).get("threshold", 0.5))
-            thr_90 = float(cal.get("thresholds", {}).get("0.9", {}).get("threshold", 0.5))
+            thr_90 = float(
+                cal.get("thresholds", {}).get("0.90", {}).get("threshold",
+                cal.get("thresholds", {}).get("0.9", {}).get("threshold", 0.5))
+            )
         except Exception:
             pass
 
@@ -1696,7 +1703,10 @@ def main():
             with open(fu_cal, "r", encoding="utf-8") as f:
                 cal_f = json.load(f)
             thrf_95 = float(cal_f.get("thresholds", {}).get("0.95", {}).get("threshold", thr_95))
-            thrf_90 = float(cal_f.get("thresholds", {}).get("0.9", {}).get("threshold", thr_90))
+            thrf_90 = float(
+                cal_f.get("thresholds", {}).get("0.90", {}).get("threshold",
+                cal_f.get("thresholds", {}).get("0.9", {}).get("threshold", thr_90))
+            )
             if fu_val and fu_test:
                 y_va_fu, p_va_fu = fu_val
                 y_te_fu, p_te_fu = fu_test

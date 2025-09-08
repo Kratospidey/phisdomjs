@@ -27,7 +27,7 @@ def train_one_epoch(model, loader, opt, sched, device):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
         opt.zero_grad(set_to_none=True)
-        logits = model(batch)
+        logits = model(batch).squeeze(-1)
         loss = crit(logits, labels)
         loss.backward()
         opt.step()
@@ -46,11 +46,14 @@ def eval_logits(model, loader, device):
     ids: List[str] = []
     for batch in loader:
         labels = batch.pop("labels").to(device)
-        ids.extend(batch.get("ids", []))
+        # accept either 'ids' or 'id' from the collator
+        _ids = batch.pop("ids", None) or batch.pop("id", None)
+        if _ids is not None:
+            ids.extend(list(_ids))
         for k, v in list(batch.items()):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
-        logits = model(batch)
+        logits = model(batch).squeeze(-1)
         logits_list.append(logits.detach().cpu())
         labels_list.append(labels.detach().cpu())
     if not logits_list:
@@ -137,8 +140,11 @@ def main():
     if not args.no_cheap:
         try:
             sample_batch = next(iter(tr_dl))
-            if "cheap_features" in sample_batch and sample_batch["cheap_features"] is not None:
-                cheap_dim = int(sample_batch["cheap_features"].shape[-1])
+            cf = sample_batch.get("cheap_features", None)
+            if cf is None:
+                cf = sample_batch.get("cheap", None)  # fallback key
+            if cf is not None:
+                cheap_dim = int(cf.shape[-1])
                 print(f"Detected cheap feature dimension: {cheap_dim}")
             else:
                 # Fallback to feature count from constant

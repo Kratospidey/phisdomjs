@@ -158,22 +158,22 @@ def main():
 
     if args.method == "average":
         # Simple equal-weight average across all heads
-        pv = np.clip(np.mean(Xv[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
-        pt = np.clip(np.mean(Xt[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+        pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+        pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
     else:
         # Logistic regression fusion
         try:
             from sklearn.linear_model import LogisticRegression
         except Exception:
             print("WARN: scikit-learn not installed; falling back to average fusion")
-            pv = fuse_average(Xv[:, 0], Xv[:, 1])
-            pt = fuse_average(Xt[:, 0], Xt[:, 1])
+            pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+            pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
         else:
             # Guard: if yv has a single class, LR is ill-posed; fall back to simple average
             if len(set(yv.tolist())) < 2:
                 print("WARN: Validation split is one-class; using average fusion.")
-                pv = np.clip(np.mean(Xv[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
-                pt = np.clip(np.mean(Xt[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+                pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+                pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
             else:
                 # L2 by default; use class_weight balanced to be robust
                 clf = LogisticRegression(max_iter=1000, class_weight="balanced")
