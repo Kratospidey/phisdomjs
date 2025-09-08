@@ -1,4 +1,4 @@
-from typing import Sequence, Tuple
+from typing import Sequence, Tuple, Optional
 
 
 def _sorted_by_score(y_true: Sequence[int], y_score: Sequence[float]):
@@ -99,3 +99,30 @@ def fpr_at_tpr(y_true: Sequence[int], y_score: Sequence[float], target_tpr: floa
         elif y == 0:
             fp += 1
     return 1.0, float("inf")
+
+
+# ---- Safe wrappers for one-class splits ----
+
+def _is_one_class(y_true: Sequence[int]) -> bool:
+    try:
+        s = set(int(y) for y in y_true)
+    except Exception:
+        s = set(y_true)
+    return len(s) < 2
+
+
+def roc_auc_safe(y_true: Sequence[int], y_score: Sequence[float]) -> Optional[float]:
+    """Return ROC-AUC or None if split is one-class.
+
+    Keeping the original roc_auc intact for callers that prefer sentinel values.
+    """
+    if _is_one_class(y_true):
+        return None
+    return roc_auc(y_true, y_score)
+
+
+def pr_auc_safe(y_true: Sequence[int], y_score: Sequence[float]) -> Optional[float]:
+    """Return PR-AUC or None if split is one-class."""
+    if _is_one_class(y_true):
+        return None
+    return pr_auc(y_true, y_score)

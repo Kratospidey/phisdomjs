@@ -596,6 +596,12 @@ def plot_curves(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import precision_recall_curve, roc_curve, auc
     os.makedirs(out_dir, exist_ok=True)
+    # One-class guard
+    if len(set(map(int, y.tolist()))) < 2:
+        # Create tiny placeholder images to avoid report breaks
+        plt.figure(); plt.text(0.5, 0.5, "One-class split; PR/ROC not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"pr_curve_{split}.png")); plt.close()
+        plt.figure(); plt.text(0.5, 0.5, "One-class split; PR/ROC not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"roc_curve_{split}.png")); plt.close()
+        return
 
     # PR
     prec, rec, _ = precision_recall_curve(y, p)
@@ -631,6 +637,9 @@ def plot_reliability(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
     import matplotlib.pyplot as plt
     from sklearn.calibration import calibration_curve
     os.makedirs(out_dir, exist_ok=True)
+    if len(set(map(int, y.tolist()))) < 2:
+        plt.figure(); plt.text(0.5, 0.5, "One-class split; reliability not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"reliability_{split}.png")); plt.close()
+        return
     frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="uniform")
     plt.figure()
     plt.plot(mean_pred, frac_pos, marker="o")
@@ -649,6 +658,9 @@ def plot_confusion(y: np.ndarray, p: np.ndarray, thr: float, out_dir: str, split
     import seaborn as sns
     from sklearn.metrics import confusion_matrix
     os.makedirs(out_dir, exist_ok=True)
+    if len(set(map(int, y.tolist()))) < 2:
+        plt.figure(); plt.text(0.5, 0.5, "One-class split; confusion not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"confusion_{split}.png")); plt.close()
+        return
     yhat = (p >= thr).astype(int)
     cm = confusion_matrix(y, yhat, labels=[0, 1])
     plt.figure()

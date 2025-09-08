@@ -9,7 +9,7 @@ import numpy as np
 
 from phisdom.data.schema import load_jsonl
 from phisdom.data.cheap_features import CHEAP_FEATURES, row_to_features
-from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
+from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 
 def read_preds(path: str) -> Dict[str, float]:
@@ -136,8 +136,8 @@ def main():
                 json.dump(w, f, indent=2)
 
     # Metrics and thresholds on test
-    pr = pr_auc(yt.tolist(), pt.tolist())
-    roc = roc_auc(yt.tolist(), pt.tolist())
+    pr = pr_auc_safe(yt.tolist(), pt.tolist())
+    roc = roc_auc_safe(yt.tolist(), pt.tolist())
     thresholds = {}
     for tpr in args.tpr:
         fpr, thr = fpr_at_tpr(yt.tolist(), pt.tolist(), tpr)

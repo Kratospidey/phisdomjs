@@ -19,7 +19,7 @@ from phisdom.data.new_heads import (
 )
 from phisdom.models.heads import UrlCharCNN, JsCharCNN, DomGCN
 from phisdom.models.calibration import fit_temperature, TemperatureScaler
-from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
+from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 
 @torch.no_grad()
@@ -86,7 +86,7 @@ def main():
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         model = UrlCharCNN().to(device)
         eval_fn = eval_logits_seq
-        get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
+        get_ids = lambda ds: [ds[i].get("id", str(i)) for i in range(len(ds))]
     elif args.head == "js":
         tr_ds = JsSeqDataset(args.val_jsonl)
         va_ds = JsSeqDataset(args.val_jsonl)
@@ -96,7 +96,7 @@ def main():
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         model = JsCharCNN().to(device)
         eval_fn = eval_logits_seq
-        get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
+        get_ids = lambda ds: [ds[i].get("id", str(i)) for i in range(len(ds))]
     elif args.head == "dom":
         tr_ds = DomGraphDataset(args.val_jsonl)
         va_ds = DomGraphDataset(args.val_jsonl)
@@ -106,7 +106,7 @@ def main():
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         model = DomGCN().to(device)
         eval_fn = eval_logits_graph
-        get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
+        get_ids = lambda ds: [ds[i].get("id", str(i)) for i in range(len(ds))]
     elif args.head == "text":
         from phisdom.data.new_heads import TextSeqDataset
         from phisdom.models.heads import TextCharCNN
@@ -118,7 +118,7 @@ def main():
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         model = TextCharCNN().to(device)
         eval_fn = eval_logits_seq
-        get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
+        get_ids = lambda ds: [ds[i].get("id", str(i)) for i in range(len(ds))]
     else:
         from phisdom.data.new_heads import CheapFeaturesDataset, CheapFeaturesCollator
         from phisdom.data.cheap_features import CHEAP_FEATURES
@@ -146,7 +146,7 @@ def main():
                 return torch.empty((0,)), torch.empty((0,), dtype=torch.long)
             return torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
         eval_fn = eval_logits_mlp
-        get_ids = lambda ds: [r.get("id", str(i)) for i, r in enumerate(ds.rows)]
+        get_ids = lambda ds: [ds[i].get("id", str(i)) for i in range(len(ds))]
 
     # Load weights
     state_p = os.path.join(args.model_dir, "model.pt")
@@ -179,8 +179,8 @@ def main():
         p_test = torch.sigmoid(test_logits / torch.exp(ts.log_T)).numpy() if test_logits.numel() else np.zeros((0,), dtype=float)
 
     # Metrics on test
-    pr = pr_auc(test_labels.tolist(), p_test.tolist()) if p_test.size else 0.0
-    roc = roc_auc(test_labels.tolist(), p_test.tolist()) if p_test.size else 0.0
+    pr = pr_auc_safe(test_labels.tolist(), p_test.tolist()) if p_test.size else None
+    roc = roc_auc_safe(test_labels.tolist(), p_test.tolist()) if p_test.size else None
     thresholds = {}
     for tpr in (0.95, 0.90):
         fpr, thr = fpr_at_tpr(test_labels.tolist(), p_test.tolist(), tpr) if p_test.size else (1.0, 1.0)
@@ -199,23 +199,23 @@ def main():
             tr_ds = UrlSeqDataset(args.train_jsonl)
             tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
             tr_eval = eval_logits_seq
-            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+            tr_ids = [tr_ds[i].get("id", str(i)) for i in range(len(tr_ds))]
         elif args.head == "js":
             tr_ds = JsSeqDataset(args.train_jsonl)
             tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
             tr_eval = eval_logits_seq
-            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+            tr_ids = [tr_ds[i].get("id", str(i)) for i in range(len(tr_ds))]
         elif args.head == "dom":
             tr_ds = DomGraphDataset(args.train_jsonl)
             tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=DomGraphCollator())  # type: ignore[arg-type]
             tr_eval = eval_logits_graph
-            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+            tr_ids = [tr_ds[i].get("id", str(i)) for i in range(len(tr_ds))]
         elif args.head == "text":
             from phisdom.data.new_heads import TextSeqDataset
             tr_ds = TextSeqDataset(args.train_jsonl)
             tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
             tr_eval = eval_logits_seq
-            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+            tr_ids = [tr_ds[i].get("id", str(i)) for i in range(len(tr_ds))]
         else:
             from phisdom.data.new_heads import CheapFeaturesDataset, CheapFeaturesCollator
             tr_ds = CheapFeaturesDataset(args.train_jsonl)
@@ -234,7 +234,7 @@ def main():
                 if not logits_list:
                     return torch.empty((0,)), torch.empty((0,), dtype=torch.long)
                 return torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
-            tr_ids = [r.get("id", str(i)) for i, r in enumerate(tr_ds.rows)]
+            tr_ids = [tr_ds[i].get("id", str(i)) for i in range(len(tr_ds))]
         tr_logits, tr_labels_t = tr_eval(model, tr_dl, device)
         with torch.no_grad():
             p_train = torch.sigmoid(tr_logits / torch.exp(ts.log_T)).numpy() if tr_logits.numel() else np.zeros((0,), dtype=float)

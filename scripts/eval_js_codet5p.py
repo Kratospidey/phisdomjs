@@ -11,7 +11,7 @@ from transformers import AutoTokenizer, T5EncoderModel
 
 from phisdom.data.js import JsonlJsDataset
 from phisdom.calibration import TemperatureScaler
-from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
+from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 
 def predict(model: T5EncoderModel, tokenizer, ds: JsonlJsDataset, max_length: int, clf_path: str) -> np.ndarray:
@@ -79,8 +79,8 @@ def main(args):
     p_test_cal = np.array(ts.transform(z_test.tolist()))
 
     # Metrics
-    pr = pr_auc(y_test.tolist(), p_test_cal.tolist())
-    roc = roc_auc(y_test.tolist(), p_test_cal.tolist())
+    pr = pr_auc_safe(y_test.tolist(), p_test_cal.tolist())
+    roc = roc_auc_safe(y_test.tolist(), p_test_cal.tolist())
 
     thresholds = {}
     for tpr in args.tpr:

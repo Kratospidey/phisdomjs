@@ -20,7 +20,7 @@ import torch
 
 from phisdom.data.loader import JsonlPhishDataset, MarkupLMDataCollator
 from phisdom.calibration import TemperatureScaler
-from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
+from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 
 def main():
@@ -111,8 +111,8 @@ def main():
     p_test = np.array(ts.transform(z_test.tolist()))
 
     # Metrics
-    pr = pr_auc(y_test.tolist(), p_test.tolist())
-    roc = roc_auc(y_test.tolist(), p_test.tolist())
+    pr = pr_auc_safe(y_test.tolist(), p_test.tolist())
+    roc = roc_auc_safe(y_test.tolist(), p_test.tolist())
 
     thresholds = {}
     for tpr in args.tpr:
