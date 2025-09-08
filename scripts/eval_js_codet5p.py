@@ -29,8 +29,8 @@ def predict(model: T5EncoderModel, tokenizer, ds: JsonlJsDataset, max_length: in
     bs = 8
     with torch.no_grad():
         for i in range(0, len(ds), bs):
-            batch = ds.rows[i : i + bs]
-            texts = [r["text"] for r in batch]
+            batch = [ds[j] for j in range(i, min(len(ds), i + bs))]
+            texts = [r.get("text", "") for r in batch]
             enc = tokenizer(texts, truncation=True, padding=True, max_length=max_length, return_tensors="pt")
             enc = {k: v.to(device) for k, v in enc.items()}
             out = model(**enc)
@@ -63,8 +63,8 @@ def main(args):
     clf_path = os.path.join(args.model_dir, "classifier.pt")
     p_val = predict(model, tokenizer, val_ds, args.max_length, clf_path)
     p_test = predict(model, tokenizer, test_ds, args.max_length, clf_path)
-    y_val = np.array([int(r["label"]) for r in val_ds.rows], dtype=int)
-    y_test = np.array([int(r["label"]) for r in test_ds.rows], dtype=int)
+    y_val = np.array([int(val_ds[i].get("label", 0)) for i in range(len(val_ds))], dtype=int)
+    y_test = np.array([int(test_ds[i].get("label", 0)) for i in range(len(test_ds))], dtype=int)
 
     # Calibrate on val
     # Convert probabilities to logits for temperature scaling stability
@@ -94,8 +94,9 @@ def main(args):
 
     def dump_preds(path: str, ds: JsonlJsDataset, probs: np.ndarray):
         with open(path, "w", encoding="utf-8") as f:
-            for r, p in zip(ds.rows, probs.tolist()):
-                obj = {"id": r.get("id"), "label": int(r.get("label", 0)), "prob": float(p)}
+            for i, p in enumerate(probs.tolist()):
+                r = ds[i]
+                obj = {"id": r.get("id", str(i)), "label": int(r.get("label", 0)), "prob": float(p)}
                 f.write(json.dumps(obj))
                 f.write("\n")
 

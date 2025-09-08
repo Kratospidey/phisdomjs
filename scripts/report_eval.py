@@ -1452,9 +1452,10 @@ def main():
             i = 0
             while i < len(ds):
                 end = min(len(ds), i + bs)
-                batch = ds.rows[i:end]
-                texts = [r["text"] for r in batch]
-                ids.extend([r.get("id") for r in batch])
+                # Gather batch rows via index to support lazy datasets
+                batch_rows = [ds[j] for j in range(i, end)]
+                texts = [r.get("text", "") for r in batch_rows]
+                ids.extend([r.get("id") for r in batch_rows])
                 try:
                     if device.type == "cuda":
                         try:
@@ -1496,7 +1497,7 @@ def main():
                         continue
                     else:
                         raise
-        y = np.array([int(r["label"]) for r in ds.rows], dtype=int)
+        y = np.array([int(ds[k].get("label", 0)) for k in range(len(ds))], dtype=int)
         return ids, y, np.array(probs, dtype=float)
 
     js_val_path = os.path.join(args.js_dir, "preds_val.jsonl")
@@ -1670,17 +1671,40 @@ def main():
     from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, log_loss, roc_auc_score, average_precision_score
 
     def metrics_for(y: np.ndarray, p: np.ndarray, thr: float) -> Dict[str, float]:
+        """Compute standard metrics robustly, even when y has a single class.
+        - log_loss: pass labels=[0,1] to avoid ValueError when y contains a single class
+        - roc_auc / pr_auc: return NaN if undefined (single-class y)
+        """
         yhat = (p >= thr).astype(int)
-        m = {
-            "accuracy": float(accuracy_score(y, yhat)),
-            "precision": float(precision_score(y, yhat, zero_division=0)),
-            "recall": float(recall_score(y, yhat, zero_division=0)),
-            "f1": float(f1_score(y, yhat, zero_division=0)),
-            "log_loss": float(log_loss(y, np.clip(p, 1e-8, 1-1e-8))),
-            "roc_auc": float(roc_auc_score(y, p)),
-            "pr_auc": float(average_precision_score(y, p)),
+        p_clip = np.clip(p, 1e-8, 1 - 1e-8)
+        # Always compute well-defined metrics
+        acc = float(accuracy_score(y, yhat))
+        prec = float(precision_score(y, yhat, zero_division=0))
+        rec = float(recall_score(y, yhat, zero_division=0))
+        f1 = float(f1_score(y, yhat, zero_division=0))
+        # log_loss: specify labels to support single-class y
+        try:
+            ll = float(log_loss(y, p_clip, labels=[0, 1]))
+        except Exception:
+            ll = float("nan")
+        # AUCs: undefined for single-class y
+        try:
+            roc = float(roc_auc_score(y, p))
+        except Exception:
+            roc = float("nan")
+        try:
+            pr = float(average_precision_score(y, p))
+        except Exception:
+            pr = float("nan")
+        return {
+            "accuracy": acc,
+            "precision": prec,
+            "recall": rec,
+            "f1": f1,
+            "log_loss": ll,
+            "roc_auc": roc,
+            "pr_auc": pr,
         }
-        return m
 
     metrics_summary: Dict[str, Any] = {
         "thresholds": {"tpr95": thr_95, "tpr90": thr_90},
