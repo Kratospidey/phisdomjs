@@ -152,8 +152,10 @@ def main():
         except Exception as e:
             print(f"Warning: Could not detect cheap feature dimension, using default 32: {e}")
     
-    # Use None for cheap_dim to enable LazyLinear adaptation
-    model = CrossModalTransformerFusion(cheap_dim=None).to(device)
+    # Use detected cheap_dim unless disabled, else allow module to adapt lazily with None
+    model = CrossModalTransformerFusion(
+        cheap_dim=None if args.no_cheap else cheap_dim
+    ).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(tr_dl) * args.epochs))
 

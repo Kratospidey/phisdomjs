@@ -32,7 +32,8 @@ def find_threshold_for_precision(y: np.ndarray, p: np.ndarray, target_precision:
     best_thr = float("inf") if greater_is_positive else -float("inf")
     for idx in order:
         thr = p[idx]
-        if (y[idx] == 1) == greater_is_positive:
+        is_pos = (y[idx] == 1)
+        if is_pos:
             tp += 1
         else:
             fp += 1
@@ -72,10 +73,6 @@ def main():
         else:
             print(f"[CASCADE][WARN] No usable fusion preds found in '{fusion_dir}' or '{alt}'. Cascade may fail.")
     
-    def split_from_path(p: str) -> str:
-        base = os.path.splitext(os.path.basename(p))[0]
-        return base.split('_')[-1]
-
     def load_split(split: str):
         url = read_preds(os.path.join(args.url_dir, f"preds_{split}.jsonl"))
         cheap = read_preds(os.path.join(args.cheap_dir, f"preds_{split}.jsonl"))
@@ -94,7 +91,8 @@ def main():
         thr_hi = 1.0
         thr_lo = 0.0
     else:
-        s1_v = 0.5 * pu_v + 0.5 * pc_v
+        # stage-1 is simple average; clamp to [0,1] defensively
+        s1_v = np.clip(0.5 * pu_v + 0.5 * pc_v, 0.0, 1.0)
         # Guard against one-class validation
         if len(set(yv.tolist())) < 2:
             thr_hi = 1.0
@@ -106,6 +104,12 @@ def main():
             thr_lo = find_threshold_for_precision(1 - yv, inv_scores, args.target_benign_precision, greater_is_positive=True)
             # convert back to score threshold
             thr_lo = 1.0 - thr_lo
+            # Ensure non-overlapping thresholds so fusion still handles the middle band
+            if thr_lo > thr_hi:
+                eps = 1e-6
+                mid = 0.5 * (thr_lo + thr_hi)
+                thr_lo = max(0.0, mid - eps)
+                thr_hi = min(1.0, mid + eps)
 
     # Apply cascade on a split
     def apply(split: str):
@@ -113,7 +117,7 @@ def main():
         if len(ids) == 0:
             # Empty alignment across heads; return NaNs to avoid runtime warnings
             return ids, y, np.array([], dtype=float), float("nan"), float("nan"), float("nan")
-        s1 = 0.5 * pu + 0.5 * pc
+        s1 = np.clip(0.5 * pu + 0.5 * pc, 0.0, 1.0)
         accept_phish = s1 >= thr_hi
         accept_benign = s1 <= thr_lo
         # final probabilities: use s1 where accepted, else fused

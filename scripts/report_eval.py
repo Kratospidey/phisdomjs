@@ -314,8 +314,9 @@ def _prob_bars_html(probs: List[float], class_names: List[str]) -> str:
     pairs = list(zip(class_names, probs))
     rows = []
     for name, p in pairs:
-        pct = f"{p*100:.1f}%"
-        width = int(p*100)
+        p_clamped = max(0.0, min(1.0, float(p)))
+        pct = f"{p_clamped*100:.1f}%"
+        width = int(p_clamped*100)
         rows.append(
             "<div style='margin:4px 0'>"
             f"<div class='mono' style='font-size:12px;margin-bottom:2px'>{name}: {pct}</div>"
@@ -801,7 +802,8 @@ def plot_accuracy_curve_multi_splits(series: List[Tuple[str, np.ndarray, np.ndar
     for label, y, p in series:
         accs = []
         for t in thresholds:
-            accs.append((p >= t).astype(int).mean())
+            yhat = (p >= t).astype(int)
+            accs.append((yhat == y).mean())
         plt.plot(thresholds, accs, label=label)
     plt.xlabel("Threshold")
     plt.ylabel("Accuracy")
@@ -1466,7 +1468,7 @@ def main():
     )
 
     # Load JS preds if available (compute if missing)
-    def read_preds(path: str):
+    def read_preds_arrays(path: str):
         if not os.path.exists(path):
             return None
         y: List[int] = []
@@ -1576,14 +1578,14 @@ def main():
     xfu_val_path = os.path.join(xfu_dir, "preds_val.jsonl")
     xfu_test_path = os.path.join(xfu_dir, "preds_test.jsonl")
 
-    js_val = read_preds(js_val_path)
-    js_test = read_preds(js_test_path)
+    js_val = read_preds_arrays(js_val_path)
+    js_test = read_preds_arrays(js_test_path)
     # Compute JS train preds if possible
     js_train = compute_js_preds(args.train_jsonl)
-    fu_val = read_preds(fu_val_path)
-    fu_test = read_preds(fu_test_path)
-    xfu_val = read_preds(xfu_val_path)
-    xfu_test = read_preds(xfu_test_path)
+    fu_val = read_preds_arrays(fu_val_path)
+    fu_test = read_preds_arrays(fu_test_path)
+    xfu_val = read_preds_arrays(xfu_val_path)
+    xfu_test = read_preds_arrays(xfu_test_path)
 
     # Curves & reliability
     plot_curves(y_tr, p_tr, report_dir, "train")

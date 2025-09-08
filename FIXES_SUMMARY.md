@@ -63,16 +63,19 @@ def find_threshold_for_precision(y, p, target_precision, greater_is_positive=Tru
 
 ### 4. **Silent Gotchas Fixed** ✅
 
-#### 4a. Train Fusion X-Attention - No Burned Batches
+#### 4a. Train Fusion X-Attention - No Burned Batches + Use Detected Dimension
 **File**: `scripts/train_fusion_xattn.py`
 ```python
-# OLD: Burns first training batch
+# OLD: Burns first training batch + ignores detected dimension
 sample_batch = next(iter(tr_dl))
+model = CrossModalTransformerFusion(cheap_dim=None)
 
-# NEW: Clean dimension detection
+# NEW: Clean dimension detection + use detected value when available
 sample_row = tr_ds[0]
 sample_batch = coll([sample_row])  # No DataLoader iteration
-model = CrossModalTransformerFusion(cheap_dim=None)  # Auto-adapt
+model = CrossModalTransformerFusion(
+    cheap_dim=None if args.no_cheap else cheap_dim  # Use detected or auto-adapt
+)
 ```
 
 #### 4b. JS Training OOM Bookkeeping  
@@ -95,10 +98,57 @@ except RuntimeError:
     bs = max(1, bs // 2)
 ```
 
-#### 4c. LIME/SHAP Error Handling *(Already Fixed)*
+#### 4c. Accuracy Curve Correctness 
+**File**: `scripts/report_eval.py` 
+```python
+# OLD: Plots rate of positive predictions (ignores labels!)
+accs.append((p >= t).astype(int).mean())
+
+# NEW: Actual accuracy vs labels
+yhat = (p >= t).astype(int)
+accs.append((yhat == y).mean())
+```
+
+#### 4d. Cascade Threshold Overlap Prevention
+**File**: `scripts/cascade.py`
+```python
+# NEW: Prevent "accept everything" when benign > phish threshold
+if thr_lo > thr_hi:
+    eps = 1e-6
+    mid = 0.5 * (thr_lo + thr_hi)
+    thr_lo = max(0.0, mid - eps)
+    thr_hi = min(1.0, mid + eps)
+```
+
+#### 4e. Progress Bar Clipping + Function Name Disambiguation
+**File**: `scripts/report_eval.py`
+```python
+# Progress bars: prevent widths outside [0,100]
+p_clamped = max(0.0, min(1.0, float(p)))
+width = int(p_clamped*100)
+
+# Avoid name shadowing: tuple-returning reader renamed
+def read_preds_arrays(path: str):  # was read_preds
+```
+
+#### 4f. Simplified Threshold Logic + Score Clipping
+**File**: `scripts/cascade.py`
+```python
+# Clearer precision threshold counting
+is_pos = (y[idx] == 1)
+if is_pos:
+    tp += 1
+else:
+    fp += 1
+
+# Defensive stage-1 score clipping
+s1 = np.clip(0.5 * pu + 0.5 * pc, 0.0, 1.0)
+```
+
+#### 4g. LIME/SHAP Error Handling *(Already Fixed)*
 **File**: `scripts/report_eval.py` - Enhanced error handling for explanation generation
 
-#### 4d. Seaborn Dependency Removal *(Already Fixed)*  
+#### 4h. Seaborn Dependency Removal *(Already Fixed)*  
 **File**: `scripts/report_eval.py` - Pure matplotlib confusion matrices
 
 ## New Features
@@ -131,9 +181,26 @@ Running the full pipeline should now:
 1. **Complete without crashes** - LazyLinear handles any cheap feature dimension  
 2. **Show reasonable fusion performance** - Stable ID joining restores ROC-AUC >0.8
 3. **Display numeric cascade coverage** - Robust threshold finding, no more NaN
-4. **Train efficiently** - No burned batches, optimized O(1) lookups  
+4. **Train efficiently** - No burned batches, optimized O(1) lookups, uses detected dimensions
 5. **Handle OOM gracefully** - Clean backoff without corrupted ID lists
 6. **Generate clean reports** - Fewer warnings, pure matplotlib plots
+7. **Show correct accuracy curves** - Plots actual accuracy vs labels, not prediction rates
+8. **Maintain cascade coverage** - Prevents threshold overlap that would bypass fusion
+9. **Render safe HTML progress bars** - Clamped widths prevent visual corruption
+
+## Correctness Improvements
+
+### **Critical Bug Fixes** 🐛
+- **Accuracy Curve**: Now computes true accuracy (predictions vs labels) instead of prediction rate
+- **Cascade Thresholds**: Prevents overlap that would accept everything and bypass fusion  
+- **Progress Bars**: Clamped to [0,100] range to prevent visual corruption
+- **Threshold Logic**: Simplified and more maintainable precision counting
+
+### **Code Quality** 🧹
+- **Function Naming**: Disambiguated `read_preds` vs `read_preds_arrays` to avoid shadowing
+- **Dead Code**: Removed unused `split_from_path` function
+- **Score Validation**: Defensive clipping of stage-1 scores to [0,1] range
+- **Dimension Usage**: Actually uses detected cheap dimension when available
 
 ## Architecture Benefits
 
