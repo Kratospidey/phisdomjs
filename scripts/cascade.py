@@ -63,6 +63,17 @@ def main():
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
+    
+    # Check if fusion directory has predictions, fall back to logistic fusion if needed
+    fusion_dir = args.fusion_dir
+    if not os.path.isdir(fusion_dir) or not any(name.endswith("_preds.jsonl") for name in os.listdir(fusion_dir)):
+        alt = "artifacts/fusion"
+        if os.path.isdir(alt) and any(name.endswith("_preds.jsonl") for name in os.listdir(alt)):
+            print(f"[CASCADE][WARN] '{fusion_dir}' has no predictions; falling back to '{alt}'.")
+            fusion_dir = alt
+        else:
+            print(f"[CASCADE][WARN] No usable fusion preds found in '{fusion_dir}' or '{alt}'. Cascade may fail.")
+    
     def split_from_path(p: str) -> str:
         base = os.path.splitext(os.path.basename(p))[0]
         return base.split('_')[-1]
@@ -70,7 +81,7 @@ def main():
     def load_split(split: str):
         url = read_preds(os.path.join(args.url_dir, f"preds_{split}.jsonl"))
         cheap = read_preds(os.path.join(args.cheap_dir, f"preds_{split}.jsonl"))
-        fused = read_preds(os.path.join(args.fusion_dir, f"preds_{split}.jsonl"))
+        fused = read_preds(os.path.join(fusion_dir, f"preds_{split}.jsonl"))
         ids = [i for i in fused.keys() if i in url and i in cheap]
         y = np.array([fused[i][0] for i in ids], dtype=int)
         p_url = np.array([url[i][1] for i in ids], dtype=float)
@@ -109,9 +120,18 @@ def main():
         accept_benign = s1 <= thr_lo
         # final probabilities: use s1 where accepted, else fused
         p_final = np.where(accept_phish | accept_benign, s1, pf)
-        coverage = float(np.mean(accept_phish | accept_benign)) if accept_phish.size else float("nan")
-        cov_hi = float(np.mean(accept_phish)) if accept_phish.size else float("nan")
-        cov_lo = float(np.mean(accept_benign)) if accept_benign.size else float("nan")
+        
+        # Robust coverage computation (avoid NaN from 0/0)
+        total = len(accept_phish) if accept_phish.size > 0 else 0
+        if total > 0:
+            coverage = float(np.sum(accept_phish | accept_benign)) / total
+            cov_hi = float(np.sum(accept_phish)) / total
+            cov_lo = float(np.sum(accept_benign)) / total
+        else:
+            coverage = float("nan")
+            cov_hi = float("nan") 
+            cov_lo = float("nan")
+            
         return ids, y, p_final, coverage, cov_hi, cov_lo
 
     # Save preds and report

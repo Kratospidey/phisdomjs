@@ -13,17 +13,27 @@ from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 
 def read_preds(path: str) -> Dict[str, float]:
+    """Read predictions from a JSONL file, returning a mapping from stable ID to probability."""
     m: Dict[str, float] = {}
     if not os.path.exists(path):
+        print(f"Warning: Prediction file missing: {path}")
         return m
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             if not line.strip():
                 continue
             obj = json.loads(line)
-            id_ = str(obj.get("id"))
-            p = float(obj.get("prob", 0.0))
-            m[id_] = p
+            # Look for various ID fields that could serve as stable keys
+            id_ = obj.get("id") or obj.get("uid") or obj.get("sha1") or obj.get("url_hash")
+            if id_ is None:
+                raise KeyError(f"Prediction row missing stable key (id/uid/sha1/url_hash): {list(obj.keys())}")
+            # Look for score in various field names
+            score = obj.get("prob")
+            if score is None:
+                score = obj.get("score") if obj.get("score") is not None else obj.get("logit")
+            if score is None:
+                raise KeyError(f"Prediction row missing score field (prob/score/logit): {list(obj.keys())}")
+            m[str(id_)] = float(score)
     return m
 
 
@@ -32,25 +42,63 @@ def _row_features(r: Dict[str, object], use_features: bool) -> List[float]:
 
 
 def align(jsonl_path: str, use_features: bool, **head_dirs: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    """Align predictions from multiple heads using stable ID joining."""
     # head_dirs: mapping from head name -> directory containing preds_{split}.jsonl
     split = os.path.splitext(os.path.basename(jsonl_path))[0].split('_')[-1]
     preds_by_head: Dict[str, Dict[str, float]] = {}
+    
+    # Load predictions from each head
     for name, d in head_dirs.items():
         preds_by_head[name] = read_preds(os.path.join(d, f"preds_{split}.jsonl"))
+        print(f"Loaded {len(preds_by_head[name])} predictions for {name}")
+    
+    # Load ground truth labels
     rows = load_jsonl(jsonl_path)
+    gold_labels: Dict[str, int] = {}
+    for r in rows:
+        id_ = r.get("id") or r.get("uid") or r.get("sha1") or r.get("url_hash")
+        if id_ is None:
+            raise KeyError(f"Gold row missing stable key (id/uid/sha1/url_hash): {list(r.keys())}")
+        gold_labels[str(id_)] = int(r.get("label", 0))
+    
+    print(f"Loaded {len(gold_labels)} gold labels")
+    
+    # Find common IDs across all heads and gold labels
+    common_ids = set(gold_labels.keys())
+    for name, preds in preds_by_head.items():
+        common_ids &= set(preds.keys())
+        print(f"After intersecting with {name}: {len(common_ids)} common IDs")
+    
+    if not common_ids:
+        print("Warning: No common IDs found across all heads and gold labels!")
+        return np.array([]), np.array([]), np.array([]), list(head_dirs.keys())
+    
+    # Build aligned feature matrix and labels
     xs: List[List[float]] = []
     ys: List[int] = []
     ids: List[str] = []
-    for r in rows:
-        id_ = str(r.get("id"))
-        # Require presence across all provided heads
-        if not all(id_ in preds for preds in preds_by_head.values()):
-            continue
+    
+    for id_ in sorted(common_ids):  # sort for deterministic order
+        # Base features: predictions from each head
         base = [preds_by_head[name][id_] for name in head_dirs.keys()]
-        base.extend(_row_features(r, use_features))
+        
+        # Optionally add cheap features
+        if use_features:
+            # Find the original row to get cheap features
+            row = next((r for r in rows if str(r.get("id") or r.get("uid") or r.get("sha1") or r.get("url_hash")) == id_), None)
+            if row is not None:
+                base.extend(_row_features(row, use_features))
+            else:
+                # If we can't find the original row, add zeros for cheap features
+                from phisdom.data.cheap_features import CHEAP_FEATURES
+                base.extend([0.0] * len(CHEAP_FEATURES))
+        
         xs.append(base)
-        ys.append(int(r.get("label", 0)))
+        ys.append(gold_labels[id_])
         ids.append(id_)
+    
+    print(f"Final aligned dataset: {len(ids)} examples with {len(xs[0]) if xs else 0} features")
+    
     X = np.array(xs, dtype=float)
     y = np.array(ys, dtype=int)
     return X, y, np.array(ids), list(head_dirs.keys())

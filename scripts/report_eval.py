@@ -909,7 +909,19 @@ def explain_lime(
         html = _ensure_text_str(r.get("html", ""), max_chars=max_chars)
         rid = r.get("id") or "sample"
         url = r.get("url")
+        
+        # Basic guardrails: skip if text too short or probs are degenerate
+        if len(html.split()) < 10:
+            print(f"[WARN] LIME skipped {rid}: text too short ({len(html.split())} words)")
+            continue
+            
         try:
+            # Check if prediction is reasonable before explaining
+            probs = predict_proba([html])
+            if probs is None or len(probs) == 0 or not (0.01 < probs[0][1] < 0.99):
+                print(f"[WARN] LIME skipped {rid}: degenerate prediction {probs}")
+                continue
+                
             exp = explainer.explain_instance(html, predict_proba, num_features=num_features, num_samples=num_samples)
             out_path = os.path.join(out_dir, f"lime_{rid}.html")
             # Extract tokens and weights if available
@@ -1033,7 +1045,19 @@ def explain_shap(
     sel_n = max(1, num_samples // 10)
     for text, rid, url in filtered[:sel_n]:
         out_path = os.path.join(out_dir, f"shap_{rid}.html")
+        
+        # Additional guardrails for SHAP
+        if len(text.split()) < 15:
+            print(f"[WARN] SHAP skipped {rid}: text too short for reliable explanation")
+            continue
+            
         try:
+            # Check prediction quality before explaining
+            test_probs = predict_proba([text])
+            if test_probs is None or len(test_probs) == 0 or not (0.01 < test_probs[0][1] < 0.99):
+                print(f"[WARN] SHAP skipped {rid}: degenerate prediction")
+                continue
+                
             text = _ensure_text_str(text, max_chars=max_chars)
             exp_all = explainer([text], max_evals=num_samples)  # type: ignore[call-arg]
             # Get the first explanation
@@ -1174,7 +1198,19 @@ def explain_lime_js(
         text = _ensure_text_str(r.get("text", ""), max_chars=max_chars)
         rid = r.get("id") or "sample"
         url = r.get("url")
+        
+        # Basic guardrails: skip if text too short or probs are degenerate
+        if len(text.split()) < 10:
+            print(f"[WARN] JS LIME skipped {rid}: text too short ({len(text.split())} words)")
+            continue
+            
         try:
+            # Check if prediction is reasonable before explaining
+            probs = predict_proba([text])
+            if probs is None or len(probs) == 0 or not (0.01 < probs[0][1] < 0.99):
+                print(f"[WARN] JS LIME skipped {rid}: degenerate prediction")
+                continue
+                
             exp = explainer.explain_instance(text, predict_proba, num_features=num_features, num_samples=num_samples)
             out_path = os.path.join(out_dir, f"lime_js_{rid}.html")
             try:
@@ -1300,7 +1336,19 @@ def explain_shap_js(
     sel_n = max(1, num_samples // 10)
     for text, rid, url in filtered[:sel_n]:
         out_path = os.path.join(out_dir, f"shap_js_{rid}.html")
+        
+        # Additional guardrails for JS SHAP
+        if len(text.split()) < 15:
+            print(f"[WARN] JS SHAP skipped {rid}: text too short for reliable explanation")
+            continue
+            
         try:
+            # Check prediction quality before explaining
+            test_probs = predict_proba([text])
+            if test_probs is None or len(test_probs) == 0 or not (0.01 < test_probs[0][1] < 0.99):
+                print(f"[WARN] JS SHAP skipped {rid}: degenerate prediction")
+                continue
+                
             text = _ensure_text_str(text, max_chars=max_chars)
             exp_all = explainer([text], max_evals=num_samples)  # type: ignore[call-arg]
             try:
