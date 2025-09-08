@@ -9,6 +9,13 @@ SEED_SIZE ?=
 PHISH_RATIO ?= 0.5
 AUTO_CUTOFF ?= 80
 VAL_FRAC ?= 0.1
+# Class balance targets (positive ratios) and tolerance for splits
+POSR_TRAIN ?=
+POSR_VAL ?=
+POSR_TEST ?=
+RATIO_TOL ?= 0.05
+BALANCE_SPLITS ?= 0
+MIN_TOTAL_TEST ?=
 CRAWL_CONCURRENCY ?= 12
 CRAWL_TIMEOUT ?= 3.0
 CRAWL_RETRIES ?= 1
@@ -89,7 +96,14 @@ crawl:
 	fi
 
 splits:
-	$(PY) scripts/make_splits.py --dataset $(DATASET) --out data/splits.json --auto-cutoff-percentile $(AUTO_CUTOFF) --val-frac $(VAL_FRAC) $(if $(SEED),--seed $(SEED),)
+	$(PY) scripts/make_splits.py --dataset $(DATASET) --out data/splits.json --auto-cutoff-percentile $(AUTO_CUTOFF) --val-frac $(VAL_FRAC) \
+		$(if $(SEED),--seed $(SEED),) \
+		$(if $(POSR_TRAIN),--target-pos-ratio-train $(POSR_TRAIN),) \
+		$(if $(POSR_VAL),--target-pos-ratio-val $(POSR_VAL),) \
+		$(if $(POSR_TEST),--target-pos-ratio-test $(POSR_TEST),) \
+		$(if $(RATIO_TOL),--ratio-tol $(RATIO_TOL),) \
+		$(if $(MIN_TOTAL_TEST),--min-total-test $(MIN_TOTAL_TEST),) \
+		$(if $(filter $(BALANCE_SPLITS),1),--balance-splits,)
 
 slice:
 	$(PY) scripts/slice_dataset.py --dataset $(DATASET) --splits data/splits.json --out-dir data
