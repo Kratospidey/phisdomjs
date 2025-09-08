@@ -129,7 +129,7 @@ def main():
         coll = CheapFeaturesCollator()
         va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
-        # Build model with hidden size inferred from config or checkpoint
+    # Build model with hidden size inferred from config or checkpoint
         hidden = None
         cfg_path = os.path.join(args.model_dir, "model_config.json")
         if os.path.exists(cfg_path):

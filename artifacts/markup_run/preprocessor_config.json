@@ -1,4 +1,0 @@
-{
-  "feature_extractor_type": "MarkupLMFeatureExtractor",
-  "processor_class": "MarkupLMProcessor"
-}

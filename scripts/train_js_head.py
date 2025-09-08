@@ -124,7 +124,17 @@ def main():
     patience = 3
     bad = 0
     bcel = nn.BCEWithLogitsLoss()
-    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
+    # AMP: prefer torch.amp (PyTorch 2.0+) and fall back to torch.cuda.amp for older versions
+    scaler = None
+    _use_cuda = (device.type == "cuda")
+    try:
+        from torch.amp import GradScaler as _GradScaler  # type: ignore
+        scaler = _GradScaler("cuda") if _use_cuda else None
+    except Exception:
+        try:
+            scaler = torch.cuda.amp.GradScaler(enabled=_use_cuda)  # type: ignore[attr-defined]
+        except Exception:
+            scaler = None
     start_ep = 0
     ckpt_path = os.path.join(args.output_dir, "checkpoint.pt")
     if args.resume and os.path.exists(ckpt_path):
@@ -146,12 +156,33 @@ def main():
             x = batch["input_ids"].to(device)
             y = batch["labels"].float().to(device)
             opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device.type == "cuda")):
+            # Autocast using torch.amp where available, else fall back
+            _ctx = None
+            logits = None
+            loss = None
+            if _use_cuda:
+                try:
+                    from torch.amp import autocast as _autocast  # type: ignore
+                    _ctx = _autocast(device_type="cuda")
+                except Exception:
+                    try:
+                        _ctx = torch.cuda.amp.autocast()  # type: ignore[attr-defined]
+                    except Exception:
+                        _ctx = None
+            if _ctx is not None:
+                with _ctx:
+                    logits = model(x)
+                    loss = crit(logits, y)
+            else:
                 logits = model(x)
                 loss = crit(logits, y)
-            scaler.scale(loss).backward()
-            scaler.step(opt)
-            scaler.update()
+            if scaler is not None and _use_cuda:
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
+            else:
+                loss.backward()
+                opt.step()
             if sched is not None:
                 sched.step()
             total += float(loss.item()) * x.size(0)

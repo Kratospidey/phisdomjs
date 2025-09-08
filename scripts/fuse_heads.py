@@ -104,7 +104,7 @@ def main():
     Xv, yv, ids_v, feature_names = align(args.val_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
     Xt, yt, ids_t, _ = align(args.test_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
     if Xv.size == 0 or Xt.size == 0:
-        print("WARN: No overlap between DOM and JS predictions; ensure eval scripts were run and IDs match.")
+        print("WARN: No aligned predictions for fusion. Did you run eval scripts for all included heads?")
     pv: np.ndarray
     pt: np.ndarray
 

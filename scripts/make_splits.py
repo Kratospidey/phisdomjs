@@ -227,6 +227,25 @@ def main():
             train_idx = sorted([train_val_idx[i] for i in train_idx2_rel])
             val_idx = sorted([train_val_idx[i] for i in val_idx2_rel])
             test_idx = sorted(test_idx2)
+            # Ensure min positives in val/test if possible by swapping from train
+            def ensure_min_pos(idxs: List[int], min_pos: int) -> List[int]:
+                if min_pos <= 0:
+                    return idxs
+                pos = sum(1 for i in idxs if int(labels[i]) == 1)
+                if pos >= min_pos:
+                    return idxs
+                needed = min_pos - pos
+                train_pos = [i for i in train_idx if int(labels[i]) == 1]
+                swap_ids = train_pos[:needed]
+                if swap_ids:
+                    updated = sorted(idxs + swap_ids)
+                    keep = set(swap_ids)
+                    train_idx[:] = [i for i in train_idx if i not in keep]
+                    return updated
+                return idxs
+            # Apply to val/test (best-effort)
+            val_idx = ensure_min_pos(val_idx, max(1, int(args.min_pos_val)))
+            test_idx = ensure_min_pos(test_idx, max(1, int(args.min_pos_test)))
             tr_n, tr_p, tr_n0 = _class_counts(train_idx, labels)
             va_n, va_p, va_n0 = _class_counts(val_idx, labels)
             te_n, te_p, te_n0 = _class_counts(test_idx, labels)

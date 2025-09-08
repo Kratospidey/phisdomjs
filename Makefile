@@ -142,8 +142,9 @@ train-dom-gcn:
 train-text-head:
 	$(PY) scripts/train_text_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/text_head --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --max-len $(if $(filter $(SMOKE),1),512,1024)
 
+HIDDEN_CHEAP ?= 128
 train-cheap-mlp:
-	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size $(if $(filter $(SMOKE),1),64,128) --epochs $(if $(filter $(SMOKE),1),2,5) --lr 2e-3 --weight-decay 1e-4 --hidden 128
+	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size $(if $(filter $(SMOKE),1),64,128) --epochs $(if $(filter $(SMOKE),1),2,5) --lr 2e-3 --weight-decay 1e-4 --hidden $(HIDDEN_CHEAP)
 
 .PHONY: fuse
 fuse:

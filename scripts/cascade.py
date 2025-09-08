@@ -101,14 +101,18 @@ def main():
     # Apply cascade on a split
     def apply(split: str):
         ids, y, pu, pc, pf = load_split(split)
+        if len(ids) == 0:
+            # Empty alignment across heads; return NaNs to avoid runtime warnings
+            return ids, y, np.array([], dtype=float), float("nan"), float("nan"), float("nan")
         s1 = 0.5 * pu + 0.5 * pc
         accept_phish = s1 >= thr_hi
         accept_benign = s1 <= thr_lo
-        fall_back = ~(accept_phish | accept_benign)
         # final probabilities: use s1 where accepted, else fused
         p_final = np.where(accept_phish | accept_benign, s1, pf)
-        coverage = float(np.mean(accept_phish | accept_benign))
-        return ids, y, p_final, coverage, float(np.mean(accept_phish)), float(np.mean(accept_benign))
+        coverage = float(np.mean(accept_phish | accept_benign)) if accept_phish.size else float("nan")
+        cov_hi = float(np.mean(accept_phish)) if accept_phish.size else float("nan")
+        cov_lo = float(np.mean(accept_benign)) if accept_benign.size else float("nan")
+        return ids, y, p_final, coverage, cov_hi, cov_lo
 
     # Save preds and report
     out = {
