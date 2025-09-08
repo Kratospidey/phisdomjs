@@ -96,6 +96,13 @@ def main():
                 break
 
     model.load_state_dict(torch.load(os.path.join(args.output_dir, "model.pt"), map_location=device))
+    # Save a tiny model config for robust evaluation
+    try:
+        cfg = {"in_dim": len(CHEAP_FEATURES), "hidden": int(args.hidden), "dropout": 0.1}
+        with open(os.path.join(args.output_dir, "model_config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg, f, indent=2)
+    except Exception:
+        pass
     val_logits, val_labels = eval_logits(model, va_dl, device)
     if val_logits.numel():
         ts, meta = fit_temperature(val_logits, val_labels)

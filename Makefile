@@ -196,7 +196,7 @@ eval-js-head:
 
 # Phase 6 (optional): JS augmentation and augmented head
 .PHONY: phase6
-phase6: augment-js train-js-head-aug eval-js-head-aug report
+phase6: augment-js train-js-head-aug eval-js-head-aug eval-dom-gcn eval-text-head eval-cheap-mlp report
 
 # Phase 6: JS augmentation and optional retraining using augmented field
 .PHONY: augment-js train-js-head-aug eval-js-head-aug

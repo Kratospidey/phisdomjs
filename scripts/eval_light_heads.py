@@ -129,7 +129,28 @@ def main():
         coll = CheapFeaturesCollator()
         va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
         te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll)  # type: ignore[arg-type]
-        model = CheapMLP(in_dim=len(CHEAP_FEATURES)).to(device)
+        # Build model with hidden size inferred from config or checkpoint
+        hidden = None
+        cfg_path = os.path.join(args.model_dir, "model_config.json")
+        if os.path.exists(cfg_path):
+            try:
+                cfg = json.load(open(cfg_path))
+                hidden = int(cfg.get("hidden"))
+            except Exception:
+                hidden = None
+        # If still unknown, peek at state dict shape (net.0.weight)
+        st_path = os.path.join(args.model_dir, "model.pt")
+        if hidden is None and os.path.exists(st_path):
+            try:
+                st_cpu = torch.load(st_path, map_location="cpu")
+                w0 = st_cpu.get("net.0.weight")
+                if isinstance(w0, torch.Tensor) and w0.ndim == 2:
+                    hidden = int(w0.shape[0])
+            except Exception:
+                hidden = None
+        if hidden is None:
+            hidden = 64  # default fallback
+        model = CheapMLP(in_dim=len(CHEAP_FEATURES), hidden=hidden).to(device)
         # redefine eval_fn for MLP
         @torch.no_grad()
         def eval_logits_mlp(model, loader, device):
