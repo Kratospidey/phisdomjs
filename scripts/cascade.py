@@ -66,7 +66,7 @@ def main():
         return os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl"))
     fusion_dir = args.fusion_dir
     if not _has_preds(fusion_dir):
-        alt = "artifacts/fusion"
+        alt = "artifacts/fusion_xattn"  # Try cross-attention fusion as backup
         if _has_preds(alt):
             print(f"[CASCADE][WARN] '{fusion_dir}' has no predictions; falling back to '{alt}'.")
             fusion_dir = alt
@@ -105,7 +105,7 @@ def main():
             # convert back to score threshold
             thr_lo = 1.0 - thr_lo
             # Ensure non-overlapping thresholds so fusion still handles the middle band
-            if thr_lo > thr_hi:
+            if thr_lo >= thr_hi:
                 eps = 1e-6
                 mid = 0.5 * (thr_lo + thr_hi)
                 thr_lo = max(0.0, mid - eps)

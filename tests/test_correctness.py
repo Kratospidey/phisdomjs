@@ -39,7 +39,7 @@ def test_cascade_threshold_overlap():
     thr_hi = 0.3  # phish threshold
     
     # Simulate the overlap fix
-    if thr_lo > thr_hi:
+    if thr_lo >= thr_hi:
         eps = 1e-6
         mid = 0.5 * (thr_lo + thr_hi)
         thr_lo_fixed = max(0.0, mid - eps)

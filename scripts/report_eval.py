@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple, cast
 import numpy as np
 
 import torch
-from transformers import AutoModelForSequenceClassification, MarkupLMProcessor, Trainer, TrainingArguments, AutoTokenizer, T5EncoderModel
+from transformers import AutoModelForSequenceClassification, MarkupLMProcessor, AutoTokenizer, T5EncoderModel
 from transformers.utils import logging as hf_logging
 import torch
 
@@ -742,6 +742,8 @@ def plot_pr_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_d
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
+        if len(set(map(int, y.tolist()))) < 2:
+            continue
         prec, rec, _ = precision_recall_curve(y, p)
         pr_auc = auc(rec, prec)
         plt.plot(rec, prec, label=f"{label} (AUC={pr_auc:.3f})")
@@ -761,6 +763,8 @@ def plot_roc_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
+        if len(set(map(int, y.tolist()))) < 2:
+            continue
         fpr, tpr, _ = roc_curve(y, p)
         roc_auc = auc(fpr, tpr)
         plt.plot(fpr, tpr, label=f"{label} (AUC={roc_auc:.3f})")
@@ -781,6 +785,8 @@ def plot_reliability_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
+        if len(set(map(int, y.tolist()))) < 2:
+            continue
         frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="uniform")
         plt.plot(mean_pred, frac_pos, marker="o", label=label)
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
