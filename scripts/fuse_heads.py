@@ -55,11 +55,14 @@ def align(jsonl_path: str, use_features: bool, **head_dirs: str) -> Tuple[np.nda
     # Load ground truth labels
     rows = load_jsonl(jsonl_path)
     gold_labels: Dict[str, int] = {}
+    id2row: Dict[str, Dict] = {}
     for r in rows:
         id_ = r.get("id") or r.get("uid") or r.get("sha1") or r.get("url_hash")
         if id_ is None:
             raise KeyError(f"Gold row missing stable key (id/uid/sha1/url_hash): {list(r.keys())}")
-        gold_labels[str(id_)] = int(r.get("label", 0))
+        rid = str(id_)
+        gold_labels[rid] = int(r.get("label", 0))
+        id2row[rid] = r
     
     print(f"Loaded {len(gold_labels)} gold labels")
     
@@ -84,8 +87,8 @@ def align(jsonl_path: str, use_features: bool, **head_dirs: str) -> Tuple[np.nda
         
         # Optionally add cheap features
         if use_features:
-            # Find the original row to get cheap features
-            row = next((r for r in rows if str(r.get("id") or r.get("uid") or r.get("sha1") or r.get("url_hash")) == id_), None)
+            # O(1) lookup instead of O(N) search
+            row = id2row.get(id_)
             if row is not None:
                 base.extend(_row_features(row, use_features))
             else:

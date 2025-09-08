@@ -1522,7 +1522,6 @@ def main():
                 # Gather batch rows via index to support lazy datasets
                 batch_rows = [ds[j] for j in range(i, end)]
                 texts = [r.get("text", "") for r in batch_rows]
-                ids.extend([r.get("id") for r in batch_rows])
                 try:
                     if device.type == "cuda":
                         try:
@@ -1542,6 +1541,8 @@ def main():
                     m = np.max(logits, axis=1, keepdims=True)
                     e = np.exp(logits - m)
                     p1 = (e[:, 1] / (e[:, 0] + e[:, 1]))
+                    # success path - only add ids/probs after successful processing
+                    ids.extend([r.get("id") for r in batch_rows])
                     probs.extend(p1.tolist())
                     # adaptive increase if headroom
                     if device.type == "cuda" and total_mem:
@@ -1558,8 +1559,7 @@ def main():
                             torch.cuda.empty_cache()
                         except Exception:
                             pass
-                        # back off and retry smaller batch
-                        ids[:] = ids[:-(end - i)]  # remove ids we appended for this failed chunk
+                        # back off and retry smaller batch (no need to clean up ids since we never added them)
                         bs = max(1, bs // 2)
                         continue
                     else:

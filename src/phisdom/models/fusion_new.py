@@ -92,20 +92,18 @@ class CrossModalTransformerFusion(nn.Module):
 
     # ---- helpers ----------------------------------------------------------
 
-    def _ensure_stream_modules(self, name: str, device: torch.device):
+    def _ensure_stream_modules(self, name: str):
         """Lazily create embedding and projection for a modality."""
         if name not in self._tok_emb:
-            emb = nn.Embedding(self.token_vocab_size, self.token_embed_dim).to(device)
-            self._tok_emb[name] = emb
+            self._tok_emb[name] = nn.Embedding(self.token_vocab_size, self.token_embed_dim)
             # Initialize the new embedding
-            nn.init.normal_(emb.weight, mean=0., std=0.02)
+            nn.init.normal_(self._tok_emb[name].weight, mean=0., std=0.02)
         if name not in self._tok_proj:
-            proj = nn.Linear(self.token_embed_dim, self.d_model).to(device)
-            self._tok_proj[name] = proj
+            self._tok_proj[name] = nn.Linear(self.token_embed_dim, self.d_model)
             # Initialize the new projection
-            nn.init.xavier_uniform_(proj.weight)
-            if proj.bias is not None:
-                nn.init.constant_(proj.bias, 0.0)
+            nn.init.xavier_uniform_(self._tok_proj[name].weight)
+            if self._tok_proj[name].bias is not None:
+                nn.init.constant_(self._tok_proj[name].bias, 0.0)
 
     @staticmethod
     def _pick(batch: Dict[str, torch.Tensor], *keys: str) -> Optional[torch.Tensor]:
@@ -124,7 +122,7 @@ class CrossModalTransformerFusion(nn.Module):
         device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Encode token stream: ids -> (B,L,D), (B,L)"""
-        self._ensure_stream_modules(name, device)
+        self._ensure_stream_modules(name)
         emb = self._tok_emb[name](tokens.to(device))
         x = self._tok_proj[name](emb)
         if mask is None:
@@ -187,7 +185,7 @@ class CrossModalTransformerFusion(nn.Module):
 
         # transformer + masked mean pool
         out = self.encoder(X, src_key_padding_mask=~M)     # encoder expects True=pad in mask
-        denom = M.sum(dim=1, keepdim=True).clamp_min(1)
+        denom = M.sum(dim=1, keepdim=1).clamp_min(1)
         pooled = (out * M.unsqueeze(-1)).sum(dim=1) / denom
         logits = self.cls(pooled)                           # (B,1)
         return logits

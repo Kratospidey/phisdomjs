@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import math
 import os
 from typing import Dict, List, Tuple
 
@@ -25,21 +26,13 @@ def read_preds(path: str) -> Dict[str, Tuple[int, float]]:
 
 
 def find_threshold_for_precision(y: np.ndarray, p: np.ndarray, target_precision: float, greater_is_positive: bool = True) -> float:
-    # Sort by score descending for positives, ascending for negatives if needed
+    """Find threshold to achieve target precision, with deterministic tie handling."""
     order = np.argsort(-p) if greater_is_positive else np.argsort(p)
-    tp = 0
-    fp = 0
-    thr = 1.0 if greater_is_positive else 0.0
-    best_thr = thr
-    for i, idx in enumerate(order):
-        pred_pos = 1
-        if greater_is_positive:
-            thr = p[idx]
-            pred_pos = 1
-        else:
-            thr = p[idx]
-            pred_pos = 1  # we're thresholding on low scores as positives for benign class
-        if y[idx] == (1 if greater_is_positive else 0):
+    tp = fp = 0
+    best_thr = float("inf") if greater_is_positive else -float("inf")
+    for idx in order:
+        thr = p[idx]
+        if (y[idx] == 1) == greater_is_positive:
             tp += 1
         else:
             fp += 1
@@ -47,6 +40,9 @@ def find_threshold_for_precision(y: np.ndarray, p: np.ndarray, target_precision:
         if prec >= target_precision:
             best_thr = thr
             break
+    # if never reached, pick extreme
+    if math.isinf(best_thr):
+        best_thr = 1.0 if greater_is_positive else 0.0
     return float(best_thr)
 
 

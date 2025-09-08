@@ -135,26 +135,25 @@ def main():
     va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
     te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
 
-    # Infer cheap feature dimension from the first batch (robust across featurizer changes)
-    cheap_dim = 32  # default fallback
+    # Infer cheap feature dimension without consuming a training batch
+    cheap_dim = 32
     if not args.no_cheap:
         try:
-            sample_batch = next(iter(tr_dl))
-            cf = sample_batch.get("cheap_features", None)
-            if cf is None:
-                cf = sample_batch.get("cheap", None)  # fallback key
+            sample_row = tr_ds[0]
+            sample_batch = coll([sample_row])  # collator expects a list
+            cf = sample_batch.get("cheap_features") or sample_batch.get("cheap")
             if cf is not None:
                 cheap_dim = int(cf.shape[-1])
                 print(f"Detected cheap feature dimension: {cheap_dim}")
             else:
-                # Fallback to feature count from constant
                 from phisdom.data.cheap_features import CHEAP_FEATURES
                 cheap_dim = len(CHEAP_FEATURES)
                 print(f"Using cheap feature dimension from constant: {cheap_dim}")
         except Exception as e:
             print(f"Warning: Could not detect cheap feature dimension, using default 32: {e}")
     
-    model = CrossModalTransformerFusion(cheap_dim=cheap_dim).to(device)
+    # Use None for cheap_dim to enable LazyLinear adaptation
+    model = CrossModalTransformerFusion(cheap_dim=None).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(tr_dl) * args.epochs))
 
