@@ -93,6 +93,7 @@ splits:
 
 slice:
 	$(PY) scripts/slice_dataset.py --dataset $(DATASET) --splits data/splits.json --out-dir data
+	$(PY) scripts/verify_splits.py --train data/pages_train.jsonl --val data/pages_val.jsonl --test data/pages_test.jsonl || (echo "[MAKE][ERROR] Bad splits; aborting." && exit 3)
 
 # Aliases for convenience/compatibility with some docs/logs
 .PHONY: make_splits slice_dataset

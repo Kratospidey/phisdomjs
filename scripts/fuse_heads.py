@@ -121,19 +121,28 @@ def main():
             pv = fuse_average(Xv[:, 0], Xv[:, 1])
             pt = fuse_average(Xt[:, 0], Xt[:, 1])
         else:
-            # L2 by default; use class_weight balanced to be robust
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-            clf.fit(Xv, yv)
-            pv = clf.predict_proba(Xv)[:, 1]
-            pt = clf.predict_proba(Xt)[:, 1]
-            # Save fusion weights
-            w = {
-                "coef": clf.coef_.tolist(),
-                "intercept": clf.intercept_.tolist(),
-                "feature_names": list(heads.keys()) + (CHEAP_FEATURES if bool(getattr(args, "use_cheap_features", True)) else []),
-            }
-            with open(os.path.join(args.out_dir, "fusion_weights.json"), "w", encoding="utf-8") as f:
-                json.dump(w, f, indent=2)
+            # Guard: if yv has a single class, LR is ill-posed; fall back to simple average
+            if len(set(yv.tolist())) < 2:
+                print("WARN: Validation split is one-class; using average fusion.")
+                pv = np.clip(np.mean(Xv[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+                pt = np.clip(np.mean(Xt[:, : len(heads)] or 0.0, axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+            else:
+                # L2 by default; use class_weight balanced to be robust
+                clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+                clf.fit(Xv, yv)
+                pv = clf.predict_proba(Xv)[:, 1]
+                pt = clf.predict_proba(Xt)[:, 1]
+                # Save fusion weights
+                try:
+                    w = {
+                        "coef": clf.coef_.tolist(),
+                        "intercept": clf.intercept_.tolist(),
+                        "feature_names": list(heads.keys()) + (CHEAP_FEATURES if bool(getattr(args, "use_cheap_features", True)) else []),
+                    }
+                    with open(os.path.join(args.out_dir, "fusion_weights.json"), "w", encoding="utf-8") as f:
+                        json.dump(w, f, indent=2)
+                except Exception:
+                    pass
 
     # Metrics and thresholds on test
     pr = pr_auc_safe(yt.tolist(), pt.tolist())

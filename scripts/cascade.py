@@ -81,13 +81,22 @@ def main():
     # Prepare val for thresholds
     ids_v, yv, pu_v, pc_v, pf_v = load_split("val")
     # simple stage1 score: average of URL and Cheap; could be replaced with a trained LR if desired
-    s1_v = 0.5 * pu_v + 0.5 * pc_v
-    thr_hi = find_threshold_for_precision(yv, s1_v, args.target_precision, greater_is_positive=True)
-    # For benign acceptance, use (1 - score) precision on negatives
-    inv_scores = 1.0 - s1_v
-    thr_lo = find_threshold_for_precision(1 - yv, inv_scores, args.target_benign_precision, greater_is_positive=True)
-    # convert back to score threshold
-    thr_lo = 1.0 - thr_lo
+    if yv.size == 0:
+        thr_hi = 1.0
+        thr_lo = 0.0
+    else:
+        s1_v = 0.5 * pu_v + 0.5 * pc_v
+        # Guard against one-class validation
+        if len(set(yv.tolist())) < 2:
+            thr_hi = 1.0
+            thr_lo = 0.0
+        else:
+            thr_hi = find_threshold_for_precision(yv, s1_v, args.target_precision, greater_is_positive=True)
+            # For benign acceptance, use (1 - score) precision on negatives
+            inv_scores = 1.0 - s1_v
+            thr_lo = find_threshold_for_precision(1 - yv, inv_scores, args.target_benign_precision, greater_is_positive=True)
+            # convert back to score threshold
+            thr_lo = 1.0 - thr_lo
 
     # Apply cascade on a split
     def apply(split: str):
@@ -108,7 +117,11 @@ def main():
     }
     for split in ["val", "test"]:
         ids, y, p, cov, cov_hi, cov_lo = apply(split)
-        out["coverage"][split] = {"overall": cov, "phish": cov_hi, "benign": cov_lo}
+        # Avoid numpy NaNs in JSON by converting with float(); if empty, use NaN explicitly
+        if len(ids) == 0:
+            out["coverage"][split] = {"overall": float("nan"), "phish": float("nan"), "benign": float("nan")}
+        else:
+            out["coverage"][split] = {"overall": float(cov), "phish": float(cov_hi), "benign": float(cov_lo)}
         # dump preds
         with open(os.path.join(args.out_dir, f"preds_{split}.jsonl"), "w", encoding="utf-8") as f:
             for i, yy, pp in zip(ids, y.tolist(), p.tolist()):

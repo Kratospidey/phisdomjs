@@ -117,12 +117,12 @@ def roc_auc_safe(y_true: Sequence[int], y_score: Sequence[float]) -> Optional[fl
     Keeping the original roc_auc intact for callers that prefer sentinel values.
     """
     if _is_one_class(y_true):
-        return None
+        return float("nan")
     return roc_auc(y_true, y_score)
 
 
 def pr_auc_safe(y_true: Sequence[int], y_score: Sequence[float]) -> Optional[float]:
     """Return PR-AUC or None if split is one-class."""
     if _is_one_class(y_true):
-        return None
+        return float("nan")
     return pr_auc(y_true, y_score)
