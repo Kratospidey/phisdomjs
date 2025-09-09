@@ -43,6 +43,9 @@ BATCH ?= 4
 EPOCHS ?= 10
 LR ?= 3e-5
 XAI_DEVICE ?= cuda
+# Markup eval HTML truncation controls (disabled by default)
+MARKUP_TRUNCATE ?= 0              # 0 = no truncation (pass --max-html-chars -1)
+MARKUP_MAX_HTML_CHARS ?= 800000    # Used only when MARKUP_TRUNCATE=1
 # Early stopping and logging controls
 ES_PATIENCE ?= 3
 ES_MIN_DELTA ?= 0.0
@@ -84,7 +87,7 @@ unify:
 		--shuffle $(if $(SEED),--seed $(SEED),)
 
 # New variable for automatic URL target checking
-MIN_CRAWLED_URLS ?= 30000
+MIN_CRAWLED_URLS ?= 14750
 PHISH_RATIO ?= 0.5
 
 # Check if we need more URLs and crawl incrementally if needed
@@ -96,8 +99,24 @@ ensure-crawled-count:
 	if [ $$current_count -lt $(MIN_CRAWLED_URLS) ]; then \
 		echo "[MAKE] Need more URLs - running incremental crawler..."; \
 		$(MAKE) crawl-incremental TARGET_URLS=$(MIN_CRAWLED_URLS); \
+		echo "[MAKE] Updating splits to include new URLs..."; \
+		$(MAKE) extend-splits-if-needed; \
 	else \
 		echo "[MAKE] URL count sufficient ($$current_count >= $(MIN_CRAWLED_URLS))"; \
+		$(MAKE) extend-splits-if-needed; \
+	fi
+
+# Extend splits to include any new URLs that aren't covered by existing splits
+.PHONY: extend-splits-if-needed
+extend-splits-if-needed:
+	@if [ -f data/splits.json ] && [ -f data/pages.jsonl ]; then \
+		echo "[MAKE] Checking if splits need extension..."; \
+		$(PY) scripts/extend_splits.py --dataset data/pages.jsonl --splits data/splits.json --out data/splits_full.json --slice-out-dir data; \
+		if [ -f data/splits_full.json ]; then \
+			echo "[MAKE] Extended splits and slice files created"; \
+		fi; \
+	else \
+		echo "[MAKE] No existing splits or dataset found - will be created in splits target"; \
 	fi
 
 # Incremental crawling using mixed sources (Tranco + OpenPhish/PhishTank)
@@ -165,7 +184,17 @@ eval:
 	$(PY) scripts/eval_markup.py --model-dir $(OUTDIR) \
 		--val-jsonl data/pages_val.jsonl \
 		--test-jsonl data/pages_test.jsonl \
-		--max-length $(MAXLEN)
+		--max-length $(MAXLEN) \
+		$(if $(filter $(MARKUP_TRUNCATE),1),--max-html-chars $(MARKUP_MAX_HTML_CHARS),--max-html-chars -1)
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_markup.py --model-dir $(OUTDIR) \
+			--val-jsonl data/pages_val_full.jsonl \
+			--test-jsonl data/pages_test_full.jsonl \
+			--max-length $(MAXLEN) \
+			$(if $(filter $(MARKUP_TRUNCATE),1),--max-html-chars $(MARKUP_MAX_HTML_CHARS),--max-html-chars -1) \
+			--tag _full; \
+	fi
 
 .PHONY: train-js eval-js
 train-js:
@@ -175,6 +204,10 @@ train-js:
 
 eval-js:
 	$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length 512
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --max-length 512 --tag _full; \
+	fi
 
 # Lightweight heads (URL/JS CharCNN and DOM GCN)
 .PHONY: train-url-head train-js-head train-dom-gcn
@@ -199,6 +232,10 @@ train-cheap-mlp:
 .PHONY: fuse
 fuse:
 	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended fusion with --head-tag _full --tag _full"; \
+		$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features --head-tag _full --tag _full; \
+	fi
 
 # Comprehensive coverage-max fusion (imputation) and unified export
 .PHONY: fuse-all-coverage
@@ -207,6 +244,13 @@ fuse-all-coverage:
 		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --export-unified-json
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended fusion_all with --head-tag _full --tag _full"; \
+		$(PY) scripts/fuse_heads.py \
+			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+			--val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl \
+			--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --export-unified-json --head-tag _full --tag _full; \
+	fi
 
 # Second-level meta-fusion including prior first-level fusion head
 .PHONY: fuse-meta
@@ -215,12 +259,52 @@ fuse-meta: fuse-all-coverage
 		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended fusion_meta with --head-tag _full --tag _full"; \
+		$(PY) scripts/fuse_heads.py \
+			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+			--val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl \
+			--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json --head-tag _full --tag _full; \
+	fi
+
+# Meta weight search (simplex) producing fusion_meta/weights.json & preds
+.PHONY: meta-fuse-search
+meta-fuse-search:
+	$(PY) scripts/meta_fuse_heads.py \
+		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_meta \
+		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+		--alignment-strategy inner_join --strategy random --random-samples 4000 --dirichlet-alpha 1.0
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Running meta-fusion weight search on extended splits"; \
+		$(PY) scripts/meta_fuse_heads.py \
+			--val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl \
+			--out-dir artifacts/fusion_meta \
+			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+			--alignment-strategy inner_join --strategy random --random-samples 4000 --dirichlet-alpha 1.0 --head-tag _full --tag _full; \
+	fi
 # Cross-attention fusion (XFusion)
 .PHONY: train-xfusion eval-xfusion
 train-xfusion:
 	$(PY) scripts/train_fusion_xattn_fixed.py \
 		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_xattn \
+		$(if $(filter $(XF_NO_URL),1),--no-url,) \
+		$(if $(filter $(XF_NO_JS),1),--no-js,) \
+		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
+		$(if $(filter $(XF_NO_DOM),1),--no-dom,) \
+		$(if $(filter $(XF_NO_CHEAP),1),--no-cheap,) \
+		$(if $(XF_JS_RAW_FIELD),--js-raw-field $(XF_JS_RAW_FIELD),) \
+		$(if $(filter $(XF_NO_JS_CANON),1),--no-js-canonicalize,) \
+		$(if $(filter $(XF_HTML_CANON),1),--html-canonicalize,) \
+		$(if $(XF_HTML_FIELD),--html-field $(XF_HTML_FIELD),)
+
+.PHONY: train-xfusion-diag
+train-xfusion-diag:
+	$(PY) scripts/train_fusion_xattn_fixed.py \
+		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_xattn \
+		--record-diagnostics --diag-interval 100 \
 		$(if $(filter $(XF_NO_URL),1),--no-url,) \
 		$(if $(filter $(XF_NO_JS),1),--no-js,) \
 		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
@@ -241,6 +325,9 @@ cascade:
 .PHONY: report
 report:
 	$(PY) scripts/report_eval.py --model-dir $(OUTDIR) --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length $(MAXLEN) --device cuda --eval-batch 4
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] NOTE: Extended dataset available - consider updating report script to use _full files"; \
+	fi
 
 .PHONY: report-xai
 report-xai:
@@ -252,14 +339,25 @@ report-xai:
 		--device cuda --eval-batch 4 \
 		--lime --shap --num-expl 1 \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] NOTE: Extended dataset available - consider updating report script to use _full files"; \
+	fi
 
 # Evaluate calibrated lightweight heads and generate preds jsonl
 .PHONY: eval-url-head eval-js-head eval-dom-gcn
 eval-url-head:
 	$(PY) scripts/eval_light_heads.py --head url --model-dir artifacts/url_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 128
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head url --model-dir artifacts/url_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 128 --tag _full; \
+	fi
 
 eval-js-head:
 	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full; \
+	fi
 
 # Phase 6 (optional): JS augmentation and augmented head
 .PHONY: phase6
@@ -275,16 +373,32 @@ train-js-head-aug:
 
 eval-js-head-aug:
 	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn_aug --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn_aug --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full; \
+	fi
 
 eval-dom-gcn:
 	$(PY) scripts/eval_light_heads.py --head dom --model-dir artifacts/dom_gcn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 32
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head dom --model-dir artifacts/dom_gcn --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 32 --tag _full; \
+	fi
 
 .PHONY: eval-text-head eval-cheap-mlp
 eval-text-head:
 	$(PY) scripts/eval_light_heads.py --head text --model-dir artifacts/text_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head text --model-dir artifacts/text_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full; \
+	fi
 
 eval-cheap-mlp:
 	$(PY) scripts/eval_light_heads.py --head cheap --model-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 256
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended predictions with --tag _full"; \
+		$(PY) scripts/eval_light_heads.py --head cheap --model-dir artifacts/cheap_mlp --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 256 --tag _full; \
+	fi
 
 # Plot PR curves comparing individual heads and fused output
 .PHONY: plot-heads

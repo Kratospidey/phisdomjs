@@ -43,16 +43,23 @@ class CrossModalTransformerFusion(nn.Module):
         # shared token embed settings (per-stream embedders will be created lazily)
         token_vocab_size: int = 512,
         token_embed_dim: int = 48,
+        record_diagnostics: bool = False,
     ):
         super().__init__()
         self.d_model = d_model
         self.use = dict(url=use_url, js=use_js, text=use_text, dom=use_dom, cheap=use_cheap)
         self.token_vocab_size = token_vocab_size
         self.token_embed_dim = token_embed_dim
+        # Diagnostics toggle (cheap – minimal overhead when False)
+        self.record_diagnostics = record_diagnostics
+        # Container for last-forward diagnostics (read externally after forward)
+        self._last_stream_stats = []  # type: ignore[var-annotated]
+        self._last_corr = None
+        self._last_corr_modalities = []
 
         # modality registries (lazy-populated the first time we see that stream)
-        self._tok_emb: nn.ModuleDict = nn.ModuleDict()   # name -> nn.Embedding
-        self._tok_proj: nn.ModuleDict = nn.ModuleDict()  # name -> nn.Linear(token_embed_dim, d_model)
+        self._tok_emb = nn.ModuleDict()   # name -> nn.Embedding
+        self._tok_proj = nn.ModuleDict()  # name -> nn.Linear(token_embed_dim, d_model)
 
         # cheap projector (fixed or lazy)
         if use_cheap:
@@ -154,6 +161,11 @@ class CrossModalTransformerFusion(nn.Module):
         masks: List[torch.Tensor] = []
 
         # order is stable (URL, JS, TEXT, DOM) so downstream pooling is deterministic
+        stream_names: List[str] = []
+        per_stream_means: List[torch.Tensor] = []  # (D,) each
+        if self.record_diagnostics:
+            self._last_stream_stats = []  # reset
+            self._last_corr = None
         for name in ("url", "js", "text", "dom"):
             if not self.use.get(name, False):
                 continue
@@ -166,6 +178,21 @@ class CrossModalTransformerFusion(nn.Module):
             x, m = self._encode_stream(name, tok, msk, device)
             streams.append(x)
             masks.append(m)
+            stream_names.append(name)
+            if self.record_diagnostics:
+                # token embedding norms (exclude type embedding effect minimal) – compute per token vector norm
+                with torch.no_grad():
+                    tok_norms = x.detach().norm(dim=-1)  # (B,L)
+                    mean_norm = float(tok_norms.mean().cpu()) if tok_norms.numel() else 0.0
+                    std_norm = float(tok_norms.std(unbiased=False).cpu()) if tok_norms.numel() else 0.0
+                    per_stream_means.append(x.detach().mean(dim=1).mean(dim=0))  # (D,) averaged over batch+tokens
+                    self._last_stream_stats.append({
+                        "modality": name,
+                        "tokens_total": int(m.sum().item()),
+                        "mean_token_norm": mean_norm,
+                        "std_token_norm": std_norm,
+                        "seq_len_mean": float(m.sum(dim=1).float().mean().cpu()) if m.ndim == 2 else 0.0,
+                    })
 
         # optional CHEAP -> [CHEAP] token
         if self.use.get("cheap", False) and self.enc_cheap is not None:
@@ -176,6 +203,20 @@ class CrossModalTransformerFusion(nn.Module):
                 cheap_tok = cheap_tok + self.type_emb.weight[self.type_index["cheap"]].view(1, 1, -1)
                 streams.append(cheap_tok)
                 masks.append(torch.ones(cf.size(0), 1, dtype=torch.bool, device=device))
+                stream_names.append("cheap")
+                if self.record_diagnostics:
+                    with torch.no_grad():
+                        tok_norms = cheap_tok.detach().norm(dim=-1)
+                        mean_norm = float(tok_norms.mean().cpu()) if tok_norms.numel() else 0.0
+                        std_norm = float(tok_norms.std(unbiased=False).cpu()) if tok_norms.numel() else 0.0
+                        per_stream_means.append(cheap_tok.detach().mean(dim=1).mean(dim=0))
+                        self._last_stream_stats.append({
+                            "modality": "cheap",
+                            "tokens_total": int(tok_norms.numel()),
+                            "mean_token_norm": mean_norm,
+                            "std_token_norm": std_norm,
+                            "seq_len_mean": 1.0,
+                        })
 
         # if nothing present, return zeros safely
         if not streams:
@@ -184,6 +225,20 @@ class CrossModalTransformerFusion(nn.Module):
 
         X = torch.cat(streams, dim=1)       # (B, T, D)
         M = torch.cat(masks, dim=1)         # (B, T)
+
+        if self.record_diagnostics and per_stream_means:
+            # Compute cosine similarity matrix of modality mean embeddings (pre-positional)
+            with torch.no_grad():
+                means = torch.stack(per_stream_means, dim=0)  # (K,D)
+                # normalize
+                eps = 1e-8
+                norms = means.norm(dim=-1, keepdim=True).clamp_min(eps)
+                sim = (means @ means.t()) / (norms * norms.t())
+                self._last_corr = sim.detach().cpu()  # (K,K)
+                # attach ordering for external mapping
+                for s in self._last_stream_stats:
+                    s["corr_index"] = stream_names.index(s["modality"]) if s["modality"] in stream_names else -1
+                self._last_corr_modalities = list(stream_names)
 
         # positions
         pe = _sinusoidal_pe(X.size(1), X.size(2), device)  # (T,D)

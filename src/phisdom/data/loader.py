@@ -1,13 +1,28 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from phisdom.data.schema import load_jsonl
-
-try:  # soft import for typing/runtime
-    import torch
-except Exception:  # pragma: no cover
+# NOTE: We intentionally avoid a hard torch dependency at import time so that
+# modules performing lightweight tasks (e.g. data inspection) do not fail.
+# For static type checkers (Pylance/mypy), we still provide a proper base class.
+try:  # pragma: no cover - runtime soft import
+    import torch  # type: ignore
+    from torch.utils.data import Dataset as _TorchDataset  # type: ignore
+except Exception:  # Fallback shim when torch isn't installed
     torch = None  # type: ignore
+    class _TorchDataset:  # type: ignore
+        """Minimal shim replicating torch.utils.data.Dataset interface.
+        We deliberately use broad return types so subclasses remain type-compatible.
+        """
+        def __len__(self) -> int:  # pragma: no cover - trivial
+            return 0
+        def __getitem__(self, idx: int) -> Any:  # pragma: no cover - trivial
+            raise IndexError(idx)
+
+if TYPE_CHECKING:  # Provide a stable symbol for type checkers
+    from torch.utils.data import Dataset as _TorchDataset  # type: ignore
+
+DatasetBase = _TorchDataset  # alias used for inheritance (avoids Pylance error)
 
 
 class _LazyIndex:
@@ -38,7 +53,7 @@ class _LazyIndex:
 
 
 @dataclass
-class JsonlPhishDataset:
+class JsonlPhishDataset(DatasetBase):
     path: str
     id_field: str = "id"
     html_field: str = "html"
@@ -61,23 +76,30 @@ class JsonlPhishDataset:
         r = self._base.read_row(self._index[idx])
         return {
             "id": r.get(self.id_field, str(idx)),
-            "html": r.get(self.html_field, ""),
-            "label": int(r.get(self.label_field, 0)),
+            self.html_field: r.get(self.html_field, ""),
+            self.label_field: int(r.get(self.label_field, 0)),
         }
 
 
 class MarkupLMDataCollator:
-    def __init__(self, processor, max_length: int = 512):
+    def __init__(self, processor, max_length: int = 512, html_field: str = "html", label_field: str = "label", max_html_chars: int | None = 800000):
         self.processor = processor
         self.max_length = max_length
+        self.html_field = html_field
+        self.label_field = label_field
+        self.max_html_chars = max_html_chars
+        self._seen = 0
 
     def __call__(self, batch: List[Dict[str, Any]]):
-        # Late import to avoid hard dependency in tests
         import torch  # type: ignore
-
-        html_list = [b["html"] for b in batch]
-        labels = torch.tensor([int(b["label"]) for b in batch], dtype=torch.long)
-        # MarkupLMProcessor accepts html=[...]
+        html_list = []
+        for b in batch:
+            h = b.get(self.html_field, "")
+            # Truncate extremely large HTML blobs if a limit is set (None disables)
+            if self.max_html_chars is not None and self.max_html_chars >= 0 and len(h) > self.max_html_chars:
+                h = h[: self.max_html_chars]
+            html_list.append(h)
+        labels = torch.tensor([int(b.get(self.label_field, 0)) for b in batch], dtype=torch.long)
         enc = self.processor(
             html_strings=html_list,
             return_tensors="pt",
@@ -86,4 +108,7 @@ class MarkupLMDataCollator:
             max_length=self.max_length,
         )
         enc["labels"] = labels
+        self._seen += len(batch)
+        if self._seen % 512 == 0:  # periodic lightweight progress
+            print(f"[markup-collator] processed {self._seen} examples", flush=True)
         return enc

@@ -169,6 +169,11 @@ def main():
     ap.add_argument("--pin-memory", action="store_true")
     ap.add_argument("--persistent-workers", action="store_true")
     ap.add_argument("--disable-tqdm", action="store_true")
+    # Diagnostics flags
+    ap.add_argument("--record-diagnostics", action="store_true", help="Enable modality/gradient diagnostics")
+    ap.add_argument("--diag-interval", type=int, default=100, help="Steps between gradient norm snapshots")
+    ap.add_argument("--no-corr", action="store_true", help="Disable modality embedding correlation matrix computation")
+    ap.add_argument("--diag-dir", default=None, help="Output directory for diagnostics (default: out-dir/diagnostics)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -250,7 +255,8 @@ def main():
         use_text=not args.no_text,
         use_dom=not args.no_dom,
         use_cheap=not args.no_cheap,
-        cheap_dim=cheap_dim  # None for lazy adaptation, int for fixed size
+    cheap_dim=cheap_dim,  # None for lazy adaptation, int for fixed size
+    record_diagnostics=bool(args.record_diagnostics),
     ).to(device)
     
     # Enhanced optimizer with numerical stability
@@ -283,8 +289,61 @@ def main():
     bad = 0
     patience = 3
     model_saved = False  # Track if we ever saved a model
+    grad_snapshots: List[dict] = []
+    step_counter = 0
+
+    def maybe_record_gradients(step: int):
+        if not args.record_diagnostics:
+            return
+        if args.diag_interval <= 0:
+            return
+        if step % args.diag_interval != 0:
+            return
+        snap: dict = {"step": step}
+        with torch.no_grad():
+            for name, param in model.named_parameters():
+                if param.grad is not None:
+                    g = param.grad.detach()
+                    snap[name] = {
+                        "grad_norm": float(g.norm().cpu()),
+                        "grad_mean_abs": float(g.abs().mean().cpu()),
+                        "shape": list(g.shape),
+                    }
+        grad_snapshots.append(snap)
+
     for ep in range(args.epochs):
-        _ = train_one_epoch(model, tr_dl, opt, sched, device)
+        model.train()
+        crit = nn.BCEWithLogitsLoss()
+        for batch_idx, batch in enumerate(tr_dl):
+            labels = batch.pop("labels").float().to(device)
+            batch = normalize_cheap_features(batch)
+            for k, v in list(batch.items()):
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(batch).squeeze(-1)
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                print(f"[XF][WARN] NaN/Inf logits batch {batch_idx} – skipped")
+                continue
+            loss = crit(logits, labels)
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"[XF][WARN] NaN/Inf loss batch {batch_idx} – skipped")
+                continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            bad = False
+            for p in model.parameters():
+                if p.grad is not None and (torch.isnan(p.grad).any() or torch.isinf(p.grad).any()):
+                    p.grad.zero_()
+                    bad = True
+            if bad:
+                print(f"[XF][WARN] NaN/Inf gradient batch {batch_idx} – zeroed")
+                continue
+            opt.step()
+            if sched is not None:
+                sched.step()
+            step_counter += 1
+            maybe_record_gradients(step_counter)
         ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
         val_loss = float(bcel(logits_v, labels_v.float()).item()) if logits_v.numel() else float("inf")
         if val_loss + 1e-6 < best_val:
@@ -316,8 +375,10 @@ def main():
         ts = TemperatureScaler()
 
     with torch.no_grad():
-        p_val = torch.sigmoid(logits_v / torch.exp(ts.log_T)).numpy() if logits_v.numel() else np.zeros((0,), dtype=float)
-        p_test = torch.sigmoid(logits_t / torch.exp(ts.log_T)).numpy() if logits_t.numel() else np.zeros((0,), dtype=float)
+        p_val_t = torch.sigmoid(logits_v / torch.exp(ts.log_T)) if logits_v.numel() else torch.zeros(0)
+        p_test_t = torch.sigmoid(logits_t / torch.exp(ts.log_T)) if logits_t.numel() else torch.zeros(0)
+        p_val = p_val_t.cpu().numpy()
+        p_test = p_test_t.cpu().numpy()
 
     # Metrics + thresholds on test
     pr = pr_auc(labels_t.numpy().astype(int).tolist(), p_test.tolist()) if p_test.size else 0.0
@@ -341,6 +402,38 @@ def main():
     dump(os.path.join(args.out_dir, "preds_test.jsonl"), ids_t, labels_t, p_test)
 
     print(json.dumps(cal, indent=2))
+
+    # Diagnostics persistence
+    if args.record_diagnostics:
+        diag_dir = args.diag_dir or os.path.join(args.out_dir, "diagnostics")
+        os.makedirs(diag_dir, exist_ok=True)
+        diag: dict = {"grad_snapshots": grad_snapshots, "total_steps": step_counter}
+        if getattr(model, "_last_stream_stats", None):
+            diag["last_stream_stats"] = model._last_stream_stats  # type: ignore
+        if getattr(model, "_last_corr", None) is not None and not args.no_corr:
+            corr = model._last_corr.cpu().numpy().tolist()  # type: ignore
+            diag["last_corr"] = {
+                "modalities": getattr(model, "_last_corr_modalities", []),
+                "matrix": corr,
+            }
+            try:
+                import matplotlib.pyplot as plt  # type: ignore
+                import numpy as np
+                arr = np.array(corr)
+                plt.figure(figsize=(4,4))
+                plt.imshow(arr, vmin=-1, vmax=1, cmap="coolwarm")
+                plt.colorbar(label="cosine")
+                plt.xticks(range(len(arr)), diag["last_corr"]["modalities"], rotation=45, ha="right")
+                plt.yticks(range(len(arr)), diag["last_corr"]["modalities"])
+                plt.title("Modality Mean Embedding Cosine")
+                plt.tight_layout()
+                plt.savefig(os.path.join(diag_dir, "corr_heatmap.png"))
+                plt.close()
+            except Exception as e:  # pragma: no cover
+                print(f"[XF][WARN] Failed to write corr heatmap: {e}")
+        with open(os.path.join(diag_dir, "diagnostics.json"), "w", encoding="utf-8") as f:
+            json.dump(diag, f, indent=2)
+        print(f"[XF][INFO] Wrote diagnostics to {diag_dir}")
 
 
 if __name__ == "__main__":

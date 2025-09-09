@@ -16,7 +16,8 @@ from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
 
 def predict(model: T5EncoderModel, tokenizer, ds: JsonlJsDataset, max_length: int, clf_path: str) -> np.ndarray:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    # Move model to device
+    model.to(device)  # type: ignore[misc]
     model.eval()
     clf_w = None
     if os.path.exists(clf_path):
@@ -89,7 +90,13 @@ def main(args):
 
     cal = {"temperature": T, "metrics": {"pr_auc": pr, "roc_auc": roc}, "thresholds": thresholds}
     os.makedirs(args.model_dir, exist_ok=True)
-    with open(os.path.join(args.model_dir, "calibration.json"), "w", encoding="utf-8") as f:
+    tag = getattr(args, "tag", "")
+    def _with_tag(base: str) -> str:
+        if not tag:
+            return base
+        root, ext = os.path.splitext(base)
+        return f"{root}{tag}{ext}" if ext else f"{base}{tag}"
+    with open(os.path.join(args.model_dir, _with_tag("calibration.json")), "w", encoding="utf-8") as f:
         json.dump(cal, f, indent=2)
 
     def dump_preds(path: str, ds: JsonlJsDataset, probs: np.ndarray):
@@ -100,8 +107,10 @@ def main(args):
                 f.write(json.dumps(obj))
                 f.write("\n")
 
-    dump_preds(os.path.join(args.model_dir, "preds_val.jsonl"), val_ds, p_val_cal)
-    dump_preds(os.path.join(args.model_dir, "preds_test.jsonl"), test_ds, p_test_cal)
+    # reuse _with_tag defined above
+
+    dump_preds(os.path.join(args.model_dir, _with_tag("preds_val.jsonl")), val_ds, p_val_cal)
+    dump_preds(os.path.join(args.model_dir, _with_tag("preds_test.jsonl")), test_ds, p_test_cal)
 
     print(json.dumps(cal, indent=2))
 
@@ -113,5 +122,6 @@ if __name__ == "__main__":
     ap.add_argument("--test-jsonl", default="data/pages_test.jsonl")
     ap.add_argument("--max-length", type=int, default=512)
     ap.add_argument("--tpr", type=float, nargs="*", default=[0.95, 0.90])
+    ap.add_argument("--tag", default="", help="Optional suffix tag for output prediction/calibration files (e.g. _full)")
     args = ap.parse_args()
     main(args)

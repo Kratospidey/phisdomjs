@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
@@ -1495,6 +1496,7 @@ def main():
     parser.add_argument("--model-dir", default="artifacts/markup_run")
     parser.add_argument("--js-dir", default="artifacts/js_codet5p")
     parser.add_argument("--fusion-dir", default="artifacts/fusion")
+    parser.add_argument("--meta-fusion-dir", default="artifacts/fusion_meta", help="Directory containing meta-fusion (all heads) predictions")
     parser.add_argument("--train-jsonl", default="data/pages_train.jsonl")
     parser.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     parser.add_argument("--test-jsonl", default="data/pages_test.jsonl")
@@ -1668,6 +1670,9 @@ def main():
     js_test_path = os.path.join(args.js_dir, "preds_test.jsonl")
     fu_val_path = os.path.join(args.fusion_dir, "preds_val.jsonl")
     fu_test_path = os.path.join(args.fusion_dir, "preds_test.jsonl")
+    # Meta-fusion (all heads) optional
+    meta_val_path = os.path.join(args.meta_fusion_dir, "preds_val.jsonl")
+    meta_test_path = os.path.join(args.meta_fusion_dir, "preds_test.jsonl")
     # Optional: cross-attention fusion
     xfu_dir = os.path.join(os.path.dirname(args.fusion_dir), "fusion_xattn") if os.path.isabs(args.fusion_dir) else os.path.join("artifacts", "fusion_xattn")
     xfu_val_path = os.path.join(xfu_dir, "preds_val.jsonl")
@@ -1681,6 +1686,8 @@ def main():
     fu_test = read_preds_arrays(fu_test_path)
     xfu_val = read_preds_arrays(xfu_val_path)
     xfu_test = read_preds_arrays(xfu_test_path)
+    meta_val = read_preds_arrays(meta_val_path)
+    meta_test = read_preds_arrays(meta_test_path)
 
     # Curves & reliability
     plot_curves(y_tr, p_tr, report_dir, "train")
@@ -1714,6 +1721,14 @@ def main():
         plot_curves(y_te_xf, p_te_xf, report_dir, "test_xfusion")
         plot_reliability(y_va_xf, p_va_xf, report_dir, "val_xfusion")
         plot_reliability(y_te_xf, p_te_xf, report_dir, "test_xfusion")
+    # Meta-fusion curves if present
+    if meta_val and meta_test:
+        y_va_meta, p_va_meta = meta_val
+        y_te_meta, p_te_meta = meta_test
+        plot_curves(y_va_meta, p_va_meta, report_dir, "val_meta")
+        plot_curves(y_te_meta, p_te_meta, report_dir, "test_meta")
+        plot_reliability(y_va_meta, p_va_meta, report_dir, "val_meta")
+        plot_reliability(y_te_meta, p_te_meta, report_dir, "test_meta")
 
     # Build multi-split overlays for DOM
     plot_pr_multi_splits([("train", y_tr, p_tr), ("val", y_va, p_va), ("test", y_te, p_te)], report_dir, "dom")
@@ -1813,6 +1828,25 @@ def main():
                 plot_confusion(y_te_fu, p_te_fu, thrf_90, report_dir, "test_fused_tpr90")
         except Exception:
             pass
+    # Meta-fusion confusion matrices if its calibration present
+    meta_cal_path = os.path.join(args.meta_fusion_dir, "calibration.json")
+    if os.path.exists(meta_cal_path) and meta_val and meta_test:
+        try:
+            with open(meta_cal_path, "r", encoding="utf-8") as f:
+                cal_m = json.load(f)
+            thrm_95 = float(cal_m.get("thresholds", {}).get("0.95", {}).get("threshold", thr_95))
+            thrm_90 = float(
+                cal_m.get("thresholds", {}).get("0.90", {}).get("threshold",
+                cal_m.get("thresholds", {}).get("0.9", {}).get("threshold", thr_90))
+            )
+            y_va_meta, p_va_meta = meta_val
+            y_te_meta, p_te_meta = meta_test
+            plot_confusion(y_va_meta, p_va_meta, thrm_95, report_dir, "val_meta_tpr95")
+            plot_confusion(y_te_meta, p_te_meta, thrm_95, report_dir, "test_meta_tpr95")
+            plot_confusion(y_va_meta, p_va_meta, thrm_90, report_dir, "val_meta_tpr90")
+            plot_confusion(y_te_meta, p_te_meta, thrm_90, report_dir, "test_meta_tpr90")
+        except Exception:
+            pass
 
     # Combined ROC & reliability on test for DOM/JS/Fused
     combined = [("DOM", y_te, p_te)]
@@ -1825,6 +1859,9 @@ def main():
     if xfu_test:
         y_te_xf, p_te_xf = xfu_test
         combined.append(("XFusion", y_te_xf, p_te_xf))
+    if meta_test:
+        y_te_meta, p_te_meta = meta_test
+        combined.append(("Meta", y_te_meta, p_te_meta))
     if len(combined) > 1:
         plot_roc_multi(combined, report_dir, "test")
         plot_pr_multi(combined, report_dir, "test")
@@ -1928,6 +1965,16 @@ def main():
                 "val@tpr90": metrics_for(y_va_fu, p_va_fu, thr_90),
                 "test@tpr90": metrics_for(y_te_fu, p_te_fu, thr_90),
             }
+    # Meta-fusion metrics (val/test only)
+    if meta_val and meta_test:
+        y_va_meta, p_va_meta = meta_val
+        y_te_meta, p_te_meta = meta_test
+        metrics_summary["meta"] = {
+            "val@tpr95": metrics_for(y_va_meta, p_va_meta, thr_95),
+            "test@tpr95": metrics_for(y_te_meta, p_te_meta, thr_95),
+            "val@tpr90": metrics_for(y_va_meta, p_va_meta, thr_90),
+            "test@tpr90": metrics_for(y_te_meta, p_te_meta, thr_90),
+        }
 
     # Write enriched summary including light heads and cascade (if present)
     def _safe_load_json(p: str):
@@ -1950,7 +1997,32 @@ def main():
         if cal:
             light_cal[name] = cal
     cascade_json = _safe_load_json(os.path.join("artifacts/cascade", "cascade.json"))
+    # Attempt to include XFusion (cross-attention fusion) diagnostics if present.
+    # Expected layout: <fusion_parent>/fusion_xattn/diagnostics/diagnostics.json
+    # We also copy corr_heatmap.png into the report directory for embedding.
+    xfusion_diagnostics = None
+    try:
+        fusion_parent = os.path.dirname(os.path.abspath(args.fusion_dir)) if os.path.isabs(args.fusion_dir) else os.path.dirname(args.fusion_dir)
+        # Prefer sibling dir name; fall back to artifacts/fusion_xattn
+        xfusion_dir = os.path.join(fusion_parent or "artifacts", "fusion_xattn")
+        diag_dir = os.path.join(xfusion_dir, "diagnostics")
+        diag_json = os.path.join(diag_dir, "diagnostics.json")
+        if os.path.exists(diag_json):
+            with open(diag_json, "r", encoding="utf-8") as f:
+                xfusion_diagnostics = json.load(f)
+            # Copy correlation heatmap if available
+            corr_png = os.path.join(diag_dir, "corr_heatmap.png")
+            if os.path.exists(corr_png):
+                try:
+                    shutil.copy2(corr_png, os.path.join(report_dir, "xfusion_corr_heatmap.png"))
+                except Exception:
+                    pass
+    except Exception:
+        xfusion_diagnostics = None
+
     summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json}
+    if xfusion_diagnostics is not None:
+        summary_bundle["xfusion_diagnostics"] = xfusion_diagnostics
     with open(os.path.join(report_dir, "summary.json"), "w", encoding="utf-8") as f:
         json.dump(summary_bundle, f, indent=2)
 
@@ -2036,10 +2108,10 @@ def main():
                 return f"{float(x):.4f}"
             except Exception:
                 return "n/a"
-
         dom_cal = safe_load(os.path.join(args.model_dir, "calibration.json"))
         js_cal = safe_load(os.path.join(args.js_dir, "calibration.json"))
         fu_cal = safe_load(os.path.join(args.fusion_dir, "calibration.json"))
+        meta_cal = safe_load(os.path.join(args.meta_fusion_dir, "calibration.json"))
         metrics_json = safe_load(os.path.join(report_dir, "summary.json"))
         pngs = [p for p in os.listdir(report_dir) if p.endswith(".png")]
         lime_dom_dir = os.path.join(report_dir, "lime_dom")
@@ -2132,7 +2204,7 @@ def main():
             "</head><body>",
             "<div class='top'><div class='pill'>Report</div><div class='mono'>PhisDOM Evaluation</div>"
             f"<div style='margin-left:auto' class='mono'>{args.model_dir}</div></div>",
-            "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#metrics'>Metrics</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
+            "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#metrics'>Metrics</a><a href='#xfusion'>XFusion</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
             "<div class='wrap'>",
             "<div class='section'><p class='mono' style='opacity:.85'>This report summarizes training/evaluation of the DOM model (MarkupLM) and optionally JS (CodeT5+) and fused heads. It includes PR/ROC curves, reliability, confusion matrices at calibrated thresholds, and optional LIME/SHAP explanations. Below are dataset counts and calibration snapshots, followed by detailed metrics tables and plots. The Tests section summarizes unit tests included in this repo.</p></div>",
             "<div id='dataset' class='section'><h2 style='margin:0 0 8px 0'>Dataset summary</h2>",
@@ -2143,6 +2215,7 @@ def main():
             f"<div class='grid'><div class='card'>{metric_block('DOM (MarkupLM)', dom_cal)}</div>",
             f"<div class='card'>{metric_block('JS (CodeT5+)', js_cal)}</div>",
             f"<div class='card'>{metric_block('Fused (DOM+JS)', fu_cal)}</div>",
+            f"<div class='card'>{metric_block('Meta Fused (All Heads)', meta_cal)}</div>",
             # Include light heads if present
             (lambda light: ''.join([
                 f"<div class='card'>{metric_block('URL CharCNN', light.get('url'))}</div>",
@@ -2157,10 +2230,82 @@ def main():
             metrics_table("DOM", (metrics_json or {}).get("core", {}).get("dom")),
             metrics_table("JS", (metrics_json or {}).get("core", {}).get("js")),
             metrics_table("Fused", (metrics_json or {}).get("core", {}).get("fused")),
+            metrics_table("Meta Fused (All Heads)", (metrics_json or {}).get("core", {}).get("meta")),
             "</div>",
+        ]
+
+        # XFusion diagnostics card (if present)
+        xfd = (metrics_json or {}).get("xfusion_diagnostics") if isinstance(metrics_json, dict) else None
+        if isinstance(xfd, dict):
+            try:
+                top_grad = xfd.get("top_grad_params") or []
+                modalities = xfd.get("modalities") or {}
+                corr = xfd.get("correlation_matrix") or []
+                corr_mods = xfd.get("correlation_modalities") or []
+                steps = xfd.get("total_steps")
+                # Build gradient list
+                grad_rows = []
+                for name, val in top_grad[:10]:
+                    try:
+                        grad_rows.append(f"<tr><td class='mono'>{name}</td><td class='mono' style='text-align:right'>{float(val):.4f}</td></tr>")
+                    except Exception:
+                        continue
+                grad_tbl = ("<table><thead><tr><th>Param</th><th>|grad|</th></tr></thead><tbody>"+"".join(grad_rows)+"</tbody></table>") if grad_rows else "<p>No gradient stats.</p>"
+                # Modalities stats
+                mod_cards = []
+                for m, stats in modalities.items():
+                    if not isinstance(stats, dict):
+                        continue
+                    mean_n = stats.get("mean_token_norm_mean")
+                    var_n = stats.get("mean_token_norm_var")
+                    ntok = stats.get("num_tokens")
+                    if mean_n is None or var_n is None or ntok is None:
+                        continue
+                    try:
+                        mean_f = float(mean_n)
+                        var_f = float(var_n)
+                        ntok_i = int(ntok)
+                        mod_cards.append(
+                            f"<div class='card'><h4 style='margin:0 0 6px 0'>{m}</h4><div class='mono'>mean_norm={mean_f:.4f}</div><div class='mono'>var_norm={var_f:.4f}</div><div class='mono'>tokens={ntok_i}</div></div>"
+                        )
+                    except Exception:
+                        continue
+                # Correlation matrix
+                corr_html = ""
+                if corr and corr_mods and all(isinstance(r, (list, tuple)) for r in corr):
+                    try:
+                        head = "".join(f"<th>{m}</th>" for m in corr_mods)
+                        body_rows = []
+                        for mi, row in zip(corr_mods, corr):
+                            cells = []
+                            for v in row:
+                                try:
+                                    cells.append(f"<td class='mono' style='text-align:right'>{float(v):.3f}</td>")
+                                except Exception:
+                                    cells.append("<td class='mono'>n/a</td>")
+                            body_rows.append(f"<tr><td class='mono'>{mi}</td>{''.join(cells)}</tr>")
+                        corr_html = (
+                            "<div style='overflow:auto'><table><thead><tr><th></th>"+head+"</tr></thead><tbody>"+"".join(body_rows)+"</tbody></table></div>"
+                        )
+                    except Exception:
+                        corr_html = "<p>Correlation matrix parse error.</p>"
+                heat_png = "xfusion_corr_heatmap.png"
+                heat_img = f"<div><img src='{heat_png}' alt='corr heatmap'/></div>" if os.path.exists(os.path.join(report_dir, heat_png)) else ""
+                html.append(
+                    "<div id='xfusion' class='section'><h2 style='margin:0 0 8px 0'>XFusion Diagnostics</h2>"
+                    + f"<p class='mono' style='opacity:.8'>Instrumented cross-attention fusion stats (steps={steps}).</p>"
+                    + "<div class='grid'>"
+                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Top Grad Norms</h3>{grad_tbl}</div>"
+                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Modality Token Norms</h3><div class='subgrid'>{''.join(mod_cards) or '<p>No modality stats.</p>'}</div></div>"
+                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Embedding Correlations</h3>{corr_html}{heat_img}</div>"
+                    + "</div></div>"
+                )
+            except Exception:
+                pass
+        html.extend([
             "<div id='tests' class='section'><h2 style='margin:0 0 8px 0'>Tests overview</h2>", tests_html, "</div>",
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
-        ]
+        ])
 
         for name in sorted(pngs):
             html.append(f"<div><p>{name}</p><img src='{name}'/></div>")

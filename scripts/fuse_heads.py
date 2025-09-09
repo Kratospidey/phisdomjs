@@ -58,6 +58,8 @@ def main():
         ap.add_argument("--use-cheap-features", action="store_true", help="Include lightweight crawler features in the stacker")
         ap.add_argument("--validate-predictions", action="store_true", help="Validate prediction formats before fusion")
     ap.add_argument("--tpr", type=float, nargs="*", default=[0.95, 0.90])
+    ap.add_argument("--tag", default="", help="Optional suffix tag for fused output files (e.g. _full)")
+    ap.add_argument("--head-tag", default="", help="Optional suffix tag for input head prediction files to read (e.g. _full)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -86,9 +88,16 @@ def main():
     
     # Filter to only heads with prediction files
     available_heads = {}
+    in_tag = args.head_tag
+    def _with_in_tag(base: str) -> str:
+        if not in_tag:
+            return base
+        root, ext = os.path.splitext(base)
+        return f"{root}{in_tag}{ext}" if ext else f"{base}{in_tag}"
+
     for name, d in heads.items():
-        val_preds = os.path.join(d, "preds_val.jsonl")
-        test_preds = os.path.join(d, "preds_test.jsonl")
+        val_preds = os.path.join(d, _with_in_tag("preds_val.jsonl"))
+        test_preds = os.path.join(d, _with_in_tag("preds_test.jsonl"))
         if os.path.exists(val_preds) and os.path.exists(test_preds):
             available_heads[name] = d
         else:
@@ -105,7 +114,7 @@ def main():
         print("Validating prediction formats...")
         for name, d in available_heads.items():
             for split in ["val", "test"]:
-                pred_path = os.path.join(d, f"preds_{split}.jsonl")
+                pred_path = os.path.join(d, _with_in_tag(f"preds_{split}.jsonl"))
                 diagnostics = validate_prediction_format(pred_path)
                 if not diagnostics["valid"]:
                     print(f"ERROR: Invalid prediction format in {pred_path}")
@@ -136,14 +145,14 @@ def main():
 
     # Align data with available heads
     Xv, yv, ids_v, feature_names = aligner.align(
-        args.val_jsonl, 
-        available_heads, 
+        args.val_jsonl,
+        {k: v for k, v in available_heads.items()},  # pass mapping
         required_heads=required_heads,
         use_cheap_features=bool(getattr(args, "use_cheap_features", True))
     )
     Xt, yt, ids_t, _ = aligner.align(
-        args.test_jsonl, 
-        available_heads, 
+        args.test_jsonl,
+        {k: v for k, v in available_heads.items()},
         required_heads=required_heads,
         use_cheap_features=bool(getattr(args, "use_cheap_features", True))
     )
@@ -239,12 +248,31 @@ def main():
         ids_t, yt, pt, "fusion", "test", auto_flip=True
     )
     
-    save_standardized_predictions(val_preds, val_meta, args.out_dir, "val")
-    save_standardized_predictions(test_preds, test_meta, args.out_dir, "test")
+    tag = args.tag
+    def _with_tag(base: str) -> str:
+        if not tag:
+            return base
+        root, ext = os.path.splitext(base)
+        return f"{root}{tag}{ext}" if ext else f"{base}{tag}"
+
+    if tag:
+        # Manual save with tag (avoid altering helper logic globally)
+        for split, preds, meta in [("val", val_preds, val_meta), ("test", test_preds, test_meta)]:
+            pred_path = os.path.join(args.out_dir, _with_tag(f"preds_{split}.jsonl"))
+            with open(pred_path, "w", encoding="utf-8") as f:
+                for p in preds:
+                    f.write(json.dumps(p))
+                    f.write("\n")
+            meta_path = os.path.join(args.out_dir, _with_tag(f"preds_{split}_metadata.json"))
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+    else:
+        save_standardized_predictions(val_preds, val_meta, args.out_dir, "val")
+        save_standardized_predictions(test_preds, test_meta, args.out_dir, "test")
 
     # Save calibration results
     cal = {"metrics": {"pr_auc": pr, "roc_auc": roc}, "thresholds": thresholds}
-    with open(os.path.join(args.out_dir, "calibration.json"), "w", encoding="utf-8") as f:
+    with open(os.path.join(args.out_dir, _with_tag("calibration.json")), "w", encoding="utf-8") as f:
         json.dump(cal, f, indent=2)
 
     print(json.dumps(cal, indent=2))

@@ -14,8 +14,6 @@ from transformers import (
 )
 from transformers.utils import logging as hf_logging
 import logging as py_logging
-from typing import cast
-from torch.utils.data import Dataset as TorchDataset
 import torch
 
 from phisdom.data.loader import JsonlPhishDataset, MarkupLMDataCollator
@@ -37,7 +35,10 @@ def main():
     parser.add_argument("--val-jsonl", required=True)
     parser.add_argument("--test-jsonl", required=True)
     parser.add_argument("--max-length", type=int, default=512)
+    parser.add_argument("--max-html-chars", type=int, default=800000, help="Truncate each HTML document to this many chars before tokenization (controls memory). Use -1 to disable.")
+    parser.add_argument("--limit", type=int, default=0, help="If >0, limit number of examples per split for a fast smoke test.")
     parser.add_argument("--tpr", type=float, nargs="*", default=[0.95, 0.90])
+    parser.add_argument("--tag", default="", help="Optional suffix tag for output prediction/calibration files (e.g. _full)")
     args = parser.parse_args()
 
     # Guard: require a fine-tuned local model directory (avoid loading base Hub ID)
@@ -62,13 +63,22 @@ def main():
     val_ds = JsonlPhishDataset(args.val_jsonl)
     test_ds = JsonlPhishDataset(args.test_jsonl)
 
-    collator = MarkupLMDataCollator(processor=processor, max_length=args.max_length)
+    max_html_chars = None if args.max_html_chars is not None and args.max_html_chars < 0 else args.max_html_chars
+    collator = MarkupLMDataCollator(processor=processor, max_length=args.max_length, max_html_chars=max_html_chars)
 
-    # Dummy trainer for prediction loop
+    if args.limit and args.limit > 0:
+        # Simple slice by rebuilding reduced index lists
+        val_ds._index = val_ds._index[: args.limit]  # type: ignore[attr-defined]
+        test_ds._index = test_ds._index[: args.limit]  # type: ignore[attr-defined]
+        print(f"[INFO] Limiting evaluation to first {args.limit} examples per split for smoke test")
+    # Use Trainer but keep raw sample keys so collator sees 'html'
     targs = TrainingArguments(
         output_dir=os.path.join(args.model_dir, "_eval_tmp"),
         per_device_eval_batch_size=4,
-        remove_unused_columns=False,
+        dataloader_drop_last=False,
+        remove_unused_columns=False,  # CRITICAL: keep 'html' for collator
+    report_to=[],
+    logging_strategy="no",
     )
     trainer = Trainer(model=model, args=targs, data_collator=collator)
 
@@ -83,24 +93,22 @@ def main():
     else:
         print("[INFO] Eval using CPU")
 
-    # Predict on val for calibration
-    val_out = trainer.predict(cast(TorchDataset, val_ds))  # type: ignore[arg-type]
+    # Predict on val using Trainer
+    val_out = trainer.predict(val_ds)  # type: ignore[arg-type]
     logits_val = val_out.predictions
     if isinstance(logits_val, tuple):
         logits_val = logits_val[0]
-    # Binary logits: if 2-dim, use logit for class 1 as z = log(p1/p0)
     if logits_val.ndim == 2 and logits_val.shape[1] == 2:
         z_val = logits_val[:, 1] - logits_val[:, 0]
     else:
         z_val = logits_val.reshape(-1)
-    # Extract labels without relying on deprecated `.rows`
     y_val = np.array([val_ds[i]["label"] for i in range(len(val_ds))], dtype=int)
 
     ts = TemperatureScaler(is_logit=True)
     T = ts.fit(y_val.tolist(), z_val.tolist())
 
     # Predict on test
-    test_out = trainer.predict(cast(TorchDataset, test_ds))  # type: ignore[arg-type]
+    test_out = trainer.predict(test_ds)  # type: ignore[arg-type]
     logits_test = test_out.predictions
     if isinstance(logits_test, tuple):
         logits_test = logits_test[0]
@@ -129,7 +137,14 @@ def main():
         "metrics": {"pr_auc": pr, "roc_auc": roc},
         "thresholds": thresholds,
     }
-    with open(os.path.join(args.model_dir, "calibration.json"), "w", encoding="utf-8") as f:
+    tag = args.tag
+    def _with_tag(base: str) -> str:
+        if not tag:
+            return base
+        root, ext = os.path.splitext(base)
+        return f"{root}{tag}{ext}" if ext else f"{base}{tag}"
+
+    with open(os.path.join(args.model_dir, _with_tag("calibration.json")), "w", encoding="utf-8") as f:
         json.dump(cal, f, indent=2)
 
     # Save predictions using standardized format
@@ -140,7 +155,19 @@ def main():
         preds, metadata = standardize_prediction_format(
             ids, labels, probs, "markup_lm", split_name, auto_flip=True
         )
-        save_standardized_predictions(preds, metadata, args.model_dir, split_name)
+        # Temporarily write to tag-suffixed filename if provided
+        if tag:
+            # Write predictions manually replicating save_standardized_predictions but with tag
+            pred_path = os.path.join(args.model_dir, _with_tag(f"preds_{split_name}.jsonl"))
+            with open(pred_path, "w", encoding="utf-8") as f:
+                for pred in preds:
+                    f.write(json.dumps(pred))
+                    f.write("\n")
+            meta_path = os.path.join(args.model_dir, _with_tag(f"preds_{split_name}_metadata.json"))
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, indent=2)
+        else:
+            save_standardized_predictions(preds, metadata, args.model_dir, split_name)
 
     save_preds_standardized("val", val_ds, p_val)
     save_preds_standardized("test", test_ds, p_test)
