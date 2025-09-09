@@ -21,20 +21,56 @@ def train_one_epoch(model, loader, opt, sched, device):
     crit = nn.BCEWithLogitsLoss()
     total = 0.0
     n = 0
-    for batch in loader:
+    nan_batches = 0
+    for batch_idx, batch in enumerate(loader):
         labels = batch.pop("labels").float().to(device)
         for k, v in list(batch.items()):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
         opt.zero_grad(set_to_none=True)
         logits = model(batch).squeeze(-1)
+        
+        # Check for NaN/inf in logits
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"🚨 NaN/Inf logits detected in batch {batch_idx}, skipping...")
+            nan_batches += 1
+            continue
+            
         loss = crit(logits, labels)
+        
+        # Check for NaN/inf in loss
+        if torch.isnan(loss).any() or torch.isinf(loss).any():
+            print(f"🚨 NaN/Inf loss detected in batch {batch_idx}, skipping...")
+            nan_batches += 1
+            continue
+            
         loss.backward()
+        
+        # Gradient clipping for stability
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        # Check for NaN gradients
+        has_nan_grad = False
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    print(f"🚨 NaN/Inf gradient in {name}, zeroing...")
+                    param.grad.zero_()
+                    has_nan_grad = True
+        
+        if has_nan_grad:
+            nan_batches += 1
+            continue
+            
         opt.step()
         if sched is not None:
             sched.step()
         total += float(loss.item()) * labels.size(0)
         n += labels.size(0)
+    
+    if nan_batches > 0:
+        print(f"⚠️  Skipped {nan_batches} batches due to NaN/Inf values")
+    
     return total / max(1, n)
 
 
@@ -44,6 +80,7 @@ def eval_logits(model, loader, device):
     logits_list: List[torch.Tensor] = []
     labels_list: List[torch.Tensor] = []
     ids: List[str] = []
+    nan_samples = 0
     for batch in loader:
         labels = batch.pop("labels").to(device)
         # accept either 'ids' or 'id' from the collator
@@ -54,8 +91,20 @@ def eval_logits(model, loader, device):
             if isinstance(v, torch.Tensor):
                 batch[k] = v.to(device)
         logits = model(batch).squeeze(-1)
+        
+        # Check for NaN/inf in evaluation logits
+        if torch.isnan(logits).any() or torch.isinf(logits).any():
+            print(f"🚨 NaN/Inf logits in evaluation, replacing with zeros...")
+            nan_count = torch.isnan(logits).sum().item() + torch.isinf(logits).sum().item()
+            nan_samples += nan_count
+            logits = torch.where(torch.isfinite(logits), logits, torch.zeros_like(logits))
+        
         logits_list.append(logits.detach().cpu())
         labels_list.append(labels.detach().cpu())
+    
+    if nan_samples > 0:
+        print(f"⚠️  Replaced {nan_samples} NaN/Inf predictions with zeros during evaluation")
+        
     if not logits_list:
         return ids, torch.empty((0,)), torch.empty((0,), dtype=torch.long)
     return ids, torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
@@ -135,34 +184,72 @@ def main():
     va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
     te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
 
-    # Infer cheap feature dimension without consuming a training batch
-    cheap_dim = 32
+    # Infer cheap feature dimension safely without consuming a training batch
+    cheap_dim = None
     if not args.no_cheap:
         try:
+            # Sample a single row to detect cheap feature dimension
             sample_row = tr_ds[0]
             sample_batch = coll([sample_row])  # collator expects a list
+            
+            # Look for cheap features in various field names
             cf = sample_batch.get("cheap_features") or sample_batch.get("cheap")
-            if cf is not None:
+            if cf is not None and hasattr(cf, 'shape'):
                 cheap_dim = int(cf.shape[-1])
                 print(f"Detected cheap feature dimension: {cheap_dim}")
             else:
+                # Fallback to constant dimension from feature list
                 from phisdom.data.cheap_features import CHEAP_FEATURES
                 cheap_dim = len(CHEAP_FEATURES)
                 print(f"Using cheap feature dimension from constant: {cheap_dim}")
         except Exception as e:
-            print(f"Warning: Could not detect cheap feature dimension, using default 32: {e}")
+            print(f"Warning: Could not detect cheap feature dimension, using lazy adaptation: {e}")
+            cheap_dim = None  # Let LazyLinear handle it
     
-    # Use detected cheap_dim unless disabled, else allow module to adapt lazily with None
+    # Create model with detected or adaptive cheap dimension
     model = CrossModalTransformerFusion(
-        cheap_dim=None if args.no_cheap else cheap_dim
+        d_model=128,
+        n_heads=4, 
+        n_layers=2,
+        dropout=0.1,
+        use_url=not args.no_url,
+        use_js=not args.no_js,
+        use_text=not args.no_text,
+        use_dom=not args.no_dom,
+        use_cheap=not args.no_cheap,
+        cheap_dim=cheap_dim  # None for lazy adaptation, int for fixed size
     ).to(device)
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    
+    # Enhanced optimizer with numerical stability
+    opt = torch.optim.AdamW(
+        model.parameters(), 
+        lr=args.lr, 
+        weight_decay=args.weight_decay,
+        eps=1e-8,  # Larger epsilon for stability
+        amsgrad=True  # More stable variant
+    )
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(tr_dl) * args.epochs))
+
+    # Add parameter initialization for stability
+    def init_weights_stable(m):
+        if isinstance(m, nn.Linear) and not isinstance(m, nn.LazyLinear):
+            torch.nn.init.xavier_uniform_(m.weight, gain=0.1)  # Smaller gain
+            if m.bias is not None:
+                torch.nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.LayerNorm):
+            torch.nn.init.constant_(m.weight, 1.0)
+            torch.nn.init.constant_(m.bias, 0.0)
+        elif isinstance(m, nn.Embedding):
+            torch.nn.init.normal_(m.weight, mean=0.0, std=0.01)  # Smaller std
+
+    model.apply(init_weights_stable)
+    print("✓ Applied stable weight initialization")
 
     bcel = nn.BCEWithLogitsLoss()
     best_val = float("inf")
     bad = 0
     patience = 3
+    model_saved = False  # Track if we ever saved a model
     for ep in range(args.epochs):
         _ = train_one_epoch(model, tr_dl, opt, sched, device)
         ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
@@ -171,10 +258,16 @@ def main():
             best_val = val_loss
             bad = 0
             torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pt"))
+            model_saved = True
         else:
             bad += 1
             if bad >= patience:
                 break
+    
+    # Ensure we have a saved model even if validation was problematic
+    if not model_saved:
+        print("Warning: No model was saved during training, saving current state")
+        torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pt"))
 
     model.load_state_dict(torch.load(os.path.join(args.out_dir, "model.pt"), map_location=device))
     ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)

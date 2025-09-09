@@ -597,6 +597,14 @@ def plot_curves(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import precision_recall_curve, roc_curve, auc
     os.makedirs(out_dir, exist_ok=True)
+    # Guard against NaNs in probabilities
+    if not np.isfinite(p).all():
+        print(f"[WARN] NaN/inf detected in probabilities for split {split}; filtering")
+        mask = np.isfinite(p)
+        y = y[mask]
+        p = p[mask]
+    if y.size == 0 or p.size == 0:
+        plt.figure(); plt.text(0.5, 0.5, "No valid predictions", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"pr_curve_{split}.png")); plt.close(); return
     # One-class guard
     if len(set(map(int, y.tolist()))) < 2:
         # Create tiny placeholder images to avoid report breaks
@@ -637,11 +645,20 @@ def plot_curves(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
 def plot_reliability(y: np.ndarray, p: np.ndarray, out_dir: str, split: str):
     import matplotlib.pyplot as plt
     from sklearn.calibration import calibration_curve
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
-    if len(set(map(int, y.tolist()))) < 2:
+    
+    # Filter out NaN/inf values
+    mask = np.isfinite(p)
+    if not mask.any():
+        plt.figure(); plt.text(0.5, 0.5, "All probabilities are NaN/inf", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"reliability_{split}.png")); plt.close()
+        return
+    y_clean, p_clean = y[mask], p[mask]
+    
+    if len(set(map(int, y_clean.tolist()))) < 2:
         plt.figure(); plt.text(0.5, 0.5, "One-class split; reliability not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"reliability_{split}.png")); plt.close()
         return
-    frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="uniform")
+    frac_pos, mean_pred = calibration_curve(y_clean, p_clean, n_bins=10, strategy="uniform")
     plt.figure()
     plt.plot(mean_pred, frac_pos, marker="o")
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
@@ -681,10 +698,23 @@ def plot_confusion(y: np.ndarray, p: np.ndarray, thr: float, out_dir: str, split
 def plot_roc_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve, auc
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        fpr, tpr, _ = roc_curve(y, p)
+        # Filter out NaN/inf values
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping ROC curve")
+            continue
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Skip if only one class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class after NaN filtering for {label}, skipping ROC curve")
+            continue
+            
+        fpr, tpr, _ = roc_curve(y_clean, p_clean)
         roc_auc = auc(fpr, tpr)
         plt.plot(fpr, tpr, label=f"{label} (AUC={roc_auc:.3f})")
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
@@ -701,10 +731,23 @@ def plot_roc_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: st
 def plot_pr_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import precision_recall_curve, auc
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        prec, rec, _ = precision_recall_curve(y, p)
+        # Filter out NaN/inf values
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping PR curve")
+            continue
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Skip if only one class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class after NaN filtering for {label}, skipping PR curve")
+            continue
+            
+        prec, rec, _ = precision_recall_curve(y_clean, p_clean)
         pr_auc = auc(rec, prec)
         plt.plot(rec, prec, label=f"{label} (AUC={pr_auc:.3f})")
     plt.xlabel("Recall")
@@ -720,10 +763,23 @@ def plot_pr_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str
 def plot_reliability_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.calibration import calibration_curve
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="uniform")
+        # Filter out NaN/inf values
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping reliability")
+            continue
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Skip if only one class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class for {label} after NaN filtering, skipping reliability")
+            continue
+            
+        frac_pos, mean_pred = calibration_curve(y_clean, p_clean, n_bins=10, strategy="uniform")
         plt.plot(mean_pred, frac_pos, marker="o", label=label)
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
     plt.xlabel("Mean predicted probability")
@@ -739,12 +795,23 @@ def plot_reliability_multi(series: List[Tuple[str, np.ndarray, np.ndarray]], out
 def plot_pr_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import precision_recall_curve, auc
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        if len(set(map(int, y.tolist()))) < 2:
+        # Filter out NaN/inf values first
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping PR curve")
             continue
-        prec, rec, _ = precision_recall_curve(y, p)
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Check for single class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class for {label} after NaN filtering, skipping PR curve")
+            continue
+            
+        prec, rec, _ = precision_recall_curve(y_clean, p_clean)
         pr_auc = auc(rec, prec)
         plt.plot(rec, prec, label=f"{label} (AUC={pr_auc:.3f})")
     plt.xlabel("Recall")
@@ -760,12 +827,23 @@ def plot_pr_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_d
 def plot_roc_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.metrics import roc_curve, auc
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        if len(set(map(int, y.tolist()))) < 2:
+        # Filter out NaN/inf values first
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping ROC curve")
             continue
-        fpr, tpr, _ = roc_curve(y, p)
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Check for single class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class for {label} after NaN filtering, skipping ROC curve")
+            continue
+            
+        fpr, tpr, _ = roc_curve(y_clean, p_clean)
         roc_auc = auc(fpr, tpr)
         plt.plot(fpr, tpr, label=f"{label} (AUC={roc_auc:.3f})")
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
@@ -782,12 +860,23 @@ def plot_roc_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_
 def plot_reliability_multi_splits(series: List[Tuple[str, np.ndarray, np.ndarray]], out_dir: str, name: str):
     import matplotlib.pyplot as plt
     from sklearn.calibration import calibration_curve
+    import numpy as np
     os.makedirs(out_dir, exist_ok=True)
     plt.figure()
     for label, y, p in series:
-        if len(set(map(int, y.tolist()))) < 2:
+        # Filter out NaN/inf values first
+        mask = np.isfinite(p)
+        if not mask.any():
+            print(f"[WARN] All probabilities are NaN/inf for {label}, skipping reliability")
             continue
-        frac_pos, mean_pred = calibration_curve(y, p, n_bins=10, strategy="uniform")
+        y_clean, p_clean = y[mask], p[mask]
+        
+        # Check for single class after filtering
+        if len(set(map(int, y_clean.tolist()))) < 2:
+            print(f"[WARN] Single class for {label} after NaN filtering, skipping reliability")
+            continue
+            
+        frac_pos, mean_pred = calibration_curve(y_clean, p_clean, n_bins=10, strategy="uniform")
         plt.plot(mean_pred, frac_pos, marker="o", label=label)
     plt.plot([0, 1], [0, 1], "k--", alpha=0.4)
     plt.xlabel("Mean predicted probability")

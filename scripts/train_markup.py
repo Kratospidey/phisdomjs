@@ -61,18 +61,24 @@ class EpochProgressCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):  # type: ignore[override]
         if not metrics:
             return
-        best = state.best_metric if state.best_metric is not None else float('nan')
+        best = state.best_metric if state.best_metric is not None else None
         metric = metrics.get("eval_pr_auc") or metrics.get("pr_auc")
         if metric is not None:
-            print(f"[EPOCH] eval pr_auc={metric:.4f} | best={best}")
+            if best is not None:
+                print(f"[EPOCH] eval pr_auc={metric:.4f} | best={best:.4f}")
+            else:
+                print(f"[EPOCH] eval pr_auc={metric:.4f} | best=first_epoch")
 
 
 def main():
     parser = argparse.ArgumentParser(description="Train MarkupLM DOM head on JSONL dataset")
     parser.add_argument("--config", required=True, help="YAML config path")
+    parser.add_argument("--epochs", type=float, help="Number of training epochs (overrides config)")
     parser.add_argument("--early-stopping-patience", type=int, default=3, help="Stop if metric doesn't improve for N evals")
     parser.add_argument("--early-stopping-min-delta", type=float, default=0.0, help="Minimum improvement to reset patience")
     parser.add_argument("--disable-tqdm", action="store_true", help="Disable tqdm progress bar")
+    parser.add_argument("--skip-if-exists", action="store_true", help="Skip training if output_dir already has a saved model (idempotent)")
+    parser.add_argument("--force", action="store_true", help="Force retrain even if output_dir exists")
     args = parser.parse_args()
 
     with open(args.config, "r", encoding="utf-8") as f:
@@ -93,8 +99,19 @@ def main():
     model_name = cfg.get("model_name", "microsoft/markuplm-base")
     max_length = int(cfg.get("max_length", 512))
     batch_size = int(cfg.get("batch_size", 4))
-    num_epochs = float(cfg.get("num_epochs", 1))
+    num_epochs = float(args.epochs) if args.epochs is not None else float(cfg.get("num_epochs", 1))
     lr = float(cfg.get("learning_rate", 3e-5))
+
+    # Idempotent skip logic
+    sentinel_files = [
+        os.path.join(out_dir, "pytorch_model.bin"),
+        os.path.join(out_dir, "model.safetensors"),
+        os.path.join(out_dir, "config.json"),
+    ]
+    if args.skip_if_exists and not args.force:
+        if any(os.path.exists(p) for p in sentinel_files):
+            print(f"[INFO] Skipping training (model already exists in {out_dir}). Use --force to retrain.")
+            return
 
     train_path = cfg["train_jsonl"]
     val_path = cfg.get("val_jsonl", train_path)
@@ -149,7 +166,8 @@ def main():
     )
 
     # Callbacks: pretty epoch progress + early stopping
-    callbacks = [EpochProgressCallback(total_epochs=num_epochs)]
+    # Mixed callback types (custom + EarlyStopping); declare as generic list for type checkers
+    callbacks: list[TrainerCallback] = [EpochProgressCallback(total_epochs=num_epochs)]  # type: ignore[list-item]
     if int(args.early_stopping_patience) > 0:
         callbacks.append(EarlyStoppingCallback(early_stopping_patience=int(args.early_stopping_patience), early_stopping_threshold=float(args.early_stopping_min_delta)))
 

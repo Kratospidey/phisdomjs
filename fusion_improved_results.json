@@ -1,0 +1,1 @@
+{"metrics": {"pr_auc": 0.8009340224575445, "roc_auc": 0.9755096354771302}, "improvement_notes": "21x improvement over broken baseline (0.037 → 0.801), 2.5x more sample coverage (1884/1949 vs 751/1949)"}

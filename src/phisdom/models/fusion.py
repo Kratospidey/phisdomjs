@@ -57,8 +57,12 @@ class CrossModalTransformerFusion(nn.Module):
         # cheap projector (fixed or lazy)
         if use_cheap:
             if cheap_dim is None:
+                # Use LazyLinear for automatic dimension detection
                 self.enc_cheap = nn.LazyLinear(d_model)
             else:
+                # Validate dimension
+                if not isinstance(cheap_dim, int) or cheap_dim <= 0:
+                    raise ValueError(f"cheap_dim must be a positive integer, got {cheap_dim}")
                 self.enc_cheap = nn.Linear(int(cheap_dim), d_model)
         else:
             self.enc_cheap = None

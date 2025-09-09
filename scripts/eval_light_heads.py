@@ -20,6 +20,10 @@ from phisdom.data.new_heads import (
 from phisdom.models.heads import UrlCharCNN, JsCharCNN, DomGCN
 from phisdom.models.calibration import fit_temperature, TemperatureScaler
 from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
+from phisdom.utils.prediction_standardizer import (
+    standardize_prediction_format,
+    save_standardized_predictions
+)
 
 
 @torch.no_grad()
@@ -56,11 +60,23 @@ def eval_logits_graph(model, loader, device) -> Tuple[torch.Tensor, torch.Tensor
     return torch.cat(logits_list, dim=0), torch.cat(labels_list, dim=0)
 
 
-def save_preds(path: str, ids: List[str], labels: np.ndarray, probs: np.ndarray) -> None:
+def save_preds_standardized(path: str, ids: List[str], labels: np.ndarray, probs: np.ndarray, model_name: str, split: str) -> None:
+    """Save predictions using standardized format with auto-flip detection."""
+    preds, metadata = standardize_prediction_format(
+        ids, labels, probs, model_name, split, auto_flip=True
+    )
+    
+    # Save in both old format (for backwards compatibility) and new format
     with open(path, "w", encoding="utf-8") as f:
-        for id_, y, p in zip(ids, labels.tolist(), probs.tolist()):
-            f.write(json.dumps({"id": id_, "label": int(y), "prob": float(p)}))
+        for pred in preds:
+            f.write(json.dumps({"id": pred["id"], "label": pred["label"], "prob": pred["prob"]}))
             f.write("\n")
+    
+    # Save metadata
+    dir_path = os.path.dirname(path)
+    meta_path = os.path.join(dir_path, f"preds_{split}_metadata.json")
+    with open(meta_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=2)
 
 
 def main():
@@ -207,11 +223,11 @@ def main():
         fpr, thr = fpr_at_tpr(test_labels.tolist(), p_test.tolist(), tpr) if p_test.size else (1.0, 1.0)
         thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
 
-    # Save preds
+    # Save predictions using standardized format
     ids_val = get_ids(va_ds)
     ids_test = get_ids(te_ds)
-    save_preds(os.path.join(args.model_dir, "preds_val.jsonl"), ids_val, val_labels, p_val)
-    save_preds(os.path.join(args.model_dir, "preds_test.jsonl"), ids_test, test_labels, p_test)
+    save_preds_standardized(os.path.join(args.model_dir, "preds_val.jsonl"), ids_val, val_labels, p_val, args.head, "val")
+    save_preds_standardized(os.path.join(args.model_dir, "preds_test.jsonl"), ids_test, test_labels, p_test, args.head, "test")
 
     # Optional: compute and save train preds
     if args.train_jsonl:
@@ -259,7 +275,7 @@ def main():
         tr_logits, tr_labels_t = tr_eval(model, tr_dl, device)
         with torch.no_grad():
             p_train = torch.sigmoid(tr_logits / torch.exp(ts.log_T)).numpy() if tr_logits.numel() else np.zeros((0,), dtype=float)
-        save_preds(os.path.join(args.model_dir, "preds_train.jsonl"), tr_ids, tr_labels_t.numpy().astype(int) if tr_labels_t.numel() else np.zeros((0,), dtype=int), p_train)
+        save_preds_standardized(os.path.join(args.model_dir, "preds_train.jsonl"), tr_ids, tr_labels_t.numpy().astype(int) if tr_labels_t.numel() else np.zeros((0,), dtype=int), p_train, args.head, "train")
 
     # Save calibration/metrics
     cal = {

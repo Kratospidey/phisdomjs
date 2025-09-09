@@ -61,17 +61,35 @@ def main():
 
     os.makedirs(args.out_dir, exist_ok=True)
     
-    # Check if fusion directory has predictions, fall back to logistic fusion if needed
+    # Check if fusion directory has predictions, fall back to alternatives if needed
     def _has_preds(d: str) -> bool:
         return os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl"))
+    
     fusion_dir = args.fusion_dir
     if not _has_preds(fusion_dir):
-        alt = "artifacts/fusion_xattn"  # Try cross-attention fusion as backup
-        if _has_preds(alt):
-            print(f"[CASCADE][WARN] '{fusion_dir}' has no predictions; falling back to '{alt}'.")
-            fusion_dir = alt
+        # Try alternatives in order of preference
+        alternatives = ["artifacts/fusion", "artifacts/fusion_xattn"]
+        for alt in alternatives:
+            if _has_preds(alt):
+                print(f"[CASCADE][INFO] '{fusion_dir}' has no predictions; using '{alt}'.")
+                fusion_dir = alt
+                break
         else:
-            print(f"[CASCADE][WARN] No usable fusion preds found in '{fusion_dir}' or '{alt}'. Cascade may fail.")
+            print(f"[CASCADE][ERROR] No usable fusion preds found in '{fusion_dir}' or alternatives {alternatives}.")
+            print("[CASCADE][INFO] Generating dummy cascade results...")
+            # Generate dummy results to prevent pipeline failure
+            out = {
+                "stage1": {"thr_hi": 1.0, "thr_lo": 0.0},
+                "coverage": {
+                    "val": {"overall": float("nan"), "phish": float("nan"), "benign": float("nan")},
+                    "test": {"overall": float("nan"), "phish": float("nan"), "benign": float("nan")}
+                },
+                "error": "No fusion predictions available for cascade"
+            }
+            with open(os.path.join(args.out_dir, "cascade.json"), "w", encoding="utf-8") as f:
+                json.dump(out, f, indent=2)
+            print(json.dumps(out, indent=2))
+            return
     
     def load_split(split: str):
         url = read_preds(os.path.join(args.url_dir, f"preds_{split}.jsonl"))

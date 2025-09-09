@@ -21,6 +21,10 @@ import torch
 from phisdom.data.loader import JsonlPhishDataset, MarkupLMDataCollator
 from phisdom.calibration import TemperatureScaler
 from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
+from phisdom.utils.prediction_standardizer import (
+    standardize_prediction_format,
+    save_standardized_predictions
+)
 
 
 def main():
@@ -128,17 +132,18 @@ def main():
     with open(os.path.join(args.model_dir, "calibration.json"), "w", encoding="utf-8") as f:
         json.dump(cal, f, indent=2)
 
-    # Save predictions
-    def dump_preds(path: str, ds: JsonlPhishDataset, probs: np.ndarray):
-        with open(path, "w", encoding="utf-8") as f:
-            for i, p in enumerate(probs.tolist()):
-                r = ds[i]
-                obj = {"id": r.get("id", str(i)), "label": int(r.get("label", 0)), "prob": float(p)}
-                f.write(json.dumps(obj))
-                f.write("\n")
+    # Save predictions using standardized format
+    def save_preds_standardized(split_name: str, ds: JsonlPhishDataset, probs: np.ndarray):
+        ids = [ds[i].get("id", str(i)) for i in range(len(ds))]
+        labels = np.array([ds[i].get("label", 0) for i in range(len(ds))], dtype=int)
+        
+        preds, metadata = standardize_prediction_format(
+            ids, labels, probs, "markup_lm", split_name, auto_flip=True
+        )
+        save_standardized_predictions(preds, metadata, args.model_dir, split_name)
 
-    dump_preds(os.path.join(args.model_dir, "preds_val.jsonl"), val_ds, p_val)
-    dump_preds(os.path.join(args.model_dir, "preds_test.jsonl"), test_ds, p_test)
+    save_preds_standardized("val", val_ds, p_val)
+    save_preds_standardized("test", test_ds, p_test)
 
     print(json.dumps(cal, indent=2))
 

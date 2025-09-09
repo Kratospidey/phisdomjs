@@ -40,7 +40,7 @@ DATASET := data/pages.jsonl
 OUTDIR ?= artifacts/markup_run
 MAXLEN ?= 512
 BATCH ?= 4
-EPOCHS ?= 1
+EPOCHS ?= 10
 LR ?= 3e-5
 XAI_DEVICE ?= cuda
 # Early stopping and logging controls
@@ -83,6 +83,40 @@ unify:
 		$(if $(SEED_SIZE),--target-size $(SEED_SIZE) --phish-ratio $(PHISH_RATIO),--limit-phish $(LIMIT_PHISH) --limit-benign $(LIMIT_BENIGN)) \
 		--shuffle $(if $(SEED),--seed $(SEED),)
 
+# New variable for automatic URL target checking
+MIN_CRAWLED_URLS ?= 30000
+PHISH_RATIO ?= 0.5
+
+# Check if we need more URLs and crawl incrementally if needed
+.PHONY: ensure-crawled-count
+ensure-crawled-count:
+	@current_count=$$(if [ -f data/pages.jsonl ]; then wc -l < data/pages.jsonl; else echo 0; fi); \
+	echo "[MAKE] Current crawled URLs: $$current_count"; \
+	echo "[MAKE] Minimum required URLs: $(MIN_CRAWLED_URLS)"; \
+	if [ $$current_count -lt $(MIN_CRAWLED_URLS) ]; then \
+		echo "[MAKE] Need more URLs - running incremental crawler..."; \
+		$(MAKE) crawl-incremental TARGET_URLS=$(MIN_CRAWLED_URLS); \
+	else \
+		echo "[MAKE] URL count sufficient ($$current_count >= $(MIN_CRAWLED_URLS))"; \
+	fi
+
+# Incremental crawling using mixed sources (Tranco + OpenPhish/PhishTank)
+.PHONY: crawl-incremental
+crawl-incremental:
+	@if [ "$(CRAWL)" = "false" ] || [ "$(CRAWL)" = "0" ] || [ "$(CRAWL)" = "no" ]; then \
+		echo "[MAKE] Incremental crawl skipped (CRAWL=$(CRAWL))"; \
+	else \
+		echo "[MAKE] Running incremental mixed crawler ($(PHISH_RATIO) phish ratio)..."; \
+		bash -c "source ~/.bashrc && conda activate mlcuda311 && PYTHONPATH=src python scripts/crawl_mixed_incremental.py \
+			--target-count $(if $(TARGET_URLS),$(TARGET_URLS),$(MIN_CRAWLED_URLS)) \
+			--phish-ratio $(PHISH_RATIO) \
+			--concurrency $(CRAWL_CONCURRENCY) \
+			--timeout-s $(CRAWL_TIMEOUT) \
+			--retries $(CRAWL_RETRIES) \
+			--tls-timeout $(TLS_TIMEOUT) \
+			--dns-timeout $(DNS_TIMEOUT)"; \
+	fi
+
 crawl:
 	@mkdir -p data
 	@if [ "$(CRAWL)" = "false" ] || [ "$(CRAWL)" = "0" ] || [ "$(CRAWL)" = "no" ]; then \
@@ -117,7 +151,9 @@ slice_dataset: slice
 train:
 	$(PY) scripts/train_markup.py --config configs/markup_base.yaml \
 		$(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) \
-		--early-stopping-patience $(ES_PATIENCE) --early-stopping-min-delta $(ES_MIN_DELTA)
+		--epochs $(EPOCHS) \
+		--early-stopping-patience $(ES_PATIENCE) --early-stopping-min-delta $(ES_MIN_DELTA) \
+		$(if $(filter $(SKIP_IF_EXISTS),1),--skip-if-exists,)
 
 # Uses the trained model dir from markup_base.yaml
 # Adjust --max-length if needed
@@ -163,10 +199,26 @@ train-cheap-mlp:
 .PHONY: fuse
 fuse:
 	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic --use-cheap-features
+
+# Comprehensive coverage-max fusion (imputation) and unified export
+.PHONY: fuse-all-coverage
+fuse-all-coverage:
+	$(PY) scripts/fuse_heads.py \
+		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --export-unified-json
+
+# Second-level meta-fusion including prior first-level fusion head
+.PHONY: fuse-meta
+fuse-meta: fuse-all-coverage
+	$(PY) scripts/fuse_heads.py \
+		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --dom-light-dir artifacts/dom_gcn --text-dir artifacts/text_head --cheap-mlp-dir artifacts/cheap_mlp \
+		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 2 --use-cheap-features --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json
 # Cross-attention fusion (XFusion)
 .PHONY: train-xfusion eval-xfusion
 train-xfusion:
-	$(PY) scripts/train_fusion_xattn.py \
+	$(PY) scripts/train_fusion_xattn_fixed.py \
 		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_xattn \
 		$(if $(filter $(XF_NO_URL),1),--no-url,) \
@@ -241,13 +293,13 @@ plot-heads:
 
 # End-to-end: fetch feeds, unify to seed, optional crawl, then splits/train/eval
 ifeq ($(CRAWL),false)
-all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
+all e2e: feeds unify crawl-verify ensure-crawled-count auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else ifeq ($(CRAWL),0)
-all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
+all e2e: feeds unify crawl-verify ensure-crawled-count auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else ifeq ($(CRAWL),no)
-all e2e: feeds unify crawl-verify auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
+all e2e: feeds unify crawl-verify ensure-crawled-count auto-backfill splits slice auto-backfill phase4 $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 else
-all e2e: feeds unify crawl auto-backfill splits slice auto-backfill phase4 $(if $(filter $(AUGMENT_JS),1),phase6,) $(if $(filter $(USE_XFUSION),1),train-xfusion,)
+all e2e: feeds unify crawl ensure-crawled-count auto-backfill splits slice auto-backfill phase4 $(if $(filter $(AUGMENT_JS),1),phase6,) $(if $(filter $(USE_XFUSION),1),train-xfusion,)
 endif
 
 .PHONY: crawl-verify

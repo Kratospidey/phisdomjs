@@ -3,108 +3,19 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Set, Optional
 
 import numpy as np
 
 from phisdom.data.schema import load_jsonl
 from phisdom.data.cheap_features import CHEAP_FEATURES, row_to_features
 from phisdom.metrics import pr_auc_safe, roc_auc_safe, fpr_at_tpr
-
-
-def read_preds(path: str) -> Dict[str, float]:
-    """Read predictions from a JSONL file, returning a mapping from stable ID to probability."""
-    m: Dict[str, float] = {}
-    if not os.path.exists(path):
-        print(f"Warning: Prediction file missing: {path}")
-        return m
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            if not line.strip():
-                continue
-            obj = json.loads(line)
-            # Look for various ID fields that could serve as stable keys
-            id_ = obj.get("id") or obj.get("uid") or obj.get("sha1") or obj.get("url_hash")
-            if id_ is None:
-                raise KeyError(f"Prediction row missing stable key (id/uid/sha1/url_hash): {list(obj.keys())}")
-            # Look for score in various field names
-            score = obj.get("prob")
-            if score is None:
-                score = obj.get("score") if obj.get("score") is not None else obj.get("logit")
-            if score is None:
-                raise KeyError(f"Prediction row missing score field (prob/score/logit): {list(obj.keys())}")
-            m[str(id_)] = float(score)
-    return m
-
-
-def _row_features(r: Dict[str, object], use_features: bool) -> List[float]:
-    return row_to_features(r, use_features)
-
-
-def align(jsonl_path: str, use_features: bool, **head_dirs: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[str]]:
-    """Align predictions from multiple heads using stable ID joining."""
-    # head_dirs: mapping from head name -> directory containing preds_{split}.jsonl
-    split = os.path.splitext(os.path.basename(jsonl_path))[0].split('_')[-1]
-    preds_by_head: Dict[str, Dict[str, float]] = {}
-    
-    # Load predictions from each head
-    for name, d in head_dirs.items():
-        preds_by_head[name] = read_preds(os.path.join(d, f"preds_{split}.jsonl"))
-        print(f"Loaded {len(preds_by_head[name])} predictions for {name}")
-    
-    # Load ground truth labels
-    rows = load_jsonl(jsonl_path)
-    gold_labels: Dict[str, int] = {}
-    id2row: Dict[str, Dict] = {}
-    for r in rows:
-        id_ = r.get("id") or r.get("uid") or r.get("sha1") or r.get("url_hash")
-        if id_ is None:
-            raise KeyError(f"Gold row missing stable key (id/uid/sha1/url_hash): {list(r.keys())}")
-        rid = str(id_)
-        gold_labels[rid] = int(r.get("label", 0))
-        id2row[rid] = r
-    
-    print(f"Loaded {len(gold_labels)} gold labels")
-    
-    # Find common IDs across all heads and gold labels
-    common_ids = set(gold_labels.keys())
-    for name, preds in preds_by_head.items():
-        common_ids &= set(preds.keys())
-        print(f"After intersecting with {name}: {len(common_ids)} common IDs")
-    
-    if not common_ids:
-        print("Warning: No common IDs found across all heads and gold labels!")
-        return np.array([]), np.array([]), np.array([]), list(head_dirs.keys())
-    
-    # Build aligned feature matrix and labels
-    xs: List[List[float]] = []
-    ys: List[int] = []
-    ids: List[str] = []
-    
-    for id_ in sorted(common_ids):  # sort for deterministic order
-        # Base features: predictions from each head
-        base = [preds_by_head[name][id_] for name in head_dirs.keys()]
-        
-        # Optionally add cheap features
-        if use_features:
-            # O(1) lookup instead of O(N) search
-            row = id2row.get(id_)
-            if row is not None:
-                base.extend(_row_features(row, use_features))
-            else:
-                # If we can't find the original row, add zeros for cheap features
-                from phisdom.data.cheap_features import CHEAP_FEATURES
-                base.extend([0.0] * len(CHEAP_FEATURES))
-        
-        xs.append(base)
-        ys.append(gold_labels[id_])
-        ids.append(id_)
-    
-    print(f"Final aligned dataset: {len(ids)} examples with {len(xs[0]) if xs else 0} features")
-    
-    X = np.array(xs, dtype=float)
-    y = np.array(ys, dtype=int)
-    return X, y, np.array(ids), list(head_dirs.keys())
+from phisdom.utils.alignment import get_alignment_strategy
+from phisdom.utils.prediction_standardizer import (
+    validate_prediction_format,
+    standardize_prediction_format,
+    save_standardized_predictions
+)
 
 
 def fuse_average(p_dom: np.ndarray, p_js: np.ndarray, w_dom: float = 0.5) -> np.ndarray:
@@ -125,75 +36,192 @@ def main():
     ap.add_argument("--test-jsonl", default="data/pages_test.jsonl")
     ap.add_argument("--out-dir", default="artifacts/fusion")
     ap.add_argument("--method", choices=["average", "logistic"], default="logistic")
+    ap.add_argument("--alignment-strategy", choices=["inner_join", "coverage_max"], default="inner_join",
+                    help="Alignment strategy: inner_join (strict) or coverage_max (with imputation)")
+    ap.add_argument("--min-heads", type=int, default=2,
+                    help="Minimum number of heads required per sample (for coverage_max strategy)")
+    ap.add_argument("--exclude-heads", nargs="*", default=[],
+                    help="Head names to exclude from fusion (e.g., 'p_dom_light' 'p_cheap')")
+    ap.add_argument("--require-heads", nargs="*", default=[],
+                    help="Head names that must be present (empty = use all available)")
+    ap.add_argument("--include-fusion-head", action="store_true", help="Include existing first-level fusion (artifacts/fusion) as meta head p_fusion")
+    ap.add_argument("--fusion-dir", default="artifacts/fusion", help="Directory of existing fusion predictions (preds_*.jsonl)")
+    ap.add_argument("--export-unified-json", action="store_true", help="Export a unified JSONL with per-head and fused probabilities")
     try:
         bool_action = argparse.BooleanOptionalAction  # type: ignore[attr-defined]
     except Exception:  # pragma: no cover
         bool_action = None  # type: ignore
     if bool_action is not None:
         ap.add_argument("--use-cheap-features", action=bool_action, default=True, help="Include lightweight crawler features in the stacker (default: True)")
+        ap.add_argument("--validate-predictions", action=bool_action, default=True, help="Validate prediction formats before fusion")
     else:
         ap.add_argument("--use-cheap-features", action="store_true", help="Include lightweight crawler features in the stacker")
+        ap.add_argument("--validate-predictions", action="store_true", help="Validate prediction formats before fusion")
     ap.add_argument("--tpr", type=float, nargs="*", default=[0.95, 0.90])
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
 
     # Build the heads to include: only keep ones that have preds files
-    heads = {}
-    for name, d in {
+    all_heads = {
         "p_dom": args.dom_dir,
         "p_js": args.js_dir,
         "p_url": args.url_dir,
         "p_dom_light": args.dom_light_dir,
         "p_text": args.text_dir,
         "p_cheap": args.cheap_mlp_dir,
-    }.items():
-        if os.path.exists(os.path.join(d, "preds_val.jsonl")) and os.path.exists(os.path.join(d, "preds_test.jsonl")):
-            heads[name] = d
+    }
+
+    if args.include_fusion_head:
+        fval = os.path.join(args.fusion_dir, "preds_val.jsonl")
+        ftest = os.path.join(args.fusion_dir, "preds_test.jsonl")
+        if os.path.exists(fval) and os.path.exists(ftest):
+            all_heads["p_fusion"] = args.fusion_dir
+        else:
+            print(f"WARNING: --include-fusion-head requested but predictions missing in {args.fusion_dir}")
+    
+    # Filter out excluded heads
+    excluded = set(args.exclude_heads)
+    heads = {name: d for name, d in all_heads.items() if name not in excluded}
+    
+    # Filter to only heads with prediction files
+    available_heads = {}
+    for name, d in heads.items():
+        val_preds = os.path.join(d, "preds_val.jsonl")
+        test_preds = os.path.join(d, "preds_test.jsonl")
+        if os.path.exists(val_preds) and os.path.exists(test_preds):
+            available_heads[name] = d
+        else:
+            print(f"WARNING: Skipping {name} - missing prediction files in {d}")
+    
+    if not available_heads:
+        print("ERROR: No heads with valid prediction files found!")
+        return
+    
+    print(f"Using heads: {list(available_heads.keys())}")
+    
+    # Validate prediction formats if requested
+    if getattr(args, "validate_predictions", True):
+        print("Validating prediction formats...")
+        for name, d in available_heads.items():
+            for split in ["val", "test"]:
+                pred_path = os.path.join(d, f"preds_{split}.jsonl")
+                diagnostics = validate_prediction_format(pred_path)
+                if not diagnostics["valid"]:
+                    print(f"ERROR: Invalid prediction format in {pred_path}")
+                    for error in diagnostics["errors"]:
+                        print(f"  - {error}")
+                    return
+                if diagnostics["warnings"]:
+                    print(f"WARNING: Issues in {pred_path}")
+                    for warning in diagnostics["warnings"]:
+                        print(f"  - {warning}")
+    
+    # Set up alignment strategy
+    alignment_kwargs = {}
+    if args.alignment_strategy == "coverage_max":
+        alignment_kwargs["min_heads"] = args.min_heads
+    
+    aligner = get_alignment_strategy(args.alignment_strategy, **alignment_kwargs)
+    
+    # Determine required heads
+    required_heads = None
+    if args.require_heads:
+        required_heads = set(args.require_heads)
+        # Validate that required heads are available
+        missing = required_heads - set(available_heads.keys())
+        if missing:
+            print(f"ERROR: Required heads not available: {missing}")
+            return
 
     # Align data with available heads
-    Xv, yv, ids_v, feature_names = align(args.val_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
-    Xt, yt, ids_t, _ = align(args.test_jsonl, bool(getattr(args, "use_cheap_features", True)), **heads)
+    Xv, yv, ids_v, feature_names = aligner.align(
+        args.val_jsonl, 
+        available_heads, 
+        required_heads=required_heads,
+        use_cheap_features=bool(getattr(args, "use_cheap_features", True))
+    )
+    Xt, yt, ids_t, _ = aligner.align(
+        args.test_jsonl, 
+        available_heads, 
+        required_heads=required_heads,
+        use_cheap_features=bool(getattr(args, "use_cheap_features", True))
+    )
+    
     if Xv.size == 0 or Xt.size == 0:
-        print("WARN: No aligned predictions for fusion. Did you run eval scripts for all included heads?")
+        print("ERROR: No aligned predictions for fusion. Check that eval scripts have run for all included heads.")
+        return
+    
+    # Perform fusion
     pv: np.ndarray
     pt: np.ndarray
 
     if args.method == "average":
-        # Simple equal-weight average across all heads
-        pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
-        pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+        # Simple equal-weight average across all head predictions (not cheap features)
+        n_heads = len(available_heads)
+        pv = np.clip(np.mean(Xv[:, :n_heads], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+        pt = np.clip(np.mean(Xt[:, :n_heads], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
     else:
         # Logistic regression fusion
         try:
             from sklearn.linear_model import LogisticRegression
-        except Exception:
-            print("WARN: scikit-learn not installed; falling back to average fusion")
-            pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
-            pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+            from sklearn.preprocessing import StandardScaler
+        except ImportError:
+            print("ERROR: scikit-learn not installed; falling back to average fusion")
+            n_heads = len(available_heads)
+            pv = np.clip(np.mean(Xv[:, :n_heads], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+            pt = np.clip(np.mean(Xt[:, :n_heads], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
         else:
             # Guard: if yv has a single class, LR is ill-posed; fall back to simple average
             if len(set(yv.tolist())) < 2:
-                print("WARN: Validation split is one-class; using average fusion.")
-                pv = np.clip(np.mean(Xv[:, : len(heads)], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
-                pt = np.clip(np.mean(Xt[:, : len(heads)], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
+                print("WARNING: Validation split is one-class; using average fusion.")
+                n_heads = len(available_heads)
+                pv = np.clip(np.mean(Xv[:, :n_heads], axis=1), 0.0, 1.0) if Xv.size else np.zeros((0,))
+                pt = np.clip(np.mean(Xt[:, :n_heads], axis=1), 0.0, 1.0) if Xt.size else np.zeros((0,))
             else:
-                # L2 by default; use class_weight balanced to be robust
-                clf = LogisticRegression(max_iter=1000, class_weight="balanced")
-                clf.fit(Xv, yv)
-                pv = clf.predict_proba(Xv)[:, 1]
-                pt = clf.predict_proba(Xt)[:, 1]
-                # Save fusion weights
+                # Scale features for better logistic regression performance
+                scaler = StandardScaler()
+                Xv_scaled = scaler.fit_transform(Xv)
+                Xt_scaled = scaler.transform(Xt)
+                
+                # Use cross-validation and balanced class weights for robustness
+                clf = LogisticRegression(
+                    max_iter=1000, 
+                    class_weight="balanced",
+                    random_state=42,
+                    solver='liblinear'  # Robust for small datasets
+                )
+                clf.fit(Xv_scaled, yv)
+                pv = clf.predict_proba(Xv_scaled)[:, 1]
+                pt = clf.predict_proba(Xt_scaled)[:, 1]
+                
+                # Save fusion weights for interpretability
                 try:
-                    w = {
+                    weights_info = {
                         "coef": clf.coef_.tolist(),
                         "intercept": clf.intercept_.tolist(),
-                        "feature_names": list(heads.keys()) + (CHEAP_FEATURES if bool(getattr(args, "use_cheap_features", True)) else []),
+                        "feature_names": feature_names,
+                        "scaling_mean": scaler.mean_.tolist() if scaler.mean_ is not None else [],
+                        "scaling_std": scaler.scale_.tolist() if scaler.scale_ is not None else [],
+                        "method": "logistic_regression",
+                        "class_weight": "balanced"
                     }
                     with open(os.path.join(args.out_dir, "fusion_weights.json"), "w", encoding="utf-8") as f:
-                        json.dump(w, f, indent=2)
-                except Exception:
-                    pass
+                        json.dump(weights_info, f, indent=2)
+                except Exception as e:
+                    print(f"WARNING: Could not save fusion weights: {e}")
+
+    # Sanitize any non-finite values (rare: corrupted preds)
+    def _sanitize(arr: np.ndarray, name: str) -> np.ndarray:
+        if not np.isfinite(arr).all():
+            print(f"WARNING: Non-finite values detected in {name}; replacing with 0.5")
+            arr = arr.copy()
+            bad = ~np.isfinite(arr)
+            arr[bad] = 0.5
+        return arr
+
+    pv = _sanitize(pv, "val fused probs")
+    pt = _sanitize(pt, "test fused probs")
 
     # Metrics and thresholds on test
     pr = pr_auc_safe(yt.tolist(), pt.tolist())
@@ -203,20 +231,54 @@ def main():
         fpr, thr = fpr_at_tpr(yt.tolist(), pt.tolist(), tpr)
         thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
 
+    # Standardize and save predictions
+    val_preds, val_meta = standardize_prediction_format(
+        ids_v, yv, pv, "fusion", "val", auto_flip=True
+    )
+    test_preds, test_meta = standardize_prediction_format(
+        ids_t, yt, pt, "fusion", "test", auto_flip=True
+    )
+    
+    save_standardized_predictions(val_preds, val_meta, args.out_dir, "val")
+    save_standardized_predictions(test_preds, test_meta, args.out_dir, "test")
+
+    # Save calibration results
     cal = {"metrics": {"pr_auc": pr, "roc_auc": roc}, "thresholds": thresholds}
     with open(os.path.join(args.out_dir, "calibration.json"), "w", encoding="utf-8") as f:
         json.dump(cal, f, indent=2)
 
-    def dump(path: str, ids: np.ndarray, labels: np.ndarray, probs: np.ndarray):
-        with open(path, "w", encoding="utf-8") as f:
-            for id_, y, p in zip(ids.tolist(), labels.tolist(), probs.tolist()):
-                f.write(json.dumps({"id": id_, "label": int(y), "prob": float(p)}))
-                f.write("\n")
-
-    dump(os.path.join(args.out_dir, "preds_val.jsonl"), ids_v, yv, pv)
-    dump(os.path.join(args.out_dir, "preds_test.jsonl"), ids_t, yt, pt)
-
     print(json.dumps(cal, indent=2))
+
+    # Optional unified export (test + val)
+    if args.export_unified_json:
+        try:
+            unified_path_val = os.path.join(args.out_dir, "unified_val.jsonl")
+            unified_path_test = os.path.join(args.out_dir, "unified_test.jsonl")
+
+            # Reconstruct per-head probabilities for each split for heads only (exclude cheap feature columns)
+            # We re-run alignment (already have Xv, Xt). Feature ordering = heads (+ cheap features if present at end)
+            n_feature_names = len(feature_names)
+            head_names = [h for h in feature_names if h.startswith("p_")]
+            # Determine index mapping
+            head_indices = [feature_names.index(h) for h in head_names]
+
+            def _export(path: str, ids, labels, X, fused_probs):
+                with open(path, "w", encoding="utf-8") as f:
+                    for sid, lab, row, fp in zip(ids, labels.tolist(), X, fused_probs.tolist()):
+                        obj = {
+                            "id": sid,
+                            "label": int(lab),
+                            "fused_prob": float(fp),
+                            "heads": {hn: float(row[idx]) for hn, idx in zip(head_names, head_indices)}
+                        }
+                        f.write(json.dumps(obj))
+                        f.write("\n")
+
+            _export(unified_path_val, ids_v, yv, Xv, pv)
+            _export(unified_path_test, ids_t, yt, Xt, pt)
+            print(f"Unified probability exports written: {unified_path_val}, {unified_path_test}")
+        except Exception as e:
+            print(f"WARNING: Failed unified export: {e}")
 
 
 if __name__ == "__main__":
