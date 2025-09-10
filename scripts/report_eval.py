@@ -1517,11 +1517,16 @@ def explain_shap_js(
 def main():
     # Keep logs clean from expected HF warnings (e.g., head init)
     hf_logging.set_verbosity_error()
-    parser = argparse.ArgumentParser(description="Generate evaluation plots and explanations")
+    parser = argparse.ArgumentParser(description="Generate evaluation plots and explanations (extended version)")
     parser.add_argument("--model-dir", default="artifacts/markup_run")
+    parser.add_argument("--out-dir", default=None, help="Optional explicit output directory (overrides <model-dir>/report)")
     parser.add_argument("--js-dir", default="artifacts/js_codet5p")
     parser.add_argument("--fusion-dir", default="artifacts/fusion")
+    parser.add_argument("--xfusion-dir", default=None, help="Optional explicit cross-attention fusion directory (artifacts/fusion_xattn by default)")
+    parser.add_argument("--xfusion-diag", default=None, help="Optional explicit XFusion diagnostics JSON path")
     parser.add_argument("--meta-fusion-dir", default="artifacts/fusion_meta", help="Directory containing meta-fusion (all heads) predictions")
+    parser.add_argument("--heads-dirs", nargs="*", default=None, help="Optional list of additional head directories to include (expects calibration_eval.json inside each)")
+    parser.add_argument("--cascade-dir", default=None, help="Optional cascade directory (overrides artifacts/cascade)")
     parser.add_argument("--train-jsonl", default="data/pages_train.jsonl")
     parser.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     parser.add_argument("--test-jsonl", default="data/pages_test.jsonl")
@@ -1542,7 +1547,8 @@ def main():
 
     ensure_deps()
 
-    report_dir = os.path.join(args.model_dir, "report")
+    # Resolve report output directory (allow external specification)
+    report_dir = os.path.abspath(args.out_dir) if args.out_dir else os.path.join(args.model_dir, "report")
     os.makedirs(report_dir, exist_ok=True)
 
     # Load calibration thresholds if present
@@ -1701,7 +1707,8 @@ def main():
     meta_val_path = os.path.join(args.meta_fusion_dir, "preds_val.jsonl")
     meta_test_path = os.path.join(args.meta_fusion_dir, "preds_test.jsonl")
     # Optional: cross-attention fusion
-    xfu_dir = os.path.join(os.path.dirname(args.fusion_dir), "fusion_xattn") if os.path.isabs(args.fusion_dir) else os.path.join("artifacts", "fusion_xattn")
+    # Allow overriding xfusion dir via CLI
+    xfu_dir = args.xfusion_dir if args.xfusion_dir else (os.path.join(os.path.dirname(args.fusion_dir), "fusion_xattn") if os.path.isabs(args.fusion_dir) else os.path.join("artifacts", "fusion_xattn"))
     xfu_val_path = os.path.join(xfu_dir, "preds_val.jsonl")
     xfu_test_path = os.path.join(xfu_dir, "preds_test.jsonl")
 
@@ -2018,12 +2025,20 @@ def main():
         "text": "artifacts/text_head",
         "cheap": "artifacts/cheap_mlp",
     }
+    # Extend with user-specified head dirs (key = basename)
+    if args.heads_dirs:
+        for h in args.heads_dirs:
+            if not h:
+                continue
+            name = os.path.basename(h.rstrip("/")) or h
+            light_dirs[name] = h
     light_cal: Dict[str, Any] = {}
     for name, d in light_dirs.items():
         cal = _safe_load_json(os.path.join(d, "calibration_eval.json"))
         if cal:
             light_cal[name] = cal
-    cascade_json = _safe_load_json(os.path.join("artifacts/cascade", "cascade.json"))
+    cascade_base = args.cascade_dir if args.cascade_dir else "artifacts/cascade"
+    cascade_json = _safe_load_json(os.path.join(cascade_base, "cascade.json"))
 
     # Optional deeper cascade analysis: derive per-class resolution using URL + Cheap heads if available
     cascade_analysis: Dict[str, Any] | None = None
@@ -2107,15 +2122,20 @@ def main():
     # We also copy corr_heatmap.png into the report directory for embedding.
     xfusion_diagnostics = None
     try:
-        fusion_parent = os.path.dirname(os.path.abspath(args.fusion_dir)) if os.path.isabs(args.fusion_dir) else os.path.dirname(args.fusion_dir)
-        # Prefer sibling dir name; fall back to artifacts/fusion_xattn
-        xfusion_dir = os.path.join(fusion_parent or "artifacts", "fusion_xattn")
-        diag_dir = os.path.join(xfusion_dir, "diagnostics")
-        diag_json = os.path.join(diag_dir, "diagnostics.json")
-        if os.path.exists(diag_json):
-            with open(diag_json, "r", encoding="utf-8") as f:
+        if args.xfusion_diag and os.path.exists(args.xfusion_diag):
+            with open(args.xfusion_diag, "r", encoding="utf-8") as f:
                 xfusion_diagnostics = json.load(f)
-            # Copy correlation heatmap if available
+            diag_dir = os.path.dirname(args.xfusion_diag)
+        else:
+            fusion_parent = os.path.dirname(os.path.abspath(args.fusion_dir)) if os.path.isabs(args.fusion_dir) else os.path.dirname(args.fusion_dir)
+            xfusion_dir = args.xfusion_dir if args.xfusion_dir else os.path.join(fusion_parent or "artifacts", "fusion_xattn")
+            diag_dir = os.path.join(xfusion_dir, "diagnostics")
+            diag_json = os.path.join(diag_dir, "diagnostics.json")
+            if os.path.exists(diag_json):
+                with open(diag_json, "r", encoding="utf-8") as f:
+                    xfusion_diagnostics = json.load(f)
+        # Copy correlation heatmap if available
+        if xfusion_diagnostics:
             corr_png = os.path.join(diag_dir, "corr_heatmap.png")
             if os.path.exists(corr_png):
                 try:
