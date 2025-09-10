@@ -48,9 +48,8 @@ def find_threshold_for_precision(y: np.ndarray, p: np.ndarray, target_precision:
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Two-tier cascade: Stage1 (URL+cheap) short-circuit, Stage2 (fused) fallback")
+    ap = argparse.ArgumentParser(description="Two-tier cascade: Stage1 (URL) short-circuit, Stage2 (fused) fallback (cheap/dom_gcn removed)")
     ap.add_argument("--url-dir", default="artifacts/url_head")
-    ap.add_argument("--cheap-dir", default="artifacts/cheap_mlp")
     ap.add_argument("--fusion-dir", default="artifacts/fusion")
     ap.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     ap.add_argument("--test-jsonl", default="data/pages_test.jsonl")
@@ -93,36 +92,29 @@ def main():
     
     def load_split(split: str):
         url = read_preds(os.path.join(args.url_dir, f"preds_{split}.jsonl"))
-        cheap = read_preds(os.path.join(args.cheap_dir, f"preds_{split}.jsonl"))
         fused = read_preds(os.path.join(fusion_dir, f"preds_{split}.jsonl"))
-        ids = [i for i in fused.keys() if i in url and i in cheap]
+        ids = [i for i in fused.keys() if i in url]
         y = np.array([fused[i][0] for i in ids], dtype=int)
         p_url = np.array([url[i][1] for i in ids], dtype=float)
-        p_cheap = np.array([cheap[i][1] for i in ids], dtype=float)
         p_fused = np.array([fused[i][1] for i in ids], dtype=float)
-        return ids, y, p_url, p_cheap, p_fused
+        return ids, y, p_url, p_fused
 
     # Prepare val for thresholds
-    ids_v, yv, pu_v, pc_v, pf_v = load_split("val")
+    ids_v, yv, pu_v, pf_v = load_split("val")
     # simple stage1 score: average of URL and Cheap; could be replaced with a trained LR if desired
     if yv.size == 0:
         thr_hi = 1.0
         thr_lo = 0.0
     else:
-        # stage-1 is simple average; clamp to [0,1] defensively
-        s1_v = np.clip(0.5 * pu_v + 0.5 * pc_v, 0.0, 1.0)
-        # Guard against one-class validation
+        s1_v = pu_v  # stage1 now URL only
         if len(set(yv.tolist())) < 2:
             thr_hi = 1.0
             thr_lo = 0.0
         else:
             thr_hi = find_threshold_for_precision(yv, s1_v, args.target_precision, greater_is_positive=True)
-            # For benign acceptance, use (1 - score) precision on negatives
             inv_scores = 1.0 - s1_v
             thr_lo = find_threshold_for_precision(1 - yv, inv_scores, args.target_benign_precision, greater_is_positive=True)
-            # convert back to score threshold
             thr_lo = 1.0 - thr_lo
-            # Ensure non-overlapping thresholds so fusion still handles the middle band
             if thr_lo >= thr_hi:
                 eps = 1e-6
                 mid = 0.5 * (thr_lo + thr_hi)
@@ -131,11 +123,11 @@ def main():
 
     # Apply cascade on a split
     def apply(split: str):
-        ids, y, pu, pc, pf = load_split(split)
+        ids, y, pu, pf = load_split(split)
         if len(ids) == 0:
             # Empty alignment across heads; return NaNs to avoid runtime warnings
             return ids, y, np.array([], dtype=float), float("nan"), float("nan"), float("nan")
-        s1 = np.clip(0.5 * pu + 0.5 * pc, 0.0, 1.0)
+        s1 = pu
         accept_phish = s1 >= thr_hi
         accept_benign = s1 <= thr_lo
         # final probabilities: use s1 where accepted, else fused

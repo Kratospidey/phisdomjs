@@ -12,6 +12,7 @@ import re
 import math
 import ssl
 import socket
+import contextlib
 from datetime import datetime, timezone
 from urllib.parse import urlparse
 from collections import Counter, defaultdict
@@ -762,37 +763,30 @@ async def fetch_page(
     page.on("request", on_request)
     page.set_default_timeout(max(1, int(timeout_s * 1000)))
 
-    # Try normal navigation first; on timeout or errors, fall back to faster strategies
+    # Commit-first navigation: quick initial load; then optional scheme flip
     try:
-        resp = await page.goto(url, wait_until="domcontentloaded", timeout=int(timeout_s * 1000))
+        resp = await page.goto(url, wait_until="commit", timeout=int(timeout_s * 1000))
     except Exception as e1:
-        # Fallback 1: use the fastest commit navigation to at least get initial DOM
-        print(f"[FALLBACK] domcontentloaded failed for {url}; trying commit", flush=True)
-        try:
-            resp = await page.goto(url, wait_until="commit", timeout=min(int(timeout_s * 1000), 5000))
-        except Exception:
-            # Fallback 2: swap scheme http <-> https and retry commit briefly
-            alt_url: Optional[str] = None
-            if url.lower().startswith("http://"):
-                alt_url = "https://" + url[7:]
-            elif url.lower().startswith("https://"):
-                alt_url = "http://" + url[8:]
-            if alt_url and alt_url != url:
-                try:
-                    print(f"[FALLBACK] switching scheme and retrying commit: {alt_url}", flush=True)
-                    resp = await page.goto(alt_url, wait_until="commit", timeout=4000)
-                    url = alt_url  # use alternate for the rest of processing
-                except Exception:
-                    # Give up and re-raise the original error
-                    try:
-                        await page.close()
-                    finally:
-                        raise e1
-            else:
+        alt_url: Optional[str] = None
+        if url.lower().startswith("http://"):
+            alt_url = "https://" + url[7:]
+        elif url.lower().startswith("https://"):
+            alt_url = "http://" + url[8:]
+        if alt_url and alt_url != url:
+            try:
+                print(f"[FALLBACK] switching scheme and retrying commit: {alt_url}", flush=True)
+                resp = await page.goto(alt_url, wait_until="commit", timeout=int(min(timeout_s, 4.0) * 1000))
+                url = alt_url
+            except Exception:
                 try:
                     await page.close()
                 finally:
                     raise e1
+        else:
+            try:
+                await page.close()
+            finally:
+                raise e1
 
     if resp is not None:
         try:
@@ -1142,46 +1136,82 @@ async def fetch_page(
     return rec
 
 
-async def worker(queue: asyncio.Queue, out_path: str, write_lock: asyncio.Lock, context, capture_external_js: bool, retries: int, base_timeout_s: float, tls_timeout: float, dns_timeout: float, do_mobile_profile: bool):
+async def worker(worker_id: int, queue: asyncio.Queue, out_path: str, write_lock: asyncio.Lock,
+                 context, setup_context_fn, capture_external_js: bool, retries: int, base_timeout_s: float,
+                 tls_timeout: float, dns_timeout: float, do_mobile_profile: bool,
+                 inflight: Dict[int, Tuple[str, float]], stats: Dict[str, int],
+                 per_url_cap_s: float):
+    """Worker that enforces a hard per-URL cap across retries and records progress."""
     while True:
         item = await queue.get()
         if item is None:
             queue.task_done()
             break
-        url, label, source, timeout_s = item
+        url, label, source, timeout_s = item  # timeout_s retained for first attempt compatibility
         last_err: Optional[str] = None
+        start = time.monotonic()
+        inflight[worker_id] = (url, start)
+        outcome = "skip"  # default unless successful
         try:
             print(f"[FETCH] {url} (label={label}, src={source})", flush=True)
             attempt = 0
             rec: Optional[PageRecord] = None
+            deadline = start + max(1.0, per_url_cap_s)
             while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    last_err = f"per-url cap {per_url_cap_s:.1f}s exceeded"
+                    break
+                # exponential backoff per original logic but clamped to remaining budget and 15s
+                base_to = (timeout_s if attempt == 0 else min(base_timeout_s * (2 ** attempt), 15.0))
+                this_timeout = min(base_to, 15.0, max(1.0, remaining))
                 try:
-                    rec = await fetch_page(
-                        context,
-                        url,
-                        label=label,
-                        source=source,
-                        timeout_s=(timeout_s if attempt == 0 else min(base_timeout_s * (2 ** attempt), 15.0)),
-                        capture_external_js=capture_external_js,
-                        tls_timeout=tls_timeout,
-                        dns_timeout=dns_timeout,
+                    # Enforce a hard asyncio-level timeout separate from page timeouts
+                    rec = await asyncio.wait_for(
+                        fetch_page(
+                            context,
+                            url,
+                            label=label,
+                            source=source,
+                            timeout_s=this_timeout,
+                            capture_external_js=capture_external_js,
+                            tls_timeout=tls_timeout,
+                            dns_timeout=dns_timeout,
+                        ),
+                        timeout=max(1.0, remaining)
                     )
                     last_err = None
                 except Exception as e:
-                    last_err = f"{type(e).__name__}: {e}"
+                    if isinstance(e, asyncio.TimeoutError):
+                        last_err = f"hard timeout >={per_url_cap_s:.1f}s"
+                        # Recycle context to nuke stuck page(s)
+                        with contextlib.suppress(Exception):
+                            await context.close()
+                        try:
+                            context = await setup_context_fn()
+                        except Exception:
+                            pass
+                    else:
+                        last_err = f"{type(e).__name__}: {e}"
                     rec = None
 
                 if rec is not None:
-                    # Optional mobile-profile pass to compute cloak deltas
-                    if do_mobile_profile:
+                    # Optional mobile-profile pass (only if meaningful time left)
+                    remaining2 = deadline - time.monotonic()
+                    if do_mobile_profile and remaining2 > 2.0:
                         try:
-                            # shallow mobile context
                             realistic_mobile = (
                                 "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Mobile Safari/537.36"
                             )
-                            mctx = await context.browser.new_context(user_agent=realistic_mobile, viewport={"width": 375, "height": 667}, device_scale_factor=2, is_mobile=True, ignore_https_errors=True)
+                            mctx = await context.browser.new_context(
+                                user_agent=realistic_mobile,
+                                viewport={"width": 375, "height": 667},
+                                device_scale_factor=2,
+                                is_mobile=True,
+                                ignore_https_errors=True,
+                            )
                             mpage = await mctx.new_page()
-                            await mpage.goto(url, wait_until="domcontentloaded", timeout=int(min(base_timeout_s, 4.0) * 1000))
+                            await mpage.goto(url, wait_until="domcontentloaded", timeout=int(min(this_timeout, remaining2) * 1000))
                             mhtml = await mpage.content()
                             await mpage.close()
                             await mctx.close()
@@ -1189,25 +1219,28 @@ async def worker(queue: asyncio.Queue, out_path: str, write_lock: asyncio.Lock, 
                             rec.cloak_profile_mismatch = bool((rec.headers.get("content-type", "").lower().startswith("text/html")) and (rec.cloak_delta_domlen or 0) > 500)
                         except Exception:
                             pass
-                    # Serialize writes to avoid interleaved lines
                     async with write_lock:
                         append_jsonl(rec, out_path)
+                    outcome = "ok"
                     print(f"[OK]    {url}", flush=True)
                     break
 
+                # retry path
                 if attempt < max(0, retries):
                     attempt += 1
-                    new_timeout = min(base_timeout_s * (2 ** attempt), 15.0)
-                    print(f"[RETRY {attempt}] {url} with timeout={new_timeout:.1f}s", flush=True)
+                    print(f"[RETRY {attempt}] {url} with timeout={this_timeout:.1f}s (remaining cap ~{max(0.0, deadline - time.monotonic()):.1f}s)", flush=True)
                     continue
                 else:
                     reason = last_err or "no result"
                     print(f"[SKIP]  {url} - {reason}", flush=True)
                     break
         except Exception as e:
-            # Never let exceptions prevent task_done(), or crawl will hang
             print(f"[ERR]   {url}: {e}", flush=True)
         finally:
+            async with write_lock:
+                stats["done"] += 1
+                stats[outcome] += 1
+            inflight.pop(worker_id, None)
             queue.task_done()
 
 
@@ -1232,10 +1265,12 @@ def _load_existing_urls(path: str) -> set[str]:
     return urls
 
 
-async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: float, block_assets: bool, capture_external_js: bool, retries: int, resume: bool, tls_timeout: float, dns_timeout: float, mobile_profile: bool, use_gpu: bool):
+async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: float, block_assets: bool,
+                capture_external_js: bool, retries: int, resume: bool, tls_timeout: float, dns_timeout: float,
+                mobile_profile: bool, use_gpu: bool, per_url_cap_s: float = 45.0, progress_interval_s: float = 10.0):
+    """Crawl entry point with per-URL cap and live progress monitoring."""
     queue: asyncio.Queue = asyncio.Queue()
 
-    # If resuming and output exists, load existing URLs to skip
     existing: set[str] = set()
     if resume and os.path.exists(out_jsonl):
         try:
@@ -1244,35 +1279,36 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
         except Exception as e:
             print(f"[RESUME] Could not load existing URLs from {out_jsonl}: {e}", flush=True)
 
+    total_enq = 0
+    skipped_pre = 0
     with open(input_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
-        enq = 0
-        skipped = 0
         for row in reader:
             url = row["url"].strip()
             label = int(row.get("label", 0))
             source = row.get("source", "unknown")
             if existing and url in existing:
-                skipped += 1
+                skipped_pre += 1
                 continue
             queue.put_nowait((url, label, source, timeout_s))
-            enq += 1
+            total_enq += 1
     if resume:
-        print(f"[QUEUE] Enqueued {enq} URLs (skipped {skipped} existing)", flush=True)
+        print(f"[QUEUE] Enqueued {total_enq} URLs (skipped {skipped_pre} existing)", flush=True)
 
     if async_playwright is None:
         raise RuntimeError("playwright not installed. Install with `pip install playwright` and run `playwright install chromium`")
 
-    async with async_playwright() as pw:
+    # shared monitoring state
+    inflight: Dict[int, Tuple[str, float]] = {}
+    stats: Dict[str, int] = {"done": 0, "ok": 0, "skip": 0}
 
+    async with async_playwright() as pw:
         async def setup_context():
-            # Use a realistic desktop UA and ignore HTTPS errors; also add small stealth tweaks
             realistic_ua = (
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/126.0.6478.127 Safari/537.36"
             )
             ctx = await browser.new_context(user_agent=realistic_ua, locale="en-US", ignore_https_errors=True)
-            # Basic stealth: mask webdriver and common props
             await ctx.add_init_script(
                 """
                 Object.defineProperty(navigator, 'webdriver', { get: () => false });
@@ -1281,7 +1317,6 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
                 Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
                 """
             )
-            # Instrument minimal key-event listener counters
             await ctx.add_init_script(
                 """
                 (function(){
@@ -1307,26 +1342,23 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
                 })();
                 """
             )
-            # Block heavy assets to speed up crawl if requested
             if block_assets:
                 async def route_handler(route):  # type: ignore
                     rtype = route.request.resource_type
-                    # Keep stylesheets to avoid breaking sites; block heavy assets only
-                    if rtype in ("image", "media", "font"):
+                    # Expanded block list to suppress long-lived or heavy resources
+                    if rtype in ("image","media","font","websocket","eventsource","stylesheet","fetch","xhr","preload","prefetch","beacon"):
                         await route.abort()
                     else:
                         await route.continue_()
                 await ctx.route("**/*", route_handler)
             return ctx
 
-        # Launch browser with optional GPU flags
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--no-sandbox",
             "--disable-dev-shm-usage",
         ]
         if use_gpu:
-            # Flags to leverage GPU rasterization if available
             launch_args.extend([
                 "--enable-gpu-rasterization",
                 "--enable-oop-rasterization",
@@ -1336,29 +1368,48 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
 
         contexts = [await setup_context() for _ in range(concurrency)]
         write_lock = asyncio.Lock()
+
+        async def monitor():
+            while True:
+                try:
+                    in_flight = len(inflight)
+                    done = stats["done"]
+                    ok = stats["ok"]
+                    skip = stats["skip"]
+                    q_left = queue.qsize()
+                    slots = []
+                    for wid, (u, st) in list(inflight.items()):
+                        elapsed = time.monotonic() - st
+                        host = urlparse(u).netloc if "://" in u else u[:40]
+                        slots.append(f"w{wid}:{elapsed:4.1f}s {host[:30]}")
+                    print(f"[PROGRESS] done={done}/{total_enq} ok={ok} skip={skip} inflight={in_flight} qleft={q_left}  {' | '.join(slots)}", flush=True)
+                    await asyncio.sleep(progress_interval_s)
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    await asyncio.sleep(progress_interval_s)
+
+        monitor_task = asyncio.create_task(monitor())
+
         workers = [asyncio.create_task(
-            worker(queue, out_jsonl, write_lock, contexts[i], capture_external_js, retries, timeout_s, tls_timeout, dns_timeout, mobile_profile)
+            worker(i, queue, out_jsonl, write_lock, contexts[i], setup_context, capture_external_js, retries, timeout_s,
+                   tls_timeout, dns_timeout, mobile_profile, inflight, stats, per_url_cap_s)
         ) for i in range(concurrency)]
 
         try:
-            # Fill queue and then signal termination
             await queue.join()
         finally:
             for _ in workers:
                 queue.put_nowait(None)
-            # Ensure we wait for workers even on cancellation; suppress exceptions
             await asyncio.gather(*workers, return_exceptions=True)
-
-            # Cleanup
+            monitor_task.cancel()
+            with contextlib.suppress(Exception):
+                await monitor_task
             for ctx in contexts:
-                try:
+                with contextlib.suppress(Exception):
                     await ctx.close()
-                except Exception:
-                    pass
-            try:
+            with contextlib.suppress(Exception):
                 await browser.close()
-            except Exception:
-                pass
 
 
 def main():

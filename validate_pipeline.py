@@ -157,8 +157,7 @@ def create_mock_head_predictions(tmpdir: str, data_splits: Dict[str, List[Dict]]
         "js_codet5p": {"base_accuracy": 0.80, "phish_bias": 0.05},
         "markup_run": {"base_accuracy": 0.75, "phish_bias": 0.0},
         "text_head": {"base_accuracy": 0.78, "phish_bias": 0.08},
-        "dom_gcn": {"base_accuracy": 0.55, "phish_bias": -0.2},  # Poor performance (exclude later)
-        "cheap_mlp": {"base_accuracy": 0.52, "phish_bias": -0.1},  # Poor performance (exclude later)
+    # Removed dom_gcn and cheap_mlp heads
     }
     
     # Create artifacts directories
@@ -364,7 +363,7 @@ def test_cascade_robustness(tmpdir: str):
     print("="*50)
     
     # Create URL and cheap predictions
-    for head_name in ["url_head", "cheap_mlp"]:
+    for head_name in ["url_head"]:
         head_dir = os.path.join(tmpdir, "artifacts", head_name)
         if not os.path.exists(head_dir):
             continue

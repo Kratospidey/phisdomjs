@@ -49,10 +49,9 @@ def main():
     ap = argparse.ArgumentParser(description="Plot PR curves for calibrated heads and fusion")
     ap.add_argument("--url-dir", default="artifacts/url_head")
     ap.add_argument("--js-dir", default="artifacts/js_charcnn")
-    ap.add_argument("--dom-dir", default="artifacts/dom_gcn")
+    ap.add_argument("--dom-dir", default="artifacts/markup_run")
     ap.add_argument("--fusion-dir", default="artifacts/fusion")
     ap.add_argument("--text-dir", default="artifacts/text_head")
-    ap.add_argument("--cheap-dir", default="artifacts/cheap_mlp")
     ap.add_argument("--split", choices=["val", "test"], default="test")
     ap.add_argument("--out", default="artifacts/fusion/heads_pr_curves.png")
     args = ap.parse_args()
@@ -61,9 +60,7 @@ def main():
         "URL": os.path.join(args.url_dir, f"preds_{args.split}.jsonl"),
         "JS": os.path.join(args.js_dir, f"preds_{args.split}.jsonl"),
         "DOM (MarkupLM)": os.path.join(args.dom_dir, f"preds_{args.split}.jsonl"),
-        "DOM (Light GCN)": os.path.join(os.path.dirname(args.dom_dir) + "/dom_gcn", f"preds_{args.split}.jsonl"),
         "Text": os.path.join(args.text_dir, f"preds_{args.split}.jsonl"),
-        "Cheap MLP": os.path.join(args.cheap_dir, f"preds_{args.split}.jsonl"),
         "Fused": os.path.join(args.fusion_dir, f"preds_{args.split}.jsonl"),
     }
 

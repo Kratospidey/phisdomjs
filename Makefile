@@ -251,7 +251,6 @@ train-js-head:
 	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --num-workers $(JS_HEAD_NUM_WORKERS) --resume $(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,) $(if $(filter $(AUGMENT_JS),1),--raw-field js_augmented,)
 
 train-dom-gcn:
-	$(PY) scripts/train_dom_gcn.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/dom_gcn --batch-size $(if $(filter $(SMOKE),1),8,16) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 2e-3 --weight-decay 1e-4
 
 # Phase 3: Text and Cheap-feature heads
 .PHONY: train-text-head train-cheap-mlp
@@ -260,7 +259,6 @@ train-text-head:
 
 HIDDEN_CHEAP ?= 128
 train-cheap-mlp:
-	$(PY) scripts/train_cheap_mlp.py --train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/cheap_mlp --batch-size $(if $(filter $(SMOKE),1),64,128) --epochs $(if $(filter $(SMOKE),1),2,5) --lr 2e-3 --weight-decay 1e-4 --hidden $(HIDDEN_CHEAP)
 
 .PHONY: fuse
 fuse:

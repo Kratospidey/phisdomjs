@@ -194,22 +194,17 @@ class TestPipelineIntegration:
         import sys
         import subprocess
         from io import StringIO
-        
-        # Create mock URL and cheap predictions
-        for head_name in ["url_head", "cheap_mlp"]:
+        # Create mock URL predictions (cheap_mlp removed)
+        for head_name in ["url_head"]:
             head_dir = os.path.join(self.tmpdir, head_name)
-            os.makedirs(head_dir)
-            
+            os.makedirs(head_dir, exist_ok=True)
             for split in ["val", "test"]:
                 split_data = self.val_data if split == "val" else self.test_data_split
-                preds = []
-                for item in split_data:
-                    preds.append({
-                        "id": item["id"],
-                        "label": item["label"],
-                        "prob": 0.5 + 0.3 * (1 if item["label"] else -1)
-                    })
-                
+                preds = [{
+                    "id": item["id"],
+                    "label": item["label"],
+                    "prob": 0.5 + 0.3 * (1 if item["label"] else -1)
+                } for item in split_data]
                 pred_path = os.path.join(head_dir, f"preds_{split}.jsonl")
                 with open(pred_path, "w") as f:
                     for pred in preds:
@@ -229,7 +224,7 @@ class TestPipelineIntegration:
             sys.argv = [
                 "cascade.py",
                 "--url-dir", os.path.join(self.tmpdir, "url_head"),
-                "--cheap-dir", os.path.join(self.tmpdir, "cheap_mlp"),
+                # removed --cheap-dir
                 "--fusion-dir", fake_fusion_dir,
                 "--val-jsonl", os.path.join(self.tmpdir, "pages_val.jsonl"),
                 "--test-jsonl", os.path.join(self.tmpdir, "pages_test.jsonl"),
@@ -247,7 +242,7 @@ class TestPipelineIntegration:
             result = subprocess.run([
                 sys.executable, cascade_script,
                 "--url-dir", os.path.join(self.tmpdir, "url_head"),
-                "--cheap-dir", os.path.join(self.tmpdir, "cheap_mlp"), 
+                # removed --cheap-dir
                 "--fusion-dir", fake_fusion_dir,
                 "--val-jsonl", os.path.join(self.tmpdir, "pages_val.jsonl"),
                 "--test-jsonl", os.path.join(self.tmpdir, "pages_test.jsonl"),

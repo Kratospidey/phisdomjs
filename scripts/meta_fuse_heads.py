@@ -127,9 +127,7 @@ def main():
     ap.add_argument("--dom-dir", default="artifacts/markup_run")
     ap.add_argument("--js-dir", default="artifacts/js_codet5p")
     ap.add_argument("--url-dir", default="artifacts/url_head")
-    ap.add_argument("--dom-light-dir", default="artifacts/dom_gcn")
     ap.add_argument("--text-dir", default="artifacts/text_head")
-    ap.add_argument("--cheap-mlp-dir", default="artifacts/cheap_mlp")
     ap.add_argument("--include-fusion-head", action="store_true", help="Include existing first-level fusion head as additional input")
     ap.add_argument("--fusion-dir", default="artifacts/fusion", help="Directory of existing fusion predictions (if included)")
     ap.add_argument("--head-tag", default="", help="Suffix tag for input prediction files (e.g. _full)")
@@ -154,9 +152,7 @@ def main():
         "p_dom": args.dom_dir,
         "p_js": args.js_dir,
         "p_url": args.url_dir,
-        "p_dom_light": args.dom_light_dir,
         "p_text": args.text_dir,
-        "p_cheap": args.cheap_mlp_dir,
     }
     if args.include_fusion_head:
         fval = os.path.join(args.fusion_dir, "preds_val.jsonl")

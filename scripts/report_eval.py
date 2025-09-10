@@ -2021,9 +2021,7 @@ def main():
         "url": "artifacts/url_head",
         "js_charcnn": "artifacts/js_charcnn",
         "js_charcnn_aug": "artifacts/js_charcnn_aug",
-        "dom_light": "artifacts/dom_gcn",
         "text": "artifacts/text_head",
-        "cheap": "artifacts/cheap_mlp",
     }
     # Extend with user-specified head dirs (key = basename)
     if args.heads_dirs:
@@ -2071,7 +2069,6 @@ def main():
                     return {}
                 return out
             url_test = _read_head_preds("artifacts/url_head", "test")
-            cheap_test = _read_head_preds("artifacts/cheap_mlp", "test")
             # Align with test rows already loaded earlier (rows_te)
             records: List[Dict[str, Any]] = []
             for r in rows_te:
@@ -2079,12 +2076,12 @@ def main():
                 if rid is None:
                     continue
                 sid = str(rid)
-                if sid in url_test and sid in cheap_test:
+                if sid in url_test:
                     try:
                         y_true = int(r.get("label", 0))
                     except Exception:
                         continue
-                    s1 = 0.5 * (url_test[sid] + cheap_test[sid])
+                    s1 = url_test[sid]
                     records.append({"id": sid, "y": y_true, "s1": s1})
             if records:
                 import numpy as _np
@@ -2165,13 +2162,9 @@ def main():
         return {mk: (float(np.mean(vs)) if vs else float("nan")) for mk, vs in acc.items()}
 
     core_for_macro = {k: metrics_summary.get(k) for k in ["dom","js","fused","meta"] if k in metrics_summary}
-    macro_test_tpr90 = _macro_average(core_for_macro, "test@tpr90")
-    macro_test_tpr95 = _macro_average(core_for_macro, "test@tpr95")
-    macro_block = {
-        "models": list(core_for_macro.keys()),
-        "test@tpr90": macro_test_tpr90,
-        "test@tpr95": macro_test_tpr95,
-    }
+    macro_block: Dict[str, Any] = {"models": list(core_for_macro.keys())}
+    for split_thr in ["train@tpr95","val@tpr95","test@tpr95","train@tpr90","val@tpr90","test@tpr90"]:
+        macro_block[split_thr] = _macro_average(core_for_macro, split_thr)
 
     # Dataset drift / coverage diagnostics
     dataset_drift: Dict[str, Any] | None = None
@@ -2422,18 +2415,21 @@ def main():
         macro_json = (metrics_json or {}).get("macro") if isinstance(metrics_json, dict) else None
         def macro_table(macro: Dict[str, Any] | None):
             if not isinstance(macro, dict):
-                return "<div class='card'><h3>Macro (All Heads)</h3><p>No macro metrics.</p></div>"
+                return "<div class='card'><h3>Macro Metrics</h3><p>No macro metrics.</p></div>"
             models = macro.get("models") or []
-            t90 = macro.get("test@tpr90") or {}
-            t95 = macro.get("test@tpr95") or {}
-            cols = sorted(set(list(t90.keys()) + list(t95.keys())))
-            def row(label, data):
+            split_keys = [k for k in macro.keys() if k != "models"]
+            metric_cols: set[str] = set()
+            for sk in split_keys:
+                metric_cols.update((macro.get(sk) or {}).keys())
+            cols = sorted(metric_cols)
+            def row(label: str, data: Dict[str, float]):
                 cells = "".join(f"<td class='mono' style='text-align:right'>{fmt4(data.get(c))}</td>" for c in cols)
                 return f"<tr><td class='mono'>{label}</td>{cells}</tr>"
-            head = "".join(f"<th>{c}</th>" for c in ["metric"] + cols)
+            head = "".join(f"<th>{c}</th>" for c in ["split@thr"] + cols)
+            body = "".join(row(sk, macro.get(sk) or {}) for sk in sorted(split_keys))
             return (
                 "<div class='card'><h3>Macro Metrics (average over models: " + ", ".join(models) + ")</h3>"
-                + f"<table><thead><tr>{head}</tr></thead><tbody>" + row("test@tpr95", t95) + row("test@tpr90", t90) + "</tbody></table></div>"
+                + f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>"
             )
 
         plot_captions_html = (
@@ -2482,9 +2478,7 @@ def main():
             # Include light heads if present
             (lambda light: ''.join([
                 f"<div class='card'>{metric_block('URL CharCNN', light.get('url'))}</div>",
-                f"<div class='card'>{metric_block('DOM GCN (light)', light.get('dom_light'))}</div>",
                 f"<div class='card'>{metric_block('Text CharCNN', light.get('text'))}</div>",
-                f"<div class='card'>{metric_block('Cheap MLP', light.get('cheap'))}</div>",
                 f"<div class='card'>{metric_block('JS CharCNN (base)', light.get('js_charcnn'))}</div>",
                 f"<div class='card'>{metric_block('JS CharCNN (aug)', light.get('js_charcnn_aug'))}</div>",
             ]) if isinstance(light, dict) else '')((metrics_json or {}).get('light_heads')),
