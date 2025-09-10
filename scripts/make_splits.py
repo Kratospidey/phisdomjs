@@ -2,6 +2,7 @@
 from __future__ import annotations
 import argparse
 import json
+import hashlib, time
 from typing import List, Dict, Tuple
 import tldextract
 
@@ -450,7 +451,9 @@ def _label_aware_val_groups_ratio(
 def main():
     parser = argparse.ArgumentParser(description="Create time-aware, group-disjoint splits from JSONL dataset")
     parser.add_argument("--dataset", required=True, help="Path to JSONL dataset")
-    parser.add_argument("--out", required=True, help="Path to write splits JSON")
+    parser.add_argument("--out", required=True, help="Path to write splits JSON (v1 legacy format)")
+    parser.add_argument("--version-tag", default=None, help="Optional version tag for metadata (v2)")
+    parser.add_argument("--write-v2", action="store_true", help="Also write <out>_v2.json with metadata & hashes")
     parser.add_argument("--test-after", type=float, default=None, help="Unix timestamp; test has timestamps strictly greater")
     parser.add_argument("--auto-cutoff-percentile", type=float, default=80.0, help="If --test-after not provided, use this percentile of timestamps as cutoff (0-100)")
     parser.add_argument("--val-frac", type=float, default=0.1)
@@ -728,8 +731,45 @@ def main():
         except Exception as e:
             print(f"[SPLITS][WARN] Stratified fallback unavailable ({e}); proceeding with current splits")
 
+    v1_payload = {"cutoff": cutoff, **export_split_indices(splits)}
     with open(args.out, "w", encoding="utf-8") as f:
-        json.dump({"cutoff": cutoff, **export_split_indices(splits)}, f)
+        json.dump(v1_payload, f, indent=2)
+    print(f"[SPLITS] wrote v1 splits to {args.out}")
+
+    if args.write_v2:
+        idx_map = export_split_indices(splits)
+        def _sha(ids):
+            h = hashlib.sha1()
+            for i in sorted(ids):
+                h.update(str(i).encode('utf-8'))
+            return h.hexdigest()
+        # reconstruct label map keyed by id: iter dataset again (cheap pass)
+        id_to_label = {}
+        for r in iter_jsonl(args.dataset):
+            rid = r.get('id')
+            if rid is not None:
+                try:
+                    id_to_label[str(rid)] = int(r.get('label', 0))
+                except Exception:
+                    id_to_label[str(rid)] = 0
+        counts = {}
+        for split, ids in idx_map.items():
+            pos = sum(1 for i in ids if id_to_label.get(str(i),0)==1)
+            counts[split] = {"total": len(ids), "pos": pos, "neg": len(ids)-pos}
+        v2 = {
+            "version": 2,
+            "tag": args.version_tag,
+            "created_unix": int(time.time()),
+            "cutoff": cutoff,
+            "ids": idx_map,
+            "hashes": {k: _sha(v) for k,v in idx_map.items()},
+            "counts": counts,
+            "overall": {"total": sum(c['total'] for c in counts.values()), "pos": sum(c['pos'] for c in counts.values())},
+        }
+        v2_path = args.out.replace('.json','_v2.json') if args.out.endswith('.json') else args.out + '_v2.json'
+        with open(v2_path, 'w', encoding='utf-8') as f:
+            json.dump(v2, f, indent=2)
+        print(f"[SPLITS] wrote v2 splits to {v2_path}")
 
 
 if __name__ == "__main__":

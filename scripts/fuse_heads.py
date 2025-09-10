@@ -24,6 +24,8 @@ def fuse_average(p_dom: np.ndarray, p_js: np.ndarray, w_dom: float = 0.5) -> np.
 
 
 def main():
+    # NOTE: This script now auto-deduplicates prediction files (keeping first occurrence per id)
+    # and falls back to non-tagged base predictions when a --head-tag variant is missing.
     ap = argparse.ArgumentParser(description="Fuse one or more calibrated heads (DOM/JS/URL/light) and optional cheap features")
     # Default to baselines; allow overriding with lightweight heads
     ap.add_argument("--dom-dir", default="artifacts/markup_run")
@@ -95,11 +97,66 @@ def main():
         root, ext = os.path.splitext(base)
         return f"{root}{in_tag}{ext}" if ext else f"{base}{in_tag}"
 
+    # Helper: validate and (optionally) deduplicate predictions, returning cleaned file path
+    def _sanitize_preds(path: str) -> Tuple[str, Dict[str, int]]:
+        stats = {"lines": 0, "unique_ids": 0, "dupe_ids": 0, "fixed": 0}
+        if not os.path.exists(path):
+            return path, stats
+        cleaned_path = path + ".cleaned"
+        seen = set()
+        with open(path, "r", encoding="utf-8") as fin, open(cleaned_path, "w", encoding="utf-8") as fout:
+            for line in fin:
+                line = line.strip()
+                if not line:
+                    continue
+                stats["lines"] += 1
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                _id = obj.get("id")
+                if _id is None:
+                    continue
+                if _id in seen:
+                    stats["dupe_ids"] += 1
+                    continue  # keep first occurrence
+                seen.add(_id)
+                fout.write(json.dumps(obj)); fout.write("\n")
+        stats["unique_ids"] = len(seen)
+        if stats["dupe_ids"] > 0:
+            stats["fixed"] = 1
+            return cleaned_path, stats
+        else:
+            # remove cleaned if identical
+            try:
+                os.remove(cleaned_path)
+            except Exception:
+                pass
+            return path, stats
+
     for name, d in heads.items():
+        base_val = os.path.join(d, "preds_val.jsonl")
+        base_test = os.path.join(d, "preds_test.jsonl")
         val_preds = os.path.join(d, _with_in_tag("preds_val.jsonl"))
         test_preds = os.path.join(d, _with_in_tag("preds_test.jsonl"))
+        # Fallback: if tagged variant missing but base exists (e.g., _full missing) use base
+        if not (os.path.exists(val_preds) and os.path.exists(test_preds)) and args.head_tag:
+            if os.path.exists(base_val) and os.path.exists(base_test):
+                print(f"WARNING: Falling back to base preds for {name} (missing tag {args.head_tag})")
+                val_preds = base_val
+                test_preds = base_test
         if os.path.exists(val_preds) and os.path.exists(test_preds):
+            # Deduplicate
+            v_clean, v_stats = _sanitize_preds(val_preds)
+            t_clean, t_stats = _sanitize_preds(test_preds)
+            if v_stats.get("dupe_ids",0) or t_stats.get("dupe_ids",0):
+                print(f"[fuse][INFO] Dedup {name}: val {v_stats['dupe_ids']} dupes (uniq {v_stats['unique_ids']}/{v_stats['lines']}), test {t_stats['dupe_ids']} dupes (uniq {t_stats['unique_ids']}/{t_stats['lines']})")
             available_heads[name] = d
+            # Replace paths if cleaned
+            if v_clean != val_preds:
+                val_preds = v_clean
+            if t_clean != test_preds:
+                test_preds = t_clean
         else:
             print(f"WARNING: Skipping {name} - missing prediction files in {d}")
     

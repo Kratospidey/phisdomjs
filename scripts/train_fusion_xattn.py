@@ -2,10 +2,11 @@
 from __future__ import annotations
 import argparse
 import json
-import os
+import hashlib
+import os  # noqa: F401
 from typing import List, Tuple
 
-import numpy as np
+import numpy as np  # noqa: F401
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -136,6 +137,10 @@ def main():
     ap.add_argument("--pin-memory", action="store_true")
     ap.add_argument("--persistent-workers", action="store_true")
     ap.add_argument("--disable-tqdm", action="store_true")
+    ap.add_argument("--record-diagnostics", action="store_true")
+    ap.add_argument("--diag-interval", type=int, default=100)
+    ap.add_argument("--diag-dir", default=None)
+    ap.add_argument("--log-hist-every", type=int, default=1)
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -250,9 +255,84 @@ def main():
     bad = 0
     patience = 3
     model_saved = False  # Track if we ever saved a model
+    grad_snapshots: List[dict] = []
+    step_counter = 0
+    lr_history: List[float] = []
+    attn_entropy_snapshots: List[dict] = []  # ({step, layer_means, raw})
+
+    def maybe_record(step:int):
+        if not args.record_diagnostics or args.diag_interval <= 0:
+            return
+        if step % args.diag_interval != 0:
+            return
+        snap = {"step": step}
+        with torch.no_grad():
+            for name, p in model.named_parameters():
+                if p.grad is not None:
+                    g = p.grad.detach()
+                    snap[name] = {"grad_norm": float(g.norm().cpu()), "shape": list(g.shape)}  # type: ignore[assignment]
+        grad_snapshots.append(snap)
+
+    def dump_hist(epoch:int, logits: torch.Tensor):
+        if not args.record_diagnostics or epoch % max(1, args.log_hist_every) != 0 or not logits.numel():
+            return
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            arr = logits.detach().cpu().numpy()
+            plt.figure(figsize=(4,3))
+            plt.hist(arr, bins=60, color='indigo', alpha=0.85)
+            plt.title(f"Logits val ep{epoch}")
+            plt.tight_layout()
+            ddir = args.diag_dir or os.path.join(args.out_dir, 'diagnostics')
+            os.makedirs(ddir, exist_ok=True)
+            plt.savefig(os.path.join(ddir, f"logits_val_ep{epoch}.png"))
+            plt.close()
+        except Exception as e:
+            print(f"[XF][WARN] histogram fail: {e}")
+
     for ep in range(args.epochs):
-        _ = train_one_epoch(model, tr_dl, opt, sched, device)
+        model.train()
+        crit = nn.BCEWithLogitsLoss()
+        for batch_idx, batch in enumerate(tr_dl):
+            labels = batch.pop("labels").float().to(device)
+            for k, v in list(batch.items()):
+                if isinstance(v, torch.Tensor):
+                    batch[k] = v.to(device)
+            opt.zero_grad(set_to_none=True)
+            logits = model(batch).squeeze(-1)
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                continue
+            loss = crit(logits, labels)
+            if torch.isnan(loss) or torch.isinf(loss):
+                continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            opt.step(); sched.step()
+            step_counter += 1
+            maybe_record(step_counter)
+            # Capture attention entropy snapshot alongside gradient diagnostics
+            if args.record_diagnostics and args.diag_interval > 0 and step_counter % args.diag_interval == 0:
+                attn = getattr(model, "_last_attn_entropies", None)
+                if isinstance(attn, list) and attn:
+                    try:
+                        layer_means = [float(a.get("mean_entropy", float('nan'))) if isinstance(a, dict) and 'mean_entropy' in a else float('nan') for a in attn]
+                        attn_entropy_snapshots.append({
+                            "step": step_counter,
+                            "layer_means": layer_means,
+                            "raw": attn,
+                        })
+                        if len(attn_entropy_snapshots) > 100:
+                            attn_entropy_snapshots.pop(0)
+                    except Exception:
+                        pass
         ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
+        dump_hist(ep, logits_v)
+        try:
+            lr_history.append(float(opt.param_groups[0]['lr']))
+        except Exception:
+            pass
         val_loss = float(bcel(logits_v, labels_v.float()).item()) if logits_v.numel() else float("inf")
         if val_loss + 1e-6 < best_val:
             best_val = val_loss
@@ -283,6 +363,7 @@ def main():
         ts = TemperatureScaler()
 
     with torch.no_grad():
+        import numpy as np  # local import to satisfy static analyzer
         p_val = torch.sigmoid(logits_v / torch.exp(ts.log_T)).numpy() if logits_v.numel() else np.zeros((0,), dtype=float)
         p_test = torch.sigmoid(logits_t / torch.exp(ts.log_T)).numpy() if logits_t.numel() else np.zeros((0,), dtype=float)
 
@@ -308,6 +389,79 @@ def main():
     dump(os.path.join(args.out_dir, "preds_test.jsonl"), ids_t, labels_t, p_test)
 
     print(json.dumps(cal, indent=2))
+
+    if args.record_diagnostics:
+        ddir = args.diag_dir or os.path.join(args.out_dir, 'diagnostics')
+        os.makedirs(ddir, exist_ok=True)
+        def checksum(ids: List[str]) -> str:
+            h = hashlib.sha1()
+            for i in sorted(ids):
+                h.update(str(i).encode('utf-8'))
+            return h.hexdigest()
+        diag = {
+            "grad_snapshots": grad_snapshots,
+            "lr_history": lr_history,
+            "alignment": {
+                "val_ids_sha1": checksum(ids_v),
+                "test_ids_sha1": checksum(ids_t),
+                "val_count": len(ids_v),
+                "test_count": len(ids_t),
+            }
+        }
+        if getattr(model, "_last_stream_stats", None):
+            diag["last_stream_stats"] = model._last_stream_stats  # type: ignore
+        if getattr(model, "_last_pooled_stats", None):
+            diag["pooled_stats"] = model._last_pooled_stats  # type: ignore
+        if getattr(model, "_last_attn_entropies", None):
+            diag["attn_entropy"] = model._last_attn_entropies  # type: ignore
+        if attn_entropy_snapshots:
+            try:
+                steps_series = [s["step"] for s in attn_entropy_snapshots]
+                layer_matrix = [s["layer_means"] for s in attn_entropy_snapshots]
+                import math
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                import numpy as np
+                arr = np.array(layer_matrix, dtype=float)
+                plt.figure(figsize=(5,3.2))
+                for li in range(arr.shape[1]):
+                    plt.plot(steps_series, arr[:, li], label=f"L{li}")
+                plt.xlabel('Step')
+                plt.ylabel('Mean Attention Entropy (nats)')
+                plt.title('Attention Entropy Trend')
+                if arr.shape[1] <= 8:
+                    plt.legend(ncol=2, fontsize=8)
+                plt.tight_layout()
+                trend_path = os.path.join(ddir, 'attn_entropy_trend.png')
+                plt.savefig(trend_path, dpi=140)
+                plt.close()
+                final_raw = attn_entropy_snapshots[-1].get('raw', [])
+                alerts: List[str] = []
+                for entry in final_raw:
+                    if not isinstance(entry, dict) or 'mean_entropy' not in entry:
+                        continue
+                    mean_e = float(entry.get('mean_entropy', float('nan')))
+                    T = int(entry.get('T', 0) or 0)
+                    if T > 1:
+                        max_uniform = math.log(T)
+                        if mean_e < 0.5:
+                            alerts.append(f"layer {entry.get('layer')} entropy low {mean_e:.3f} (<0.5) -> possible collapse")
+                        if mean_e > 0.95 * max_uniform:
+                            alerts.append(f"layer {entry.get('layer')} entropy high {mean_e:.3f} (~uniform) -> possible saturation (max {max_uniform:.2f})")
+                diag['attn_entropy_trend'] = {
+                    'steps': steps_series,
+                    'layer_means': layer_matrix,
+                    'collapse_bits_threshold': 0.5,
+                    'saturation_fraction_threshold': 0.95,
+                }
+                if alerts:
+                    diag['attn_entropy_alerts'] = alerts
+            except Exception as e:  # pragma: no cover
+                print(f"[XF][WARN] Failed entropy trend plotting: {e}")
+        with open(os.path.join(ddir, 'diagnostics.json'), 'w', encoding='utf-8') as f:
+            json.dump(diag, f, indent=2)
+        print(f"[XF][INFO] diagnostics written to {ddir}")
 
 
 if __name__ == "__main__":

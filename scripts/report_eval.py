@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import shutil
+import html as _html
 from typing import Any, Dict, List, Tuple, cast
 
 import numpy as np
@@ -29,6 +30,12 @@ except Exception:
 
 from phisdom.data.loader import JsonlPhishDataset, MarkupLMDataCollator
 from phisdom.data.js import concat_scripts
+
+def escape_html(s: str) -> str:
+    try:
+        return _html.escape(str(s), quote=True)
+    except Exception:
+        return str(s)
 
 
 def ensure_deps():
@@ -676,23 +683,41 @@ def plot_confusion(y: np.ndarray, p: np.ndarray, thr: float, out_dir: str, split
     import matplotlib.pyplot as plt
     from sklearn.metrics import confusion_matrix
     os.makedirs(out_dir, exist_ok=True)
+    # Handle single-class edge case
     if len(set(map(int, y.tolist()))) < 2:
-        plt.figure(); plt.text(0.5, 0.5, "One-class split; confusion not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"confusion_{split}.png")); plt.close()
-        return
+        plt.figure(); plt.text(0.5, 0.5, "One-class split; confusion not computed", ha="center", va="center"); plt.axis("off"); plt.tight_layout(); plt.savefig(os.path.join(out_dir, f"confusion_{split}.png")); plt.close(); return
+    # Predictions
     yhat = (p >= thr).astype(int)
-    cm = confusion_matrix(y, yhat, labels=[0, 1])
-    plt.figure()
-    plt.imshow(cm, interpolation="nearest")
+    cm = confusion_matrix(y, yhat, labels=[0, 1])  # [[TN FP],[FN TP]] with our label order
+    tn, fp, fn, tp = cm.ravel()
+    # Derived rates
+    tpr = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
+    fpr = fp / (fp + tn) if (fp + tn) > 0 else float('nan')
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+    recall = tpr
+    # Normalized by true-class (row) for heat coloring
+    with np.errstate(divide='ignore', invalid='ignore'):
+        row_sums = cm.sum(axis=1, keepdims=True)
+        norm = np.divide(cm, row_sums, where=row_sums>0)
+
+    plt.figure(figsize=(4.2,4.0))
+    im = plt.imshow(norm, interpolation='nearest', cmap='Blues', vmin=0.0, vmax=1.0)
+    plt.colorbar(im, fraction=0.046, pad=0.04, label='Row %')
+    # Annotate with count and row %
     for i in range(cm.shape[0]):
         for j in range(cm.shape[1]):
-            plt.text(j, i, str(cm[i, j]), ha="center", va="center")
+            count = cm[i, j]
+            pct = norm[i, j] * 100 if row_sums[i,0] > 0 else float('nan')
+            txt = f"{count}\n{pct:.1f}%"
+            plt.text(j, i, txt, ha='center', va='center', fontsize=10, color='#111' if norm[i,j] > 0.6 else '#eee')
     plt.xticks([0,1], ["benign","phish"])
     plt.yticks([0,1], ["benign","phish"])
-    plt.xlabel("Predicted")
-    plt.ylabel("True")
-    plt.title(f"Confusion @ thr={thr:.3f} ({split})")
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.title(f"Confusion @thr={thr:.3f} {split}\nTPR={tpr:.3f} FPR={fpr:.3f} Prec={precision:.3f} Rec={recall:.3f}", fontsize=11)
     plt.tight_layout()
-    plt.savefig(os.path.join(out_dir, f"confusion_{split}.png"))
+    out_path = os.path.join(out_dir, f"confusion_{split}.png")
+    plt.savefig(out_path, dpi=160)
     plt.close()
 
 
@@ -1500,6 +1525,7 @@ def main():
     parser.add_argument("--train-jsonl", default="data/pages_train.jsonl")
     parser.add_argument("--val-jsonl", default="data/pages_val.jsonl")
     parser.add_argument("--test-jsonl", default="data/pages_test.jsonl")
+    parser.add_argument("--full-jsonl", default="data/pages.jsonl", help="Path to full (latest) dataset for drift/count checks")
     parser.add_argument("--max-length", type=int, default=512)
     parser.add_argument("--lime", action="store_true", help="Generate LIME explanations (slow)")
     parser.add_argument("--shap", action="store_true", help="Generate SHAP explanations (slow)")
@@ -1511,6 +1537,7 @@ def main():
     parser.add_argument("--xai-tokenizer", choices=["whitespace", "model"], default="whitespace", help="Tokenization used for rendering explanations")
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cuda", help="Device for prediction during reporting (DOM/JS)")
     parser.add_argument("--eval-batch", type=int, default=4, help="Per-device eval batch size for reporting")
+    parser.add_argument("--splits-version", default=None, help="Optional splits version tag or path to v2 JSON for provenance")
     args = parser.parse_args()
 
     ensure_deps()
@@ -1997,6 +2024,84 @@ def main():
         if cal:
             light_cal[name] = cal
     cascade_json = _safe_load_json(os.path.join("artifacts/cascade", "cascade.json"))
+
+    # Optional deeper cascade analysis: derive per-class resolution using URL + Cheap heads if available
+    cascade_analysis: Dict[str, Any] | None = None
+    try:
+        if cascade_json and isinstance(cascade_json, dict):
+            stage1 = cascade_json.get("stage1", {}) or {}
+            thr_hi = float(stage1.get("thr_hi", 1.0))
+            thr_lo = float(stage1.get("thr_lo", 0.0))
+            # Load URL & Cheap predictions for test split to recompute stage1 resolution stats
+            def _read_head_preds(head_dir: str, split: str) -> Dict[str, float]:
+                out: Dict[str, float] = {}
+                try:
+                    pth = os.path.join(head_dir, f"preds_{split}.jsonl")
+                    if os.path.exists(pth):
+                        with open(pth, "r", encoding="utf-8", errors="ignore") as f:
+                            for line in f:
+                                if not line.strip():
+                                    continue
+                                try:
+                                    obj = json.loads(line)
+                                except Exception:
+                                    continue
+                                i = str(obj.get("id"))
+                                if i and "prob" in obj:
+                                    try:
+                                        out[i] = float(obj["prob"])
+                                    except Exception:
+                                        pass
+                except Exception:
+                    return {}
+                return out
+            url_test = _read_head_preds("artifacts/url_head", "test")
+            cheap_test = _read_head_preds("artifacts/cheap_mlp", "test")
+            # Align with test rows already loaded earlier (rows_te)
+            records: List[Dict[str, Any]] = []
+            for r in rows_te:
+                rid = r.get("id")
+                if rid is None:
+                    continue
+                sid = str(rid)
+                if sid in url_test and sid in cheap_test:
+                    try:
+                        y_true = int(r.get("label", 0))
+                    except Exception:
+                        continue
+                    s1 = 0.5 * (url_test[sid] + cheap_test[sid])
+                    records.append({"id": sid, "y": y_true, "s1": s1})
+            if records:
+                import numpy as _np
+                s1_scores = _np.array([rec["s1"] for rec in records], dtype=float)
+                y_arr = _np.array([rec["y"] for rec in records], dtype=int)
+                accept_phish = s1_scores >= thr_hi
+                accept_benign = s1_scores <= thr_lo
+                resolved = accept_phish | accept_benign
+                total = float(len(records))
+                pos_mask = y_arr == 1
+                neg_mask = y_arr == 0
+                pos_total = float(max(1, pos_mask.sum()))
+                neg_total = float(max(1, neg_mask.sum()))
+                resolved_pos = float((resolved & pos_mask).sum())
+                resolved_neg = float((resolved & neg_mask).sum())
+                cascade_analysis = {
+                    "thr_hi": thr_hi,
+                    "thr_lo": thr_lo,
+                    "test": {
+                        "records": int(total),
+                        "resolved_overall_frac": float(resolved.sum() / total if total > 0 else float("nan")),
+                        "escalated_overall_frac": float(1.0 - (resolved.sum() / total) if total > 0 else float("nan")),
+                        "resolved_phish_frac": float(resolved_pos / pos_total),
+                        "resolved_benign_frac": float(resolved_neg / neg_total),
+                        "escalated_phish_frac": float(1.0 - (resolved_pos / pos_total)),
+                        "escalated_benign_frac": float(1.0 - (resolved_neg / neg_total)),
+                        "pos_total": int(pos_mask.sum()),
+                        "neg_total": int(neg_mask.sum()),
+                    },
+                }
+    except Exception:
+        cascade_analysis = None
     # Attempt to include XFusion (cross-attention fusion) diagnostics if present.
     # Expected layout: <fusion_parent>/fusion_xattn/diagnostics/diagnostics.json
     # We also copy corr_heatmap.png into the report directory for embedding.
@@ -2020,7 +2125,96 @@ def main():
     except Exception:
         xfusion_diagnostics = None
 
-    summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json}
+    # Macro metrics across core models (focus on test thresholds)
+    def _macro_average(models: Dict[str, Any], key: str) -> Dict[str, float]:
+        acc: Dict[str, List[float]] = {}
+        for mname, sect in models.items():
+            if not isinstance(sect, dict):
+                continue
+            entry = sect.get(key)
+            if not isinstance(entry, dict):
+                continue
+            for mk, mv in entry.items():
+                try:
+                    fv = float(mv)
+                except Exception:
+                    continue
+                if np.isnan(fv):
+                    continue
+                acc.setdefault(mk, []).append(fv)
+        return {mk: (float(np.mean(vs)) if vs else float("nan")) for mk, vs in acc.items()}
+
+    core_for_macro = {k: metrics_summary.get(k) for k in ["dom","js","fused","meta"] if k in metrics_summary}
+    macro_test_tpr90 = _macro_average(core_for_macro, "test@tpr90")
+    macro_test_tpr95 = _macro_average(core_for_macro, "test@tpr95")
+    macro_block = {
+        "models": list(core_for_macro.keys()),
+        "test@tpr90": macro_test_tpr90,
+        "test@tpr95": macro_test_tpr95,
+    }
+
+    # Dataset drift / coverage diagnostics
+    dataset_drift: Dict[str, Any] | None = None
+    try:
+        full_path = args.full_jsonl
+        if os.path.exists(full_path):
+            # Collect IDs and labels from full dataset
+            full_total = 0
+            full_pos = 0
+            full_ids: set[str] = set()
+            with open(full_path, "r", encoding="utf-8", errors="ignore") as f_full:
+                for line in f_full:
+                    if not line.strip():
+                        continue
+                    try:
+                        obj = json.loads(line)
+                    except Exception:
+                        continue
+                    fid = obj.get("id")
+                    if fid is not None:
+                        full_ids.add(str(fid))
+                    try:
+                        if int(obj.get("label", 0)) == 1:
+                            full_pos += 1
+                    except Exception:
+                        pass
+                    full_total += 1
+            # Collect IDs used in splits (train/val/test DOM rows already loaded)
+            split_ids = set()
+            for r in rows_tr + rows_va + rows_te:
+                rid = r.get("id")
+                if rid is not None:
+                    split_ids.add(str(rid))
+            missing_ids = sorted(list(full_ids - split_ids))[:50]  # cap preview
+            extra_ids = sorted(list(split_ids - full_ids))[:50]
+            used_total = len(split_ids)
+            dataset_drift = {
+                "full_total": full_total,
+                "full_pos": full_pos,
+                "full_neg": full_total - full_pos,
+                "split_total_unique": used_total,
+                "coverage_ratio": (used_total / full_total) if full_total > 0 else None,
+                "missing_in_splits_example": missing_ids,
+                "extra_in_splits_example": extra_ids,
+                "missing_count": max(0, len(full_ids) - used_total),
+            }
+    except Exception as e:
+        dataset_drift = {"error": str(e)}
+
+    summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json, "dataset_drift": dataset_drift, "macro": macro_block}
+    if args.splits_version:
+        # If it's a path to v2 file, attempt to parse minimal metadata
+        meta = {"declared": args.splits_version}
+        if os.path.exists(args.splits_version):
+            try:
+                with open(args.splits_version, 'r', encoding='utf-8') as sf:
+                    js = json.load(sf)
+                meta.update({k: js.get(k) for k in ("version","tag","cutoff","hashes","counts") if k in js})
+            except Exception as e:
+                meta['error'] = str(e)
+        summary_bundle['splits'] = meta
+    if cascade_analysis is not None:
+        summary_bundle["cascade_analysis"] = cascade_analysis
     if xfusion_diagnostics is not None:
         summary_bundle["xfusion_diagnostics"] = xfusion_diagnostics
     with open(os.path.join(report_dir, "summary.json"), "w", encoding="utf-8") as f:
@@ -2132,6 +2326,26 @@ def main():
         tr_tot, tr_neg, tr_pos = counts(rows_tr)
         va_tot, va_neg, va_pos = counts(rows_va)
         te_tot, te_neg, te_pos = counts(rows_te)
+        drift = (metrics_json or {}).get("dataset_drift") if isinstance(metrics_json, dict) else None
+        drift_html = ""
+        if isinstance(drift, dict) and drift.get("full_total"):
+            cov = drift.get("coverage_ratio")
+            warn = "" if (cov is None or cov >= 0.98) else "<div class='pill' style='background:#3a1e1e;border:1px solid #6b2a2a;color:#f5b5b5'>WARN: split coverage low</div>"
+            if cov is None:
+                cov_str = 'n/a'
+            else:
+                try:
+                    cov_str = f"{float(cov):.3f}"
+                except Exception:
+                    cov_str = 'n/a'
+            coverage_line = f"<div class='mono' style='margin-top:4px'>coverage: {cov_str}</div>" + (warn if cov is not None else "")
+            drift_html = (
+                f"<div class='card'><b>Full Dataset</b><div>{int(drift.get('full_total',0))} docs</div><div>benign: {int(drift.get('full_neg',0))}</div><div>phish: {int(drift.get('full_pos',0))}</div>"
+                + coverage_line
+                + f"<div class='mono' style='opacity:.7'>missing ids: {int(drift.get('missing_count',0))}</div></div>"
+            )
+        elif isinstance(drift, dict) and drift.get("error"):
+            drift_html = f"<div class='card'><b>Full Dataset</b><div class='mono' style='color:#f88'>error: {drift.get('error')}</div></div>"
 
         def metric_block(title, cal):
             if not cal:
@@ -2185,6 +2399,34 @@ def main():
         except Exception:
             tests_html = ""
 
+        macro_json = (metrics_json or {}).get("macro") if isinstance(metrics_json, dict) else None
+        def macro_table(macro: Dict[str, Any] | None):
+            if not isinstance(macro, dict):
+                return "<div class='card'><h3>Macro (All Heads)</h3><p>No macro metrics.</p></div>"
+            models = macro.get("models") or []
+            t90 = macro.get("test@tpr90") or {}
+            t95 = macro.get("test@tpr95") or {}
+            cols = sorted(set(list(t90.keys()) + list(t95.keys())))
+            def row(label, data):
+                cells = "".join(f"<td class='mono' style='text-align:right'>{fmt4(data.get(c))}</td>" for c in cols)
+                return f"<tr><td class='mono'>{label}</td>{cells}</tr>"
+            head = "".join(f"<th>{c}</th>" for c in ["metric"] + cols)
+            return (
+                "<div class='card'><h3>Macro Metrics (average over models: " + ", ".join(models) + ")</h3>"
+                + f"<table><thead><tr>{head}</tr></thead><tbody>" + row("test@tpr95", t95) + row("test@tpr90", t90) + "</tbody></table></div>"
+            )
+
+        plot_captions_html = (
+            "<div class='card'><h3>Plot Captions</h3>"
+            "<ul style='margin:4px 0 0 16px'>"
+            "<li><b>ROC Curve</b>: TPR vs FPR; diagonal = random; AUC closer to 1 is better.</li>"
+            "<li><b>PR Curve</b>: Precision vs Recall; area (PR-AUC) emphasizes positive class performance under imbalance.</li>"
+            "<li><b>Reliability (Calibration)</b>: Predicted probability vs empirical frequency; perfect calibration lies on diagonal.</li>"
+            "<li><b>Accuracy vs Threshold</b>: Shows how classification accuracy shifts as decision threshold varies.</li>"
+            "<li><b>Confusion Matrix</b>: Counts at given threshold targeting TPR goals (e.g. 0.90/0.95); off‑diagonal cells are errors.</li>"
+            "</ul></div>"
+        )
+
         html = [
             "<html><head><meta charset='utf-8'><title>PhisDOM Report</title>",
             "<style>",
@@ -2211,6 +2453,7 @@ def main():
             f"<div class='subgrid'><div class='card'><b>Train</b><div>{tr_tot} docs</div><div>benign: {tr_neg}</div><div>phish: {tr_pos}</div></div>",
             f"<div class='card'><b>Val</b><div>{va_tot} docs</div><div>benign: {va_neg}</div><div>phish: {va_pos}</div></div>",
             f"<div class='card'><b>Test</b><div>{te_tot} docs</div><div>benign: {te_neg}</div><div>phish: {te_pos}</div></div></div></div>",
+            (drift_html if drift_html else ""),
             "<div id='cal' class='section'><h2 style='margin:0 0 8px 0'>Calibration & Metrics</h2>",
             f"<div class='grid'><div class='card'>{metric_block('DOM (MarkupLM)', dom_cal)}</div>",
             f"<div class='card'>{metric_block('JS (CodeT5+)', js_cal)}</div>",
@@ -2231,6 +2474,7 @@ def main():
             metrics_table("JS", (metrics_json or {}).get("core", {}).get("js")),
             metrics_table("Fused", (metrics_json or {}).get("core", {}).get("fused")),
             metrics_table("Meta Fused (All Heads)", (metrics_json or {}).get("core", {}).get("meta")),
+            macro_table(macro_json),
             "</div>",
         ]
 
@@ -2291,15 +2535,63 @@ def main():
                         corr_html = "<p>Correlation matrix parse error.</p>"
                 heat_png = "xfusion_corr_heatmap.png"
                 heat_img = f"<div><img src='{heat_png}' alt='corr heatmap'/></div>" if os.path.exists(os.path.join(report_dir, heat_png)) else ""
-                html.append(
-                    "<div id='xfusion' class='section'><h2 style='margin:0 0 8px 0'>XFusion Diagnostics</h2>"
-                    + f"<p class='mono' style='opacity:.8'>Instrumented cross-attention fusion stats (steps={steps}).</p>"
-                    + "<div class='grid'>"
-                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Top Grad Norms</h3>{grad_tbl}</div>"
-                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Modality Token Norms</h3><div class='subgrid'>{''.join(mod_cards) or '<p>No modality stats.</p>'}</div></div>"
-                    + f"<div class='card'><h3 style='margin:0 0 6px 0'>Embedding Correlations</h3>{corr_html}{heat_img}</div>"
-                    + "</div></div>"
-                )
+                # Attention entropy card (with optional trend + alerts)
+                attn_entropy_html = ""
+                attn_list = xfd.get('attn_entropy') if isinstance(xfd, dict) else None
+                trend = xfd.get('attn_entropy_trend') if isinstance(xfd, dict) else None
+                alerts_list = xfd.get('attn_entropy_alerts') if isinstance(xfd, dict) else None
+                trend_img = "attn_entropy_trend.png"
+                trend_block = ""
+                if os.path.exists(os.path.join(report_dir, trend_img)):
+                    trend_block = f"<div style='margin-top:6px'><img src='{trend_img}' alt='entropy trend'/></div>"
+                alert_block = ""
+                if isinstance(alerts_list, list) and alerts_list:
+                    items = "".join(f"<li class='mono'>{escape_html(str(a))}</li>" for a in alerts_list)
+                    alert_block = f"<div style='margin-top:6px'><strong>Alerts:</strong><ul style='margin:4px 0 0 16px'>{items}</ul></div>"
+                if isinstance(attn_list, list):
+                    rows = []
+                    for e in attn_list:
+                        if not isinstance(e, dict):
+                            continue
+                        if 'mean_entropy' in e:
+                            val = e.get('mean_entropy')
+                            mean_e = float(val) if isinstance(val, (int, float)) else float('nan')
+                            heads = e.get('head_mean_entropy', []) or []
+                            head_str = ", ".join(
+                                f"{float(h):.2f}" for h in heads if isinstance(h, (int, float))
+                            )
+                            rows.append(
+                                f"<tr><td class='mono'>{e.get('layer')}</td><td class='mono' style='text-align:right'>{mean_e:.3f}</td><td class='mono' style='text-align:right'>{len(heads)}</td><td class='mono'>{head_str}</td></tr>"
+                            )
+                        elif 'skipped' in e:
+                            rows.append(
+                                f"<tr><td class='mono'>{e.get('layer')}</td><td colspan='3' class='mono'>skipped (T={e.get('T','?')})</td></tr>"
+                            )
+                    table = (
+                        "<table><thead><tr><th>Layer</th><th>Mean</th><th>Heads</th><th>Head Means</th></tr></thead><tbody>"
+                        + "".join(rows)
+                        + "</tbody></table>"
+                    ) if rows else "<p>No entropy recorded.</p>"
+                    meta_line = ""
+                    if isinstance(trend, dict):
+                        try:
+                            nsteps = len(trend.get('steps', []) or [])
+                            meta_line = f"<p class='mono' style='opacity:.7;margin:4px 0 0 0'>snapshots={nsteps}</p>"
+                        except Exception:
+                            pass
+                    attn_entropy_html = (
+                        f"<div class='card'><h3 style='margin:0 0 6px 0'>Attention Entropy</h3>{table}{meta_line}{trend_block}{alert_block}</div>"
+                    )
+                    html.append(
+                        "<div id='xfusion' class='section'><h2 style='margin:0 0 8px 0'>XFusion Diagnostics</h2>"
+                        + f"<p class='mono' style='opacity:.8'>Instrumented cross-attention fusion stats (steps={steps}).</p>"
+                        + "<div class='grid'>"
+                        + f"<div class='card'><h3 style='margin:0 0 6px 0'>Top Grad Norms</h3>{grad_tbl}</div>"
+                        + f"<div class='card'><h3 style='margin:0 0 6px 0'>Modality Token Norms</h3><div class='subgrid'>{''.join(mod_cards) or '<p>No modality stats.</p>'}</div></div>"
+                        + f"<div class='card'><h3 style='margin:0 0 6px 0'>Embedding Correlations</h3>{corr_html}{heat_img}</div>"
+                        + attn_entropy_html
+                        + "</div></div>"
+                    )
             except Exception:
                 pass
         html.extend([
@@ -2307,8 +2599,10 @@ def main():
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
         ])
 
+        if plot_captions_html:
+            html.append(plot_captions_html)
         for name in sorted(pngs):
-            html.append(f"<div><p>{name}</p><img src='{name}'/></div>")
+            html.append(f"<div><p class='mono' style='opacity:.75'>{name}</p><img src='{name}'/></div>")
 
         if lime_dom_files or shap_dom_files or lime_js_files or shap_js_files:
             html.append("<div id='xai' class='section'><h2 style='margin:0 0 8px 0'>Explanations</h2><div class='grid'>")
@@ -2351,6 +2645,7 @@ def main():
 
         # Cascade coverage (if available)
         cas = (metrics_json or {}).get('cascade')
+        cas_analysis = (metrics_json or {}).get('cascade_analysis')
         if cas and isinstance(cas, dict):
             cov = cas.get('coverage', {}) or {}
             s1 = cas.get('stage1', {}) or {}
@@ -2367,6 +2662,23 @@ def main():
                 html.append(f"<div class='mono' style='opacity:.85'>stage1 thr_hi={float(s1.get('thr_hi', float('nan'))):.4f}, thr_lo={float(s1.get('thr_lo', float('nan'))):.4f}</div>")
             except Exception:
                 pass
+            # Narrative & efficiency gain (test split)
+            if cas_analysis and isinstance(cas_analysis, dict):
+                test_block = cas_analysis.get('test') or {}
+                try:
+                    eff = float(test_block.get('resolved_overall_frac', float('nan')))
+                    esc = float(test_block.get('escalated_overall_frac', float('nan')))
+                    r_pos = float(test_block.get('resolved_phish_frac', float('nan')))
+                    r_neg = float(test_block.get('resolved_benign_frac', float('nan')))
+                    html.append(
+                        "<div style='margin-top:6px;font-size:13px;line-height:1.35'>"
+                        f"Stage-1 quickly resolves <b>{eff:.1%}</b> of test pages (efficiency gain), leaving <b>{esc:.1%}</b> to the heavier fused model. "
+                        f"Resolution is class-skewed: <b>{r_pos:.1%}</b> of phishing and <b>{r_neg:.1%}</b> of benign samples decided early. "
+                        "`efficiency gain = resolved_overall_frac = coverage of stage-1 decisions`; the remaining band is intentionally narrow to protect recall."
+                        "</div>"
+                    )
+                except Exception:
+                    pass
             html.append("</div></div>")
 
         # Robustness delta card: JS base vs augmented (if both present)

@@ -61,6 +61,37 @@ XF_NO_JS_CANON ?= 0
 XF_HTML_CANON ?= 0
 XF_HTML_FIELD ?= html
 JS_HEAD_NUM_WORKERS ?= 4
+DIAG_INTERVAL ?= 100
+REPORT_OUT ?= artifacts/report_e2e
+INCLUDE_XFUSION ?= 1
+
+# Optional toggle to include heavy CodeT5p JS head in unified report
+ENABLE_CODET5P ?= 0
+XF_DIAG_DIR ?= artifacts/fusion_xattn/diagnostics
+XF_BATCH_SIZE ?= 8
+XF_D_MODEL ?= 96
+XF_N_LAYERS ?= 2
+XF_N_HEADS ?= 4
+XF_FF_MULT ?= 4
+XF_TOKEN_EMBED ?= 48
+XF_AMP ?= 1
+XF_GRAD_CHECKPOINT ?= 0
+XF_SMOKE_LIMIT ?= 512
+XF_ATTN_DROPOUT ?=
+XF_FF_DROPOUT ?=
+XF_REVERSIBLE ?= 0
+
+# Versioned splits configuration
+WRITE_V2 ?= 0
+SPLITS_VERSION_TAG ?= v2_default
+SPLITS_VERSION_FILE ?= data/splits_v2.json
+
+# Heads directories list for reports (auto-augmented when ENABLE_CODET5P=1)
+HEADS_DIRS = artifacts/url_head artifacts/text_head artifacts/js_charcnn artifacts/dom_gcn artifacts/cheap_mlp
+HEADS_DIRS += $(if $(filter $(ENABLE_CODET5P),1),artifacts/js_codet5p,)
+
+# Optional per-user overrides (create local.mk without committing secrets)
+-include local.mk
 
 # Ensure env for PhishTank
 # export PHISHTANK_APP_KEY=your_key
@@ -156,7 +187,9 @@ splits:
 		$(if $(POSR_TEST),--target-pos-ratio-test $(POSR_TEST),) \
 		$(if $(RATIO_TOL),--ratio-tol $(RATIO_TOL),) \
 		$(if $(MIN_TOTAL_TEST),--min-total-test $(MIN_TOTAL_TEST),) \
-		$(if $(filter $(BALANCE_SPLITS),1),--balance-splits,)
+		$(if $(filter $(BALANCE_SPLITS),1),--balance-splits,) \
+		$(if $(filter $(WRITE_V2),1),--write-v2 --version-tag $(SPLITS_VERSION_TAG),)
+	@if [ -f $(SPLITS_VERSION_FILE) ]; then echo "[MAKE] Versioned splits present: $(SPLITS_VERSION_FILE)"; fi
 
 slice:
 	$(PY) scripts/slice_dataset.py --dataset $(DATASET) --splits data/splits.json --out-dir data
@@ -289,6 +322,8 @@ train-xfusion:
 	$(PY) scripts/train_fusion_xattn_fixed.py \
 		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_xattn \
+		--d-model $(XF_D_MODEL) --n-heads $(XF_N_HEADS) --n-layers $(XF_N_LAYERS) --ff-mult $(XF_FF_MULT) --token-embed-dim $(XF_TOKEN_EMBED) $(if $(filter $(XF_AMP),1),--amp,) $(if $(filter $(XF_GRAD_CHECKPOINT),1),--grad-checkpoint,) \
+		$(if $(XF_ATTN_DROPOUT),--attn-dropout $(XF_ATTN_DROPOUT),) $(if $(XF_FF_DROPOUT),--ff-dropout $(XF_FF_DROPOUT),) $(if $(filter $(XF_REVERSIBLE),1),--reversible,) \
 		$(if $(filter $(XF_NO_URL),1),--no-url,) \
 		$(if $(filter $(XF_NO_JS),1),--no-js,) \
 		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
@@ -304,7 +339,30 @@ train-xfusion-diag:
 	$(PY) scripts/train_fusion_xattn_fixed.py \
 		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--out-dir artifacts/fusion_xattn \
-		--record-diagnostics --diag-interval 100 \
+		--batch-size $(XF_BATCH_SIZE) \
+		--d-model $(XF_D_MODEL) --n-heads $(XF_N_HEADS) --n-layers $(XF_N_LAYERS) --ff-mult $(XF_FF_MULT) --token-embed-dim $(XF_TOKEN_EMBED) $(if $(filter $(XF_AMP),1),--amp,) $(if $(filter $(XF_GRAD_CHECKPOINT),1),--grad-checkpoint,) \
+		$(if $(XF_ATTN_DROPOUT),--attn-dropout $(XF_ATTN_DROPOUT),) $(if $(XF_FF_DROPOUT),--ff-dropout $(XF_FF_DROPOUT),) $(if $(filter $(XF_REVERSIBLE),1),--reversible,) \
+		--record-diagnostics --diag-interval $(DIAG_INTERVAL) --diag-dir $(XF_DIAG_DIR) \
+		$(if $(filter $(XF_NO_URL),1),--no-url,) \
+		$(if $(filter $(XF_NO_JS),1),--no-js,) \
+		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
+		$(if $(filter $(XF_NO_DOM),1),--no-dom,) \
+		$(if $(filter $(XF_NO_CHEAP),1),--no-cheap,) \
+		$(if $(XF_JS_RAW_FIELD),--js-raw-field $(XF_JS_RAW_FIELD),) \
+		$(if $(filter $(XF_NO_JS_CANON),1),--no-js-canonicalize,) \
+		$(if $(filter $(XF_HTML_CANON),1),--html-canonicalize,) \
+		$(if $(XF_HTML_FIELD),--html-field $(XF_HTML_FIELD),)
+
+.PHONY: xfusion-smoke
+xfusion-smoke:
+	$(PY) scripts/train_fusion_xattn_fixed.py \
+		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_xattn_smoke \
+		--batch-size $(if $(filter $(XF_BATCH_SIZE),),$(XF_BATCH_SIZE),4) \
+		--epochs 1 --limit-train $(XF_SMOKE_LIMIT) --limit-val $(XF_SMOKE_LIMIT) --limit-test $(XF_SMOKE_LIMIT) \
+		--d-model $(XF_D_MODEL) --n-heads $(XF_N_HEADS) --n-layers 1 --ff-mult 2 --token-embed-dim $(XF_TOKEN_EMBED) $(if $(filter $(XF_AMP),1),--amp,) $(if $(filter $(XF_GRAD_CHECKPOINT),1),--grad-checkpoint,) \
+		$(if $(XF_ATTN_DROPOUT),--attn-dropout $(XF_ATTN_DROPOUT),) $(if $(XF_FF_DROPOUT),--ff-dropout $(XF_FF_DROPOUT),) $(if $(filter $(XF_REVERSIBLE),1),--reversible,) \
+		--record-diagnostics --diag-interval 50 --diag-dir artifacts/fusion_xattn_smoke/diagnostics \
 		$(if $(filter $(XF_NO_URL),1),--no-url,) \
 		$(if $(filter $(XF_NO_JS),1),--no-js,) \
 		$(if $(filter $(XF_NO_TEXT),1),--no-text,) \
@@ -458,3 +516,69 @@ phase4: train eval report train-js eval-js train-url-head eval-url-head train-js
 # Phase 8: Cross-attention + robustness (HTML/JS canonicalization)
 .PHONY: phase8
 phase8: phase4 $(if $(filter $(AUGMENT_JS),1),phase6,) train-xfusion cascade report report-xai
+
+# --- New unified orchestration targets (attention entropy, meta fusion, comprehensive report) ---
+.PHONY: train-heads eval-heads fuse-coverage meta-fuse-all xfusion-diag report-full full-e2e
+
+train-heads: train-url-head train-js-head train-dom-gcn train-text-head train-cheap-mlp
+
+eval-heads: eval-url-head eval-js-head eval-dom-gcn eval-text-head eval-cheap-mlp
+
+# Coverage-max fusion (reuses existing target fuse-all-coverage)
+fuse-coverage: fuse-all-coverage
+
+# Meta fusion stacked on coverage fusion
+meta-fuse-all: fuse-meta meta-fuse-search
+
+# Cross-attention with diagnostics (attention entropy trend + alerts)
+xfusion-diag: train-xfusion-diag
+
+# Comprehensive HTML report including heads, meta fusion, cascade, and XFusion diagnostics
+report-full:
+	@mkdir -p $(REPORT_OUT)
+	$(PY) scripts/report_eval.py \
+		--out-dir $(REPORT_OUT) \
+		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-diag artifacts/fusion_xattn/diagnostics/diagnostics.json,) \
+		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-dir artifacts/fusion_xattn,) \
+		--heads-dirs artifacts/url_head artifacts/text_head artifacts/js_charcnn artifacts/dom_gcn artifacts/cheap_mlp $(if $(filter $(ENABLE_CODET5P),1),artifacts/js_codet5p,) \
+		--meta-dir artifacts/fusion_meta \
+		--cascade-dir artifacts/cascade || (echo "[MAKE][ERROR] report failed" && exit 4)
+	@echo "[MAKE] Report generated at $(REPORT_OUT)/index.html"
+
+# Extended XAI + versioned splits aware report
+.PHONY: report-extended-xai
+report-extended-xai:
+	@mkdir -p $(REPORT_OUT)
+	$(PY) scripts/report_eval.py \
+		--out-dir $(REPORT_OUT) \
+		--model-dir artifacts/markup_run \
+		--train-jsonl data/pages_train.jsonl --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--full-jsonl data/pages.jsonl \
+		--meta-fusion-dir artifacts/fusion_meta \
+		--fusion-dir artifacts/fusion \
+		--splits-version $(SPLITS_VERSION_FILE) \
+		$(if $(filter $(USE_XFUSION),1),--xfusion-diag $(XF_DIAG_DIR)/diagnostics.json,) \
+		$(if $(filter $(USE_XFUSION),1),--xfusion-dir artifacts/fusion_xattn,) \
+		--heads-dirs $(HEADS_DIRS) \
+		--cascade-dir artifacts/cascade \
+		--device $(XAI_DEVICE) --eval-batch 4 \
+		--lime --shap --num-expl 1 \
+		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3 || (echo "[MAKE][ERROR] extended report failed" && exit 4)
+	@echo "[MAKE] Extended report at $(REPORT_OUT)/index.html"
+
+# Full pipeline after data prepared & splits (does NOT crawl). Adjust sequence as needed.
+full-e2e: splits slice train-heads eval-heads fuse-coverage meta-fuse-all xfusion-diag cascade report-full
+	@echo "[MAKE] Full E2E (with attention entropy diagnostics) complete."
+
+# Convenience alias
+.PHONY: all-full
+all-full: full-e2e
+
+# Ultra pipeline mirroring manual multi-command sequence (heads + augmentation + diagnostics fusion + coverage/meta + meta search + extended XAI report)
+.PHONY: e2e-ultra
+e2e-ultra: ensure-crawled-count extend-splits-if-needed splits slice train-url-head train-js-head train-dom-gcn train-text-head train-cheap-mlp \
+	eval-url-head eval-js-head eval-dom-gcn eval-text-head eval-cheap-mlp \
+	$(if $(filter $(AUGMENT_JS),1),augment-js train-js-head-aug eval-js-head-aug,) \
+	fuse-all-coverage fuse-meta meta-fuse-search train-xfusion-diag cascade report-extended-xai
+	@echo "[MAKE] e2e-ultra pipeline complete (diag interval=$(DIAG_INTERVAL), splits tag=$(SPLITS_VERSION_TAG))"

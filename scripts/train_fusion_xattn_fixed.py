@@ -5,7 +5,6 @@ import json
 import os
 from typing import List, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -14,6 +13,7 @@ from phisdom.data.multimodal import MultiModalDataset, MultiModalCollator
 from phisdom.models.fusion import CrossModalTransformerFusion
 from phisdom.models.calibration import fit_temperature, TemperatureScaler
 from phisdom.metrics import pr_auc, roc_auc, fpr_at_tpr
+import hashlib
 
 
 
@@ -154,6 +154,22 @@ def main():
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--weight-decay", type=float, default=1e-4)
     ap.add_argument("--seed", type=int, default=42)
+    # Model architecture overrides
+    ap.add_argument("--d-model", type=int, default=128)
+    ap.add_argument("--n-heads", type=int, default=4)
+    ap.add_argument("--n-layers", type=int, default=2)
+    ap.add_argument("--ff-mult", type=int, default=4, help="Feedforward expansion multiplier")
+    ap.add_argument("--token-embed-dim", type=int, default=48)
+    ap.add_argument("--attn-dropout", type=float, default=None, help="Override attention dropout (default inherits --dropout or model default)")
+    ap.add_argument("--ff-dropout", type=float, default=None, help="Override feed-forward dropout (default inherits --dropout or model default)")
+    ap.add_argument("--reversible", action="store_true", help="Use reversible residual blocks (halves internal dim per partition, skips attn entropy capture)")
+    # Memory / performance
+    ap.add_argument("--amp", action="store_true", help="Enable mixed precision training (AMP)")
+    ap.add_argument("--grad-checkpoint", action="store_true", help="Enable gradient checkpointing for encoder layers (disables attn entropy capture per-layer)")
+    # Dataset limiting (smoke runs)
+    ap.add_argument("--limit-train", type=int, default=None)
+    ap.add_argument("--limit-val", type=int, default=None)
+    ap.add_argument("--limit-test", type=int, default=None)
     # modality toggles
     ap.add_argument("--no-url", action="store_true")
     ap.add_argument("--no-js", action="store_true")
@@ -174,6 +190,9 @@ def main():
     ap.add_argument("--diag-interval", type=int, default=100, help="Steps between gradient norm snapshots")
     ap.add_argument("--no-corr", action="store_true", help="Disable modality embedding correlation matrix computation")
     ap.add_argument("--diag-dir", default=None, help="Output directory for diagnostics (default: out-dir/diagnostics)")
+    ap.add_argument("--log-hist-every", type=int, default=1, help="Epoch frequency for logits histogram (val)")
+    ap.add_argument("--freeze-encoders", action="store_true", help="Freeze unimodal encoders to test head-only training")
+    ap.add_argument("--encoder-lr", type=float, default=None, help="Optional separate LR for encoder submodules")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -218,9 +237,6 @@ def main():
     )
     coll = MultiModalCollator()
     dl_kwargs = dict(num_workers=int(args.num_workers), pin_memory=bool(args.pin_memory), persistent_workers=bool(args.persistent_workers) and int(args.num_workers) > 0)
-    tr_dl = DataLoader(tr_ds, batch_size=args.batch_size, shuffle=True, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
-    va_dl = DataLoader(va_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
-    te_dl = DataLoader(te_ds, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
 
     # Infer cheap feature dimension safely without consuming a training batch
     cheap_dim = None
@@ -244,28 +260,79 @@ def main():
             print(f"Warning: Could not detect cheap feature dimension, using lazy adaptation: {e}")
             cheap_dim = None  # Let LazyLinear handle it
     
-    # Create model with detected or adaptive cheap dimension
+    # Optionally slice datasets for smoke / memory debugging
+    from torch.utils.data import Subset
+    import numpy as _np
+    rng = _np.random.default_rng(args.seed)
+    def maybe_subset(ds, limit):
+        if limit is not None and limit > 0 and len(ds) > limit:
+            idx = rng.choice(len(ds), size=limit, replace=False)
+            return Subset(ds, sorted(idx.tolist()))
+        return ds
+    tr_ds_l = maybe_subset(tr_ds, args.limit_train)
+    va_ds_l = maybe_subset(va_ds, args.limit_val)
+    te_ds_l = maybe_subset(te_ds, args.limit_test)
+    tr_dl = DataLoader(tr_ds_l, batch_size=args.batch_size, shuffle=True, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
+    va_dl = DataLoader(va_ds_l, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
+    te_dl = DataLoader(te_ds_l, batch_size=args.batch_size, shuffle=False, collate_fn=coll, **dl_kwargs)  # type: ignore[arg-type]
+
+    # Create model with detected or adaptive cheap dimension & custom hyperparams
     model = CrossModalTransformerFusion(
-        d_model=128,
-        n_heads=4, 
-        n_layers=2,
+        d_model=int(args.d_model),
+        n_heads=int(args.n_heads), 
+        n_layers=int(args.n_layers),
         dropout=0.1,
+    attn_dropout=args.attn_dropout,
+    ff_dropout=args.ff_dropout,
+    reversible=bool(args.reversible),
         use_url=not args.no_url,
         use_js=not args.no_js,
         use_text=not args.no_text,
         use_dom=not args.no_dom,
         use_cheap=not args.no_cheap,
-    cheap_dim=cheap_dim,  # None for lazy adaptation, int for fixed size
-    record_diagnostics=bool(args.record_diagnostics),
+        cheap_dim=cheap_dim,  # None for lazy adaptation, int for fixed size
+        token_vocab_size=512,
+        token_embed_dim=int(args.token_embed_dim),
+        ff_mult=int(args.ff_mult),
+        grad_checkpoint=bool(args.grad_checkpoint),
+        record_diagnostics=bool(args.record_diagnostics),
     ).to(device)
     
+    # Optionally freeze encoder blocks
+    if args.freeze_encoders:
+        frozen = 0
+        for name, p in model.named_parameters():
+            if any(k in name for k in ["url_encoder","js_encoder","text_encoder","dom_encoder","cheap_proj"]):
+                p.requires_grad = False
+                frozen += 1
+        print(f"[XF][INFO] Froze {frozen} encoder parameters")
+
+    # Build optimizer parameter groups (encoder vs fusion/head)
+    if args.encoder_lr is not None:
+        enc_params = []
+        other_params = []
+        for name, p in model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if any(k in name for k in ["url_encoder","js_encoder","text_encoder","dom_encoder","cheap_proj"]):
+                enc_params.append(p)
+            else:
+                other_params.append(p)
+        param_groups = [
+            {"params": other_params, "lr": args.lr},
+            {"params": enc_params, "lr": args.encoder_lr},
+        ]
+        print(f"[XF][INFO] Optimizer groups: other={len(other_params)} params @ {args.lr}, enc={len(enc_params)} params @ {args.encoder_lr}")
+    else:
+        param_groups = model.parameters()
+
     # Enhanced optimizer with numerical stability
     opt = torch.optim.AdamW(
-        model.parameters(), 
-        lr=args.lr, 
+        param_groups,
+        lr=args.lr,
         weight_decay=args.weight_decay,
-        eps=1e-8,  # Larger epsilon for stability
-        amsgrad=True  # More stable variant
+        eps=1e-8,
+        amsgrad=True
     )
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(tr_dl) * args.epochs))
 
@@ -291,6 +358,9 @@ def main():
     model_saved = False  # Track if we ever saved a model
     grad_snapshots: List[dict] = []
     step_counter = 0
+    lr_history: List[float] = []
+    # Attention entropy snapshots (list of {step, layer_means:[...], raw:[layer dicts]})
+    attn_entropy_snapshots: List[dict] = []
 
     def maybe_record_gradients(step: int):
         if not args.record_diagnostics:
@@ -311,6 +381,33 @@ def main():
                     }
         grad_snapshots.append(snap)
 
+    def _dump_logits_hist(epoch:int, logits: torch.Tensor, split: str, diag_dir: str):
+        if not args.record_diagnostics:
+            return
+        if epoch % max(1, args.log_hist_every) != 0:
+            return
+        if not logits.numel():
+            return
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+            arr = logits.detach().cpu().float().numpy()
+            import numpy as _np
+            plt.figure(figsize=(4,3))
+            plt.hist(arr, bins=60, color='teal', alpha=0.85)
+            plt.title(f"Logits {split} ep{epoch}")
+            plt.xlabel('logit')
+            plt.ylabel('count')
+            os.makedirs(diag_dir, exist_ok=True)
+            plt.tight_layout()
+            plt.savefig(os.path.join(diag_dir, f"logits_{split}_ep{epoch}.png"))
+            plt.close()
+        except Exception as e:
+            print(f"[XF][WARN] Failed to write logits histogram: {e}")
+
+    scaler = torch.cuda.amp.GradScaler(enabled=bool(args.amp) and torch.cuda.is_available())
+
     for ep in range(args.epochs):
         model.train()
         crit = nn.BCEWithLogitsLoss()
@@ -321,15 +418,23 @@ def main():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
             opt.zero_grad(set_to_none=True)
-            logits = model(batch).squeeze(-1)
+            if args.amp:
+                with torch.cuda.amp.autocast(enabled=True):
+                    logits = model(batch).squeeze(-1)
+                    loss = crit(logits, labels)
+            else:
+                logits = model(batch).squeeze(-1)
+                loss = crit(logits, labels)
             if torch.isnan(logits).any() or torch.isinf(logits).any():
                 print(f"[XF][WARN] NaN/Inf logits batch {batch_idx} – skipped")
                 continue
-            loss = crit(logits, labels)
             if torch.isnan(loss) or torch.isinf(loss):
                 print(f"[XF][WARN] NaN/Inf loss batch {batch_idx} – skipped")
                 continue
-            loss.backward()
+            if args.amp:
+                scaler.scale(loss).backward()
+            else:
+                loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             bad = False
             for p in model.parameters():
@@ -339,13 +444,40 @@ def main():
             if bad:
                 print(f"[XF][WARN] NaN/Inf gradient batch {batch_idx} – zeroed")
                 continue
-            opt.step()
+            if args.amp:
+                scaler.step(opt)
+                scaler.update()
+            else:
+                opt.step()
             if sched is not None:
                 sched.step()
             step_counter += 1
             maybe_record_gradients(step_counter)
+            # Record attention entropy snapshot at same diagnostic cadence
+            if args.record_diagnostics and args.diag_interval > 0 and step_counter % args.diag_interval == 0:
+                attn = getattr(model, "_last_attn_entropies", None)
+                if isinstance(attn, list) and attn:
+                    try:
+                        layer_means = [float(a.get("mean_entropy", float('nan'))) if isinstance(a, dict) and 'mean_entropy' in a else float('nan') for a in attn]
+                        attn_entropy_snapshots.append({
+                            "step": step_counter,
+                            "layer_means": layer_means,
+                            "raw": attn,
+                        })
+                        # Cap snapshots to avoid huge JSON (keep last 100)
+                        if len(attn_entropy_snapshots) > 100:
+                            attn_entropy_snapshots.pop(0)
+                    except Exception:
+                        pass
         ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
+        # LR tracking (take first param group as representative)
+        try:
+            current_lr = opt.param_groups[0]['lr']
+            lr_history.append(float(current_lr))
+        except Exception:
+            pass
         val_loss = float(bcel(logits_v, labels_v.float()).item()) if logits_v.numel() else float("inf")
+        _dump_logits_hist(ep, logits_v, 'val', args.diag_dir or os.path.join(args.out_dir, 'diagnostics'))
         if val_loss + 1e-6 < best_val:
             best_val = val_loss
             bad = 0
@@ -362,8 +494,10 @@ def main():
         torch.save(model.state_dict(), os.path.join(args.out_dir, "model.pt"))
 
     model.load_state_dict(torch.load(os.path.join(args.out_dir, "model.pt"), map_location=device))
-    ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
-    ids_t, logits_t, labels_t = eval_logits(model, te_dl, device)
+    # Evaluation with AMP autocast (no grad)
+    with torch.cuda.amp.autocast(enabled=bool(args.amp) and torch.cuda.is_available()):
+        ids_v, logits_v, labels_v = eval_logits(model, va_dl, device)
+        ids_t, logits_t, labels_t = eval_logits(model, te_dl, device)
 
     # Fit temp scaling
     if logits_v.numel():
@@ -407,9 +541,78 @@ def main():
     if args.record_diagnostics:
         diag_dir = args.diag_dir or os.path.join(args.out_dir, "diagnostics")
         os.makedirs(diag_dir, exist_ok=True)
-        diag: dict = {"grad_snapshots": grad_snapshots, "total_steps": step_counter}
+        # Alignment checksum (sorted ids across splits) to detect leakage / misalignment
+        def checksum(ids: List[str]) -> str:
+            h = hashlib.sha1()
+            for i in sorted(ids):
+                h.update(str(i).encode('utf-8'))
+            return h.hexdigest()
+        align = {
+            "val_ids_sha1": checksum(ids_v),
+            "test_ids_sha1": checksum(ids_t),
+            "val_count": len(ids_v),
+            "test_count": len(ids_t),
+        }
+        diag: dict = {
+            "grad_snapshots": grad_snapshots,
+            "total_steps": step_counter,
+            "lr_history": lr_history,
+            "alignment": align,
+        }
         if getattr(model, "_last_stream_stats", None):
             diag["last_stream_stats"] = model._last_stream_stats  # type: ignore
+        if getattr(model, "_last_pooled_stats", None):
+            diag["pooled_stats"] = model._last_pooled_stats  # type: ignore
+        if getattr(model, "_last_attn_entropies", None):
+            diag["attn_entropy"] = model._last_attn_entropies  # type: ignore
+        # Add entropy trend & alerts
+        if attn_entropy_snapshots:
+            try:
+                steps_series = [s["step"] for s in attn_entropy_snapshots]
+                layer_matrix = [s["layer_means"] for s in attn_entropy_snapshots]
+                # Transpose to plot per-layer
+                import math
+                import matplotlib
+                matplotlib.use('Agg')
+                import matplotlib.pyplot as plt
+                import numpy as np
+                arr = np.array(layer_matrix, dtype=float)  # shape (snapshots, layers)
+                plt.figure(figsize=(5,3.2))
+                for li in range(arr.shape[1]):
+                    plt.plot(steps_series, arr[:, li], label=f"L{li}")
+                plt.xlabel('Step')
+                plt.ylabel('Mean Attention Entropy (nats)')
+                plt.title('Attention Entropy Trend')
+                if arr.shape[1] <= 8:
+                    plt.legend(ncol=2, fontsize=8)
+                plt.tight_layout()
+                trend_path = os.path.join(diag_dir, 'attn_entropy_trend.png')
+                plt.savefig(trend_path, dpi=140)
+                plt.close()
+                # Alerts: collapse (<0.5) or saturation (>0.95*log(T)) at final snapshot
+                final_raw = attn_entropy_snapshots[-1].get('raw', [])
+                alerts: List[str] = []
+                for entry in final_raw:
+                    if not isinstance(entry, dict) or 'mean_entropy' not in entry:
+                        continue
+                    mean_e = float(entry.get('mean_entropy', float('nan')))
+                    T = int(entry.get('T', 0) or 0)
+                    if T > 1:
+                        max_uniform = math.log(T)
+                        if mean_e < 0.5:
+                            alerts.append(f"layer {entry.get('layer')} entropy low {mean_e:.3f} (<0.5) -> possible collapse")
+                        if mean_e > 0.95 * max_uniform:
+                            alerts.append(f"layer {entry.get('layer')} entropy high {mean_e:.3f} (~uniform) -> possible saturation (max {max_uniform:.2f})")
+                diag['attn_entropy_trend'] = {
+                    'steps': steps_series,
+                    'layer_means': layer_matrix,
+                    'collapse_bits_threshold': 0.5,
+                    'saturation_fraction_threshold': 0.95,
+                }
+                if alerts:
+                    diag['attn_entropy_alerts'] = alerts
+            except Exception as e:  # pragma: no cover
+                print(f"[XF][WARN] Failed entropy trend plotting: {e}")
         if getattr(model, "_last_corr", None) is not None and not args.no_corr:
             corr = model._last_corr.cpu().numpy().tolist()  # type: ignore
             diag["last_corr"] = {

@@ -15,7 +15,7 @@ from phisdom.models.heads import DomGCN
 from phisdom.models.calibration import fit_temperature
 
 
-def train_one_epoch(model, loader, opt, sched, device, crit, log_grad_norm: bool = False, feat_var_tracker: Dict[str, Any] | None = None):
+def train_one_epoch(model, loader, opt, sched, device, crit, log_grad_norm: bool = False, feat_var_tracker: Dict[str, Any] | None = None, diag_interval: int = 0, grad_snapshots: List[float] | None = None):
     """Train one epoch; optionally accumulate feature variance statistics & grad norms.
 
     feat_var_tracker structure (mutated in place):
@@ -31,7 +31,7 @@ def train_one_epoch(model, loader, opt, sched, device, crit, log_grad_norm: bool
     n = 0
     grad_norms: List[float] = [] if log_grad_norm else []
 
-    for batch in loader:
+    for b_idx, batch in enumerate(loader):
         x_nodes = batch["node_feats_raw"].to(device)
         x_edges = batch["edge_index"].to(device)
         x_bidx = batch["batch_index"].to(device)
@@ -74,7 +74,10 @@ def train_one_epoch(model, loader, opt, sched, device, crit, log_grad_norm: bool
                 if p.grad is not None:
                     param_norm = p.grad.detach().data.norm(2).item()
                     total_norm += param_norm ** 2
-            grad_norms.append(total_norm ** 0.5)
+            gnorm = total_norm ** 0.5
+            grad_norms.append(gnorm)
+            if diag_interval > 0 and (b_idx % diag_interval == 0) and grad_snapshots is not None:
+                grad_snapshots.append(float(gnorm))
 
         opt.step()
         if sched is not None:
@@ -122,6 +125,10 @@ def main():
     ap.add_argument("--log-hist-every", type=int, default=1, help="Epoch frequency for logits histogram logging (requires matplotlib)")
     ap.add_argument("--no-grad-norm", action="store_true", help="Disable gradient norm tracking")
     ap.add_argument("--no-feature-var", action="store_true", help="Disable node feature variance tracking")
+    ap.add_argument("--loss", choices=["bce","focal"], default="bce", help="Loss function: standard BCE or focal")
+    ap.add_argument("--focal-gamma", type=float, default=2.0, help="Focal loss gamma")
+    ap.add_argument("--focal-alpha", type=float, default=None, help="Optional focal alpha (if not set and class imbalance, auto compute pos fraction)")
+    ap.add_argument("--diag-interval", type=int, default=100, help="Batch interval for lightweight diagnostics (gradient norm snapshot)")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -159,11 +166,38 @@ def main():
         else:
             print("Warning: No positive samples found for auto pos_weight computation")
 
-    if pos_weight_tensor is not None:
-        print(f"Using pos_weight={pos_weight_tensor.item():.4f}")
-        crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+    # Loss selection (BCE or Focal)
+    if args.loss == "bce":
+        if pos_weight_tensor is not None:
+            print(f"Using pos_weight={pos_weight_tensor.item():.4f}")
+            crit = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+        else:
+            crit = nn.BCEWithLogitsLoss()
     else:
-        crit = nn.BCEWithLogitsLoss()
+        # Focal loss implementation (binary)
+        gamma = float(args.focal_gamma)
+        if args.focal_alpha is not None:
+            alpha = float(args.focal_alpha)
+        else:
+            # Auto alpha = positive class fraction if auto-pos-weight or dataset stats available
+            pos = 0
+            neg = 0
+            for item in tr_ds:
+                y = int(item['label']) if 'label' in item else int(item.get('labels', 0))
+                if y == 1: pos += 1
+                else: neg += 1
+            totalYN = pos + neg
+            alpha = (pos / totalYN) if totalYN > 0 else 0.5
+        print(f"Using Focal Loss (gamma={gamma}, alpha={alpha:.4f})")
+        def focal_loss(logits, targets):
+            # targets float {0,1}
+            bce = nn.functional.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+            p = torch.sigmoid(logits)
+            pt = p * targets + (1 - p) * (1 - targets)
+            alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+            loss = alpha_t * (1 - pt).pow(gamma) * bce
+            return loss.mean()
+        crit = focal_loss
 
     # Diagnostics setup
     diagnostics_dir = args.diagnostics_dir or os.path.join(args.output_dir, "diagnostics")
@@ -196,6 +230,7 @@ def main():
     patience = 3
     bad = 0
     bcel = crit  # For consistency later
+    grad_snapshots: List[float] = []
     for ep in range(args.epochs):
         tr_loss, grad_norm = train_one_epoch(
             model,
@@ -206,6 +241,8 @@ def main():
             crit,
             log_grad_norm=not args.no_grad_norm,
             feat_var_tracker=feat_var_tracker,
+            diag_interval=args.diag_interval,
+            grad_snapshots=grad_snapshots,
         )
         logits, labels = eval_logits(model, va_dl, device)
         val_loss = float(bcel(logits, labels.float()).item()) if logits.numel() else float("inf")
@@ -225,7 +262,7 @@ def main():
 
     # Persist diagnostics summary
     try:
-        diag: Dict[str, Any] = {"history": history}
+        diag: Dict[str, Any] = {"history": history, "grad_snapshots": grad_snapshots[:200]}  # cap size
         if feat_var_tracker is not None and feat_var_tracker["count"] > 1:
             var = feat_var_tracker["M2"] / (feat_var_tracker["count"] - 1)
             diag["feature_mean"] = feat_var_tracker["mean"].detach().cpu().tolist()
