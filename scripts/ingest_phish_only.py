@@ -14,7 +14,7 @@ Assumptions:
 """
 from __future__ import annotations
 import argparse, json, os, sys, hashlib
-from typing import Iterable, Dict, Any
+from typing import Iterable, Dict, Any, Tuple
 
 
 def iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
@@ -28,8 +28,29 @@ def iter_jsonl(path: str) -> Iterable[Dict[str, Any]]:
             except Exception:
                 continue
 
-def build_key(obj: Dict[str, Any]) -> str:
-    # Prefer canonicalized final URL if present; fall back to initial url.
+def build_key(obj: Dict[str, Any], strategy: str) -> str:
+    """Return dedupe key based on strategy.
+
+    strategies:
+      final (default): use url_final if present else url
+      raw: use url field only
+      final+query: like final but preserves case & query (lowercased fully)
+      sha_full: SHA1 of the full JSON line (robust but slower)
+    """
+    if strategy == 'raw':
+        u = obj.get('url') or ''
+        return u.strip().lower()
+    if strategy == 'final+query':
+        u = obj.get('url_final') or obj.get('url') or ''
+        return u.strip().lower()
+    if strategy == 'sha_full':
+        h = hashlib.sha1()
+        try:
+            h.update(json.dumps(obj, sort_keys=True, ensure_ascii=False).encode('utf-8'))
+            return h.hexdigest()
+        except Exception:
+            return ''
+    # default 'final'
     u = obj.get('url_final') or obj.get('url') or ''
     return u.strip().lower()
 
@@ -39,6 +60,7 @@ def main():
     ap.add_argument('--dataset', default='data/pages.jsonl')
     ap.add_argument('--phish-only', default='data/pages_phish_only.jsonl')
     ap.add_argument('--marker', default='data/.phish_only_ingested.json', help='Metadata marker file to speed up re-runs')
+    ap.add_argument('--dedupe-strategy', default='final', choices=['final','raw','final+query','sha_full'], help='Key strategy for duplicate detection')
     args = ap.parse_args()
 
     if not os.path.exists(args.phish_only):
@@ -51,26 +73,39 @@ def main():
     # Load existing URLs
     existing = set()
     for obj in iter_jsonl(args.dataset):
-        existing.add(build_key(obj))
-    print(f'[INGEST] Existing master records: {len(existing)}')
+        existing.add(build_key(obj, args.dedupe_strategy))
+    print(f'[INGEST] Existing master unique keys ({args.dedupe_strategy}): {len(existing)}')
 
     added = 0
+    skipped_existing = 0
+    skipped_blank = 0
+    total_rows = 0
     kept_hash = hashlib.sha1()
     with open(args.dataset, 'a', encoding='utf-8') as fout:
         for obj in iter_jsonl(args.phish_only):
-            k = build_key(obj)
-            if not k or k in existing:
+            total_rows += 1
+            k = build_key(obj, args.dedupe_strategy)
+            if not k:
+                skipped_blank += 1
+                continue
+            if k in existing:
+                skipped_existing += 1
                 continue
             existing.add(k)
             fout.write(json.dumps(obj, ensure_ascii=False) + '\n')
             added += 1
             kept_hash.update(k.encode('utf-8'))
-    print(f'[INGEST] Added new phish-only rows: {added}')
+    print(f'[INGEST] Phish-only rows scanned: {total_rows}')
+    print(f'[INGEST] Added: {added} | Skipped(existing): {skipped_existing} | Skipped(blank-key): {skipped_blank}')
 
     meta = {
         'phish_only_path': os.path.abspath(args.phish_only),
         'dataset_path': os.path.abspath(args.dataset),
         'added': added,
+        'scanned': total_rows,
+        'skipped_existing': skipped_existing,
+        'skipped_blank': skipped_blank,
+        'dedupe_strategy': args.dedupe_strategy,
     }
     os.makedirs(os.path.dirname(args.marker), exist_ok=True)
     with open(args.marker, 'w', encoding='utf-8') as f:

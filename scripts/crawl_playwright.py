@@ -1140,7 +1140,9 @@ async def worker(worker_id: int, queue: asyncio.Queue, out_path: str, write_lock
                  context, setup_context_fn, capture_external_js: bool, retries: int, base_timeout_s: float,
                  tls_timeout: float, dns_timeout: float, do_mobile_profile: bool,
                  inflight: Dict[int, Tuple[str, float]], stats: Dict[str, int],
-                 per_url_cap_s: float):
+                 per_url_cap_s: float,
+                 blocked_etld1: set[str], circuit_counts: Dict[str, int], circuit_lock: asyncio.Lock,
+                 adaptive_block_after: int):
     """Worker that enforces a hard per-URL cap across retries and records progress."""
     while True:
         item = await queue.get()
@@ -1148,6 +1150,18 @@ async def worker(worker_id: int, queue: asyncio.Queue, out_path: str, write_lock
             queue.task_done()
             break
         url, label, source, timeout_s = item  # timeout_s retained for first attempt compatibility
+        # Early skip if domain already circuit-blocked
+        try:
+            ext = tldextract.extract(url)
+            etld1 = ".".join([p for p in [ext.domain, ext.suffix] if p])
+        except Exception:
+            etld1 = None
+        if etld1 and etld1 in blocked_etld1:
+            async with write_lock:
+                stats["done"] += 1
+                stats["skip"] += 1
+            queue.task_done()
+            continue
         last_err: Optional[str] = None
         start = time.monotonic()
         inflight[worker_id] = (url, start)
@@ -1241,6 +1255,15 @@ async def worker(worker_id: int, queue: asyncio.Queue, out_path: str, write_lock
                 stats["done"] += 1
                 stats[outcome] += 1
             inflight.pop(worker_id, None)
+            # Adaptive circuit breaker: count timeout/cap events and block noisy eTLD+1
+            if adaptive_block_after > 0 and last_err and ("hard timeout" in last_err or "per-url cap" in last_err):
+                if etld1:
+                    async with circuit_lock:
+                        circuit_counts[etld1] = circuit_counts.get(etld1, 0) + 1
+                        c = circuit_counts[etld1]
+                        if c >= adaptive_block_after and etld1 not in blocked_etld1:
+                            blocked_etld1.add(etld1)
+                            print(f"[CIRCUIT] auto-blocking {etld1} after {c} timeouts", flush=True)
             queue.task_done()
 
 
@@ -1267,7 +1290,9 @@ def _load_existing_urls(path: str) -> set[str]:
 
 async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: float, block_assets: bool,
                 capture_external_js: bool, retries: int, resume: bool, tls_timeout: float, dns_timeout: float,
-                mobile_profile: bool, use_gpu: bool, per_url_cap_s: float = 45.0, progress_interval_s: float = 10.0):
+                mobile_profile: bool, use_gpu: bool, per_url_cap_s: float = 45.0, progress_interval_s: float = 10.0,
+                skip_numeric_sld_min_digits: int = 0, skip_numeric_allow: str = "", skip_suffix: str = "",
+                adaptive_block_after: int = 0):
     """Crawl entry point with per-URL cap and live progress monitoring."""
     queue: asyncio.Queue = asyncio.Queue()
 
@@ -1281,6 +1306,10 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
 
     total_enq = 0
     skipped_pre = 0
+    skipped_pattern = 0
+    allow_numeric = {s for s in (skip_numeric_allow.split(",") if skip_numeric_allow else []) if s}
+    suffixes = {s for s in (skip_suffix.split(",") if skip_suffix else []) if s}
+    numeric_re = re.compile(r"^[0-9]+$") if skip_numeric_sld_min_digits > 0 else None
     with open(input_csv, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -1290,10 +1319,28 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
             if existing and url in existing:
                 skipped_pre += 1
                 continue
+            # Pattern-based skipping
+            do_skip = False
+            if numeric_re is not None or suffixes:
+                try:
+                    ext = tldextract.extract(url)
+                    sld = ext.domain or ""
+                except Exception:
+                    sld = ""
+                if sld:
+                    if numeric_re is not None and numeric_re.match(sld) and sld not in allow_numeric and len(sld) >= skip_numeric_sld_min_digits:
+                        do_skip = True
+                    if not do_skip and suffixes and any(sld.endswith(sf) for sf in suffixes):
+                        do_skip = True
+            if do_skip:
+                skipped_pattern += 1
+                continue
             queue.put_nowait((url, label, source, timeout_s))
             total_enq += 1
     if resume:
         print(f"[QUEUE] Enqueued {total_enq} URLs (skipped {skipped_pre} existing)", flush=True)
+    if skipped_pattern:
+        print(f"[SKIP] Prefilter skipped {skipped_pattern} URLs (numeric/suffix rules)", flush=True)
 
     if async_playwright is None:
         raise RuntimeError("playwright not installed. Install with `pip install playwright` and run `playwright install chromium`")
@@ -1391,9 +1438,14 @@ async def crawl(input_csv: str, out_jsonl: str, concurrency: int, timeout_s: flo
 
         monitor_task = asyncio.create_task(monitor())
 
+        # Circuit breaker shared data
+        blocked_etld1: set[str] = set()
+        circuit_counts: Dict[str, int] = {}
+        circuit_lock = asyncio.Lock()
         workers = [asyncio.create_task(
             worker(i, queue, out_jsonl, write_lock, contexts[i], setup_context, capture_external_js, retries, timeout_s,
-                   tls_timeout, dns_timeout, mobile_profile, inflight, stats, per_url_cap_s)
+                   tls_timeout, dns_timeout, mobile_profile, inflight, stats, per_url_cap_s,
+                   blocked_etld1, circuit_counts, circuit_lock, adaptive_block_after)
         ) for i in range(concurrency)]
 
         try:
@@ -1434,6 +1486,11 @@ def main():
         parser.add_argument("--resume", action=bool_action, default=True, help="Skip URLs already present in out-jsonl (default: True)")
     else:
         parser.add_argument("--resume", action="store_true", help="Skip URLs already present in out-jsonl")
+    # Numeric / pattern skipping + adaptive blocking
+    parser.add_argument("--skip-numeric-sld-min-digits", type=int, default=8, help="Skip SLDs that are all digits and at least this many digits (0 disables)")
+    parser.add_argument("--skip-numeric-allow", type=str, default="360,163,12306", help="Comma list of numeric SLD tokens to always allow")
+    parser.add_argument("--skip-suffix", type=str, default="", help="Comma list of SLD suffixes to skip (e.g., -cdn,-cache)")
+    parser.add_argument("--adaptive-block-after", type=int, default=3, help="Auto-block eTLD+1 after this many timeout/cap events (0 disables)")
     args = parser.parse_args()
     # Fail fast if Playwright is not installed to avoid silent hangs
     if async_playwright is None:
@@ -1453,6 +1510,10 @@ def main():
         dns_timeout=float(args.dns_timeout),
         mobile_profile=bool(getattr(args, "mobile_profile", False)),
         use_gpu=bool(getattr(args, "gpu", False)),
+        skip_numeric_sld_min_digits=int(getattr(args, "skip_numeric_sld_min_digits", 0)),
+        skip_numeric_allow=str(getattr(args, "skip_numeric_allow", "")),
+        skip_suffix=str(getattr(args, "skip_suffix", "")),
+        adaptive_block_after=int(getattr(args, "adaptive_block_after", 0)),
     ))
 
 

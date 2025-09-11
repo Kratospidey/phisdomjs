@@ -404,6 +404,15 @@ def main():
     parser.add_argument("--output", default="data/pages.jsonl", help="Output file path")
     parser.add_argument("--per-url-cap-s", type=float, default=45.0, help="Hard wall per-URL total time budget across retries (default 45s)")
     parser.add_argument("--progress-interval-s", type=float, default=10.0, help="How often to print progress lines (seconds, default 10)")
+    # Pass-through crawler filtering / circuit-breaker flags
+    parser.add_argument("--skip-numeric-sld-min-digits", type=int, default=8,
+                        help="Skip SLDs composed only of digits with length >= this (0 disables)")
+    parser.add_argument("--skip-numeric-allow", type=str, default="360,163,12306",
+                        help="Comma list of numeric SLDs to always allow")
+    parser.add_argument("--skip-suffix", type=str, default="",
+                        help="Comma list of SLD suffixes to skip (e.g., -cdn,-cache)")
+    parser.add_argument("--adaptive-block-after", type=int, default=3,
+                        help="Auto-block eTLD+1 after this many timeout/cap events (0 disables)")
     args = parser.parse_args()
 
     if not 0 <= args.phish_ratio <= 1:
@@ -483,6 +492,10 @@ def main():
             use_gpu=False,
             per_url_cap_s=args.per_url_cap_s,
             progress_interval_s=args.progress_interval_s,
+            skip_numeric_sld_min_digits=args.skip_numeric_sld_min_digits,
+            skip_numeric_allow=args.skip_numeric_allow,
+            skip_suffix=args.skip_suffix,
+            adaptive_block_after=args.adaptive_block_after,
         ))
 
         if output_path.exists():

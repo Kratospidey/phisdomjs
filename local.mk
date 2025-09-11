@@ -32,11 +32,11 @@ SPLITS_VERSION_FILE=data/splits_v2.json
 # --- Composite sequence target replicating manual chain ---
 # Order preserved from user command:
 # ensure-crawled-count extend-splits-if-needed phase4 phase6 \
-# train-xfusion-diag cascade fuse-all-coverage fuse-meta meta-fuse-search report-xai
+# train-xfusion-diag fuse-all-coverage fuse-meta meta-fuse-search report-xai
 
 CUSTOM_SEQUENCE_TARGETS=ensure-crawled-count extend-splits-if-needed \
   phase4 phase6 \
-  $(if $(filter $(USE_XFUSION),1),train-xfusion-diag,) cascade \
+  $(if $(filter $(USE_XFUSION),1),train-xfusion-diag,) \
   fuse-all-coverage fuse-meta meta-fuse-search \
   report-extended-xai
 
