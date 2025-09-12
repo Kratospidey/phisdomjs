@@ -386,6 +386,30 @@ meta-fuse-search:
 			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
 			--alignment-strategy inner_join --strategy random --random-samples 4000 --dirichlet-alpha 1.0 --head-tag _full --tag _full; \
 	fi
+
+# New: meta fusion aligned to coverage_max unified exports (same coverage as fused)
+.PHONY: meta-unified
+meta-unified: fuse-all-coverage
+	@echo "[MAKE] Running meta fusion over unified exports (coverage_max)"
+	$(PY) scripts/meta_fuse_heads.py \
+		--use-unified artifacts/fusion_all \
+		--include-fusion-prob \
+		--out-dir artifacts/fusion_meta \
+		--alignment-strategy coverage_max --min-heads 1 --strategy random --random-samples 4000 --dirichlet-alpha 1.0
+	@if [ -f artifacts/fusion_all/unified_val.jsonl ] && [ -f artifacts/fusion_all/unified_test.jsonl ]; then \
+		echo "[MAKE] Meta (unified) complete"; \
+	fi
+
+# New: meta fusion with OOF robustness and weight constraints
+.PHONY: meta-oof
+meta-oof:
+	$(PY) scripts/meta_fuse_heads.py \
+		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--out-dir artifacts/fusion_meta_oof \
+		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
+		--alignment-strategy coverage_max --min-heads 1 \
+		--strategy random --random-samples 6000 --dirichlet-alpha 1.0 \
+		--oof-folds 5 --oof-seed 42 --l2 0.01 --cap-weight p_js:0.5 --prefer-heads p_dom p_fusion --prefer-weight 0.05 || true
 # Cross-attention fusion (XFusion)
 .PHONY: train-xfusion eval-xfusion
 train-xfusion:

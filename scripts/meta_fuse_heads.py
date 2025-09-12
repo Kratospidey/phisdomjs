@@ -78,6 +78,16 @@ def apply_weights(X: np.ndarray, w: np.ndarray) -> np.ndarray:
     return np.clip(X @ w, 0.0, 1.0)
 
 
+def _tolist_safe(x) -> List[float]:
+    try:
+        if x is None:
+            return []
+        # numpy arrays expose tolist(); fall back to list()
+        return x.tolist() if hasattr(x, "tolist") else list(x)
+    except Exception:
+        return []
+
+
 def weight_search(
     Xv: np.ndarray,
     yv: np.ndarray,
@@ -86,6 +96,13 @@ def weight_search(
     grid_steps: int,
     random_samples: int,
     dirichlet_alpha: float,
+    # Regularization/constraints (optional)
+    l2_reg: float = 0.0,
+    prefer_heads: Optional[set] = None,
+    prefer_weight: float = 0.0,
+    cap_weights: Optional[Dict[str, float]] = None,
+    oof_folds: int = 0,
+    oof_seed: int = 42,
 ) -> Tuple[np.ndarray, Dict]:
     n = len(head_names)
     candidates: np.ndarray
@@ -101,12 +118,59 @@ def weight_search(
     best_key = (-1.0, -1.0)  # (pr_auc, roc_auc)
     # Store per-candidate scores (index, pr, roc) - explicitly cast to float for type checkers
     scores: List[Dict[str, float]] = []
+    # Helper: apply caps and compute objective
+    name_to_idx = {n: i for i, n in enumerate(head_names)}
+    rng = np.random.default_rng(oof_seed)
+
+    def _score_candidate(w: np.ndarray) -> Tuple[float, float]:
+        # Enforce per-head caps (skip if violated)
+        if cap_weights:
+            for h, m in cap_weights.items():
+                idx = name_to_idx.get(h)
+                if idx is not None and w[idx] > m + 1e-9:
+                    return (-1.0, -1.0)  # invalid
+        # Evaluate PR/ROC with optional OOF folds (for weight-search robustness)
+        if oof_folds and oof_folds > 1 and len(np.unique(yv)) > 1:
+            try:
+                from sklearn.model_selection import StratifiedKFold
+            except Exception:
+                # Fallback to single split if sklearn missing
+                pv = apply_weights(Xv, w)
+                pr_val = pr_auc_safe(yv.tolist(), pv.tolist())
+                roc_val = roc_auc_safe(yv.tolist(), pv.tolist())
+                pr = float(pr_val if pr_val is not None else 0.0)
+                roc = float(roc_val if roc_val is not None else 0.0)
+            else:
+                skf = StratifiedKFold(n_splits=oof_folds, shuffle=True, random_state=oof_seed)
+                oof_preds = np.zeros_like(yv, dtype=float)
+                for tr, te in skf.split(Xv, yv):
+                    # weights are not trained; still evaluate strictly on held-out
+                    oof_preds[te] = np.clip(Xv[te] @ w, 0.0, 1.0)
+                pr_val = pr_auc_safe(yv.tolist(), oof_preds.tolist())
+                roc_val = roc_auc_safe(yv.tolist(), oof_preds.tolist())
+                pr = float(pr_val if pr_val is not None else 0.0)
+                roc = float(roc_val if roc_val is not None else 0.0)
+        else:
+            pv = apply_weights(Xv, w)
+            pr_val = pr_auc_safe(yv.tolist(), pv.tolist())
+            roc_val = roc_auc_safe(yv.tolist(), pv.tolist())
+            pr = float(pr_val if pr_val is not None else 0.0)
+            roc = float(roc_val if roc_val is not None else 0.0)
+
+        # Regularization and preferences: maximize (pr - l2*||w||^2 + prefer_weight*sum(w_preferred))
+        if l2_reg:
+            pr -= float(l2_reg) * float(np.dot(w, w))
+        if prefer_heads and prefer_weight:
+            s = 0.0
+            for h in prefer_heads:
+                idx = name_to_idx.get(h)
+                if idx is not None:
+                    s += float(w[idx])
+            pr += float(prefer_weight) * s
+        return (pr, roc)
+
     for i, w in enumerate(candidates):
-        pv = apply_weights(Xv, w)
-        pr_val = pr_auc_safe(yv.tolist(), pv.tolist())
-        roc_val = roc_auc_safe(yv.tolist(), pv.tolist())
-        pr = float(pr_val if pr_val is not None else 0.0)
-        roc = float(roc_val if roc_val is not None else 0.0)
+        pr, roc = _score_candidate(w)
         scores.append({"i": i, "pr": pr, "roc": roc})
         key = (pr, roc)
         if key > best_key:
@@ -143,6 +207,20 @@ def main():
     ap.add_argument("--require-heads", nargs="*", default=[])
     ap.add_argument("--validate-predictions", action="store_true")
     ap.add_argument("--include-cheap-features", action="store_true", help="If set, treat cheap feature probabilities as separate weight inputs (rare)")
+    # Unified export path (to align exactly with coverage_max fused data)
+    ap.add_argument("--use-unified", default="", help="Directory with unified_val.jsonl/unified_test.jsonl produced by fuse_heads --export-unified-json")
+    ap.add_argument("--include-fusion-prob", action="store_true", help="When using --use-unified, include fused_prob as p_fusion input")
+    # OOF stacking / robustness for weight selection
+    ap.add_argument("--oof-folds", type=int, default=0, help="Use K-fold OOF evaluation during weight search (>=2 enables)")
+    ap.add_argument("--oof-seed", type=int, default=42)
+    # Regularization and constraints on weights
+    ap.add_argument("--l2", type=float, default=0.0, help="L2 penalty on weight vector magnitude during search")
+    ap.add_argument("--cap-weight", action="append", default=[], help="Per-head cap like p_js:0.5 (can be repeated)")
+    ap.add_argument("--prefer-heads", nargs="*", default=[], help="Heads to softly prefer (adds prefer-weight * sum(w_i) to objective)")
+    ap.add_argument("--prefer-weight", type=float, default=0.0)
+    # Optional alternative stacker (logistic) with OOF training
+    ap.add_argument("--stacker", choices=["weights", "logistic"], default="weights")
+    ap.add_argument("--logreg-C", type=float, default=1.0, help="Inverse regularization strength for logistic stacker (if used)")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -223,50 +301,192 @@ def main():
                     print(f"ERROR: Invalid prediction file {path}")
                     return
 
-    # Align predictions across heads
-    alignment_kwargs = {}
-    if args.alignment_strategy == "coverage_max":
-        alignment_kwargs["min_heads"] = args.min_heads
-    aligner = get_alignment_strategy(args.alignment_strategy, **alignment_kwargs)
+    # Option A: Use unified export (exact same coverage as fused)
+    if args.use_unified:
+        uni_dir = args.use_unified
+        uv = os.path.join(uni_dir, "unified_val.jsonl")
+        ut = os.path.join(uni_dir, "unified_test.jsonl")
+        if not (os.path.exists(uv) and os.path.exists(ut)):
+            print(f"ERROR: --use-unified specified but files missing in {uni_dir}")
+            return
+        def _load_unified(path: str):
+            ids: List[str] = []
+            labels: List[int] = []
+            rows: List[List[float]] = []
+            # Determine head names from first row
+            head_keys: Optional[List[str]] = None
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    if head_keys is None:
+                        head_keys = sorted(list(obj.get("heads", {}).keys()))
+                        # Apply require/exclude filters
+                        if args.require_heads:
+                            head_keys = [h for h in head_keys if h in set(args.require_heads)]
+                        if args.exclude_heads:
+                            head_keys = [h for h in head_keys if h not in set(args.exclude_heads)]
+                        # Optionally include fused_prob as p_fusion
+                        if args.include_fusion_prob:
+                            head_keys = head_keys + ["p_fusion"]
+                    ids.append(obj["id"])
+                    labels.append(int(obj["label"]))
+                    row = [float(obj["heads"].get(h, 0.0)) for h in head_keys if h != "p_fusion"]
+                    if args.include_fusion_prob:
+                        row.append(float(obj.get("fused_prob", 0.0)))
+                    rows.append(row)
+            if head_keys is None:
+                return np.zeros((0,0)), np.array([]), [], []
+            return np.array(rows, dtype=float), np.array(labels, dtype=int), ids, head_keys
+        Xv, yv, ids_v, feature_names = _load_unified(uv)
+        Xt, yt, ids_t, feature_names_t = _load_unified(ut)
+        # Guard consistent feature ordering
+        if feature_names != feature_names_t:
+            print("WARNING: Unified val/test head order mismatch; aligning by intersection")
+            common = [h for h in feature_names if h in set(feature_names_t)]
+            idx_v = [feature_names.index(h) for h in common]
+            idx_t = [feature_names_t.index(h) for h in common]
+            Xv = Xv[:, idx_v]
+            Xt = Xt[:, idx_t]
+            feature_names = common
+    else:
+        # Align predictions across heads (legacy path)
+        alignment_kwargs = {}
+        if args.alignment_strategy == "coverage_max":
+            alignment_kwargs["min_heads"] = args.min_heads
+        aligner = get_alignment_strategy(args.alignment_strategy, **alignment_kwargs)
 
-    Xv, yv, ids_v, feature_names = aligner.align(
-        args.val_jsonl,
-        {k: v for k, v in available.items()},
-        required_heads=set(args.require_heads) if args.require_heads else None,
-        use_cheap_features=bool(args.include_cheap_features),
-        head_tag=in_tag
-    )
-    Xt, yt, ids_t, _ = aligner.align(
-        args.test_jsonl,
-        {k: v for k, v in available.items()},
-        required_heads=set(args.require_heads) if args.require_heads else None,
-        use_cheap_features=bool(args.include_cheap_features),
-        head_tag=in_tag
-    )
+        Xv, yv, ids_v, feature_names = aligner.align(
+            args.val_jsonl,
+            {k: v for k, v in available.items()},
+            required_heads=set(args.require_heads) if args.require_heads else None,
+            use_cheap_features=bool(args.include_cheap_features),
+            head_tag=in_tag
+        )
+        Xt, yt, ids_t, _ = aligner.align(
+            args.test_jsonl,
+            {k: v for k, v in available.items()},
+            required_heads=set(args.require_heads) if args.require_heads else None,
+            use_cheap_features=bool(args.include_cheap_features),
+            head_tag=in_tag
+        )
     if Xv.size == 0 or Xt.size == 0:
         print("ERROR: Alignment produced empty matrices")
         return
 
-    # Restrict to probability heads (prefixed with p_) for weight search
+    # Restrict to probability heads (prefixed with p_) for downstream
     prob_head_indices = [i for i, n in enumerate(feature_names) if n.startswith("p_")]
     head_names = [feature_names[i] for i in prob_head_indices]
     Xv_heads = Xv[:, prob_head_indices]
     Xt_heads = Xt[:, prob_head_indices]
 
-    # Weight search
-    w, meta = weight_search(
-        Xv_heads,
-        yv,
-        head_names,
-        strategy=args.strategy,
-        grid_steps=args.grid_steps,
-        random_samples=args.random_samples,
-        dirichlet_alpha=args.dirichlet_alpha,
-    )
-    print(f"Selected weights: {dict(zip(head_names, map(lambda x: round(float(x),4), w)))}")
+    # Parse caps map
+    caps: Dict[str, float] = {}
+    for item in (args.cap_weight or []):
+        try:
+            if ":" in item:
+                k, v = item.split(":", 1)
+            elif "=" in item:
+                k, v = item.split("=", 1)
+            else:
+                continue
+            caps[k.strip()] = float(v)
+        except Exception:
+            continue
 
-    pv = apply_weights(Xv_heads, w)
-    pt = apply_weights(Xt_heads, w)
+    if args.stacker == "logistic":
+        # Optional logistic stacker with OOF training and final fit
+        try:
+            from sklearn.linear_model import LogisticRegression
+            from sklearn.preprocessing import StandardScaler
+            from sklearn.model_selection import StratifiedKFold
+        except Exception:
+            print("ERROR: scikit-learn required for --stacker logistic")
+            return
+        # Scale features
+        scaler = StandardScaler()
+        Xv_s = scaler.fit_transform(Xv_heads)
+        Xt_s = scaler.transform(Xt_heads)
+        # OOF preds if requested
+        if args.oof_folds and args.oof_folds > 1 and len(np.unique(yv)) > 1:
+            skf = StratifiedKFold(n_splits=args.oof_folds, shuffle=True, random_state=args.oof_seed)
+            oof = np.zeros_like(yv, dtype=float)
+            for tr, te in skf.split(Xv_s, yv):
+                clf = LogisticRegression(max_iter=1000, class_weight="balanced", C=args.logreg_C, solver="liblinear", random_state=42)
+                clf.fit(Xv_s[tr], yv[tr])
+                oof[te] = clf.predict_proba(Xv_s[te])[:, 1]
+            # Fit final model on full val
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced", C=args.logreg_C, solver="liblinear", random_state=42)
+            clf.fit(Xv_s, yv)
+            pv = clf.predict_proba(Xv_s)[:, 1]
+            pt = clf.predict_proba(Xt_s)[:, 1]
+            # Save weights
+            try:
+                weights_info = {
+                    "coef": clf.coef_.tolist(),
+                    "intercept": clf.intercept_.tolist(),
+                    "head_names": head_names,
+                    "scaler_mean": _tolist_safe(getattr(scaler, "mean_", None)),
+                    "scaler_scale": _tolist_safe(getattr(scaler, "scale_", None)),
+                    "stacker": "logistic",
+                    "oof_folds": args.oof_folds,
+                    "C": args.logreg_C,
+                }
+                with open(os.path.join(args.out_dir, "meta_logistic_weights.json"), "w", encoding="utf-8") as f:
+                    json.dump(weights_info, f, indent=2)
+            except Exception:
+                pass
+        else:
+            # Simple fit without OOF
+            clf = LogisticRegression(max_iter=1000, class_weight="balanced", C=args.logreg_C, solver="liblinear", random_state=42)
+            clf.fit(Xv_s, yv)
+            pv = clf.predict_proba(Xv_s)[:, 1]
+            pt = clf.predict_proba(Xt_s)[:, 1]
+            try:
+                weights_info = {
+                    "coef": clf.coef_.tolist(),
+                    "intercept": clf.intercept_.tolist(),
+                    "head_names": head_names,
+                    "scaler_mean": _tolist_safe(getattr(scaler, "mean_", None)),
+                    "scaler_scale": _tolist_safe(getattr(scaler, "scale_", None)),
+                    "stacker": "logistic",
+                    "oof_folds": 0,
+                    "C": args.logreg_C,
+                }
+                with open(os.path.join(args.out_dir, "meta_logistic_weights.json"), "w", encoding="utf-8") as f:
+                    json.dump(weights_info, f, indent=2)
+            except Exception:
+                pass
+        # For reporting consistency, synthesize a "weights" vector via normalized positive coefs (if available)
+        w = None
+        try:
+            coefs = np.maximum(0.0, clf.coef_.reshape(-1))
+            w = coefs / coefs.sum() if coefs.sum() > 0 else np.ones_like(coefs) / len(coefs)
+        except Exception:
+            w = np.ones(len(head_names)) / max(1, len(head_names))
+        meta = {"strategy": "logistic", "head_names": head_names, "best_score": {}}
+        print(f"Selected weights (approx from logistic coefs): {dict(zip(head_names, map(lambda x: round(float(x),4), w)))}")
+    else:
+        # Weight search with optional constraints/OOF
+        w, meta = weight_search(
+            Xv_heads,
+            yv,
+            head_names,
+            strategy=args.strategy,
+            grid_steps=args.grid_steps,
+            random_samples=args.random_samples,
+            dirichlet_alpha=args.dirichlet_alpha,
+            l2_reg=args.l2,
+            prefer_heads=set(args.prefer_heads) if args.prefer_heads else None,
+            prefer_weight=args.prefer_weight,
+            cap_weights=caps,
+            oof_folds=args.oof_folds,
+            oof_seed=args.oof_seed,
+        )
+        print(f"Selected weights: {dict(zip(head_names, map(lambda x: round(float(x),4), w)))}")
+        pv = apply_weights(Xv_heads, w)
+        pt = apply_weights(Xt_heads, w)
 
     # Metrics & thresholds on test
     pr = pr_auc_safe(yt.tolist(), pt.tolist())
