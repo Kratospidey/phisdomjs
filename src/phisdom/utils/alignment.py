@@ -22,7 +22,8 @@ class AlignmentStrategy:
         jsonl_path: str,
         head_dirs: Dict[str, str],
         required_heads: Optional[Set[str]] = None,
-        use_cheap_features: bool = True
+        use_cheap_features: bool = True,
+        head_tag: str = ""
     ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
         """
         Align predictions from multiple heads.
@@ -32,6 +33,7 @@ class AlignmentStrategy:
             head_dirs: Map from head name to directory containing predictions
             required_heads: If specified, only include samples with all required heads
             use_cheap_features: Whether to include cheap features
+            head_tag: Optional suffix for prediction files (e.g., "_full").
             
         Returns:
             Tuple of (features, labels, sample_ids, feature_names)
@@ -47,7 +49,8 @@ class InnerJoinAlignment(AlignmentStrategy):
         jsonl_path: str,
         head_dirs: Dict[str, str],
         required_heads: Optional[Set[str]] = None,
-        use_cheap_features: bool = True
+        use_cheap_features: bool = True,
+        head_tag: str = ""
     ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
         
         # Determine which heads to require
@@ -59,7 +62,7 @@ class InnerJoinAlignment(AlignmentStrategy):
         head_predictions = {}
         
         for head_name, head_dir in head_dirs.items():
-            pred_path = os.path.join(head_dir, f"preds_{split}.jsonl")
+            pred_path = os.path.join(head_dir, f"preds_{split}{head_tag}.jsonl")
             preds = self._load_predictions(pred_path)
             head_predictions[head_name] = preds
             print(f"Loaded {len(preds)} predictions for {head_name}")
@@ -86,7 +89,9 @@ class InnerJoinAlignment(AlignmentStrategy):
         
         if not common_ids:
             print("WARNING: No common IDs found!")
-            return np.array([]), np.array([]), [], []
+            # Return empty matrices with expected feature dimension (num heads [+ cheap later])
+            feat_dim = len(head_dirs)
+            return np.zeros((0, feat_dim), dtype=float), np.zeros((0,), dtype=int), [], list(head_dirs.keys())
         
         # Build feature matrix
         features = []
@@ -124,11 +129,21 @@ class InnerJoinAlignment(AlignmentStrategy):
         )
     
     def _extract_split_name(self, jsonl_path: str) -> str:
-        """Extract split name from JSONL path."""
+        """Extract split name from JSONL path.
+        Supports patterns like pages_val.jsonl, pages_val_full.jsonl, test_data.jsonl.
+        Defaults to 'val' if 'val' appears in name, else 'test'.
+        """
         basename = os.path.basename(jsonl_path)
-        if "_" in basename:
-            return basename.split("_")[-1].replace(".jsonl", "")
-        return "test"  # fallback
+        if basename.startswith("pages_") and basename.endswith("_full.jsonl"):
+            core = basename[len("pages_") : -len(".jsonl")]  # pages_val_full -> val_full
+            return core
+        if basename.startswith("pages_") and basename.endswith(".jsonl"):
+            # pages_val.jsonl -> val
+            return basename[len("pages_") : -len(".jsonl")]
+        name = basename.replace('.jsonl','')
+        if 'val' in name:
+            return 'val'
+        return 'test'
     
     def _extract_id(self, row: Dict[str, Any]) -> str:
         """Extract stable ID from row."""
@@ -140,10 +155,19 @@ class InnerJoinAlignment(AlignmentStrategy):
     def _load_predictions(self, pred_path: str) -> Dict[str, Tuple[int, float]]:
         """Load predictions from JSONL file."""
         predictions = {}
-        
         if not os.path.exists(pred_path):
             print(f"WARNING: Prediction file missing: {pred_path}")
-            return predictions
+            # Fallback: try any preds_*.jsonl in same directory
+            head_dir = os.path.dirname(pred_path)
+            try:
+                import glob
+                cands = sorted(glob.glob(os.path.join(head_dir, "preds_*.jsonl")))
+                if cands:
+                    pred_path = cands[0]
+                else:
+                    return predictions
+            except Exception:
+                return predictions
         
         with open(pred_path, "r", encoding="utf-8") as f:
             for line in f:
@@ -177,7 +201,8 @@ class CoverageMaximizingAlignment(AlignmentStrategy):
         jsonl_path: str,
         head_dirs: Dict[str, str],
         required_heads: Optional[Set[str]] = None,
-        use_cheap_features: bool = True
+        use_cheap_features: bool = True,
+        head_tag: str = ""
     ) -> Tuple[np.ndarray, np.ndarray, List[str], List[str]]:
         
         # Load all predictions
@@ -185,7 +210,7 @@ class CoverageMaximizingAlignment(AlignmentStrategy):
         head_predictions = {}
         
         for head_name, head_dir in head_dirs.items():
-            pred_path = os.path.join(head_dir, f"preds_{split}.jsonl")
+            pred_path = os.path.join(head_dir, f"preds_{split}{head_tag}.jsonl")
             preds = self._load_predictions(pred_path)
             head_predictions[head_name] = preds
             print(f"Loaded {len(preds)} predictions for {head_name}")
@@ -258,6 +283,10 @@ class CoverageMaximizingAlignment(AlignmentStrategy):
     def _extract_split_name(self, jsonl_path: str) -> str:
         """Extract split name from JSONL path."""
         basename = os.path.basename(jsonl_path)
+        # Handle extended split naming: pages_val_full.jsonl -> val_full
+        if basename.startswith("pages_") and basename.endswith("_full.jsonl"):
+            core = basename[len("pages_") : -len(".jsonl")]
+            return core
         if "_" in basename:
             return basename.split("_")[-1].replace(".jsonl", "")
         return "test"  # fallback
@@ -275,7 +304,16 @@ class CoverageMaximizingAlignment(AlignmentStrategy):
         
         if not os.path.exists(pred_path):
             print(f"WARNING: Prediction file missing: {pred_path}")
-            return predictions
+            head_dir = os.path.dirname(pred_path)
+            try:
+                import glob
+                cands = sorted(glob.glob(os.path.join(head_dir, "preds_*.jsonl")))
+                if cands:
+                    pred_path = cands[0]
+                else:
+                    return predictions
+            except Exception:
+                return predictions
         
         with open(pred_path, "r", encoding="utf-8") as f:
             for line in f:

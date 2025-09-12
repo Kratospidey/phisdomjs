@@ -164,7 +164,28 @@ def main():
 
     all_heads = {k: v for k, v in all_heads.items() if k not in set(args.exclude_heads)}
 
+    # Auto-infer head tag if not provided: if corresponding preds_*_full.jsonl exist
+    # for at least one head directory, prefer "_full". If the split filename already
+    # includes _full (e.g., pages_val_full.jsonl), do not add a tag to avoid duplication.
     in_tag = args.head_tag
+    base_val = os.path.basename(args.val_jsonl)
+    base_test = os.path.basename(args.test_jsonl)
+    split_has_full = base_val.endswith("_full.jsonl") or base_test.endswith("_full.jsonl")
+    # If user passed --head-tag _full but splits already *_full, drop it to prevent preds_*_full_full.jsonl
+    if split_has_full and in_tag == "_full":
+        print("[fuse][INFO] Split filenames already include _full; ignoring --head-tag _full to avoid duplication")
+        in_tag = ""
+    if not in_tag:
+        if not split_has_full:
+            # Probe heads for _full files
+            any_full = False
+            for _, d in {**all_heads}.items():
+                if os.path.exists(os.path.join(d, "preds_val_full.jsonl")) and os.path.exists(os.path.join(d, "preds_test_full.jsonl")):
+                    any_full = True
+                    break
+            if any_full:
+                in_tag = "_full"
+                print(f"[fuse][INFO] Auto-inferred --head-tag {in_tag} based on *_full prediction files")
     def _with_in_tag(base: str) -> str:
         if not in_tag:
             return base
@@ -212,13 +233,15 @@ def main():
         args.val_jsonl,
         {k: v for k, v in available.items()},
         required_heads=set(args.require_heads) if args.require_heads else None,
-        use_cheap_features=bool(args.include_cheap_features)
+        use_cheap_features=bool(args.include_cheap_features),
+        head_tag=in_tag
     )
     Xt, yt, ids_t, _ = aligner.align(
         args.test_jsonl,
         {k: v for k, v in available.items()},
         required_heads=set(args.require_heads) if args.require_heads else None,
-        use_cheap_features=bool(args.include_cheap_features)
+        use_cheap_features=bool(args.include_cheap_features),
+        head_tag=in_tag
     )
     if Xv.size == 0 or Xt.size == 0:
         print("ERROR: Alignment produced empty matrices")
@@ -248,10 +271,14 @@ def main():
     # Metrics & thresholds on test
     pr = pr_auc_safe(yt.tolist(), pt.tolist())
     roc = roc_auc_safe(yt.tolist(), pt.tolist())
+    import math
     thresholds = {}
     for tpr in args.tpr:
         fpr, thr = fpr_at_tpr(yt.tolist(), pt.tolist(), tpr)
-        thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
+        if isinstance(thr, float) and math.isinf(thr):
+            thresholds[str(tpr)] = {"fpr": float("nan"), "threshold": 0.5}
+        else:
+            thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
 
     # Standardize/save preds
     val_preds, val_meta = standardize_prediction_format(ids_v, yv, pv, "fusion_meta", "val", auto_flip=True)

@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--tpr", type=float, nargs="*", default=[0.95, 0.90])
     ap.add_argument("--tag", default="", help="Optional suffix tag for fused output files (e.g. _full)")
     ap.add_argument("--head-tag", default="", help="Optional suffix tag for input head prediction files to read (e.g. _full)")
+    ap.add_argument("--verbose-align", action="store_true", help="Log per-ID alignment inclusion/exclusion diagnostics")
+    ap.add_argument("--normalize-dom-model", action="store_true", help="Rewrite dom prediction model field to 'dom' before alignment")
+    ap.add_argument("--coverage-max-comparison", action="store_true", help="Also run coverage_max alignment and report coverage delta vs main strategy")
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -87,7 +90,24 @@ def main():
     
     # Filter to only heads with prediction files
     available_heads = {}
+    # Determine input head prediction tag. If not explicitly provided but the
+    # user passed *_full split jsonl files AND corresponding preds_*_full.jsonl
+    # exist for at least one head, auto-infer head_tag="_full" so that we pick
+    # up the extended prediction files rather than silently falling back to
+    # canonical ones (which previously yielded zero aligned samples).
     in_tag = args.head_tag
+    if not in_tag:
+        val_base = os.path.basename(args.val_jsonl)
+        test_base = os.path.basename(args.test_jsonl)
+        operating_on_full = (val_base.startswith("pages_val_full") or test_base.startswith("pages_test_full"))
+        if operating_on_full:
+            # Probe first head dir for existence of full preds to confirm
+            sample_dir = next(iter(all_heads.values())) if all_heads else None
+            if sample_dir and os.path.exists(os.path.join(sample_dir, "preds_val_full.jsonl")) and os.path.exists(os.path.join(sample_dir, "preds_test_full.jsonl")):
+                in_tag = "_full"
+                # Mirror back to args.head_tag so downstream logging reflects inference
+                args.head_tag = in_tag
+                print(f"[fuse][INFO] Auto-inferred --head-tag {in_tag} based on *_full splits and available prediction files")
     def _with_in_tag(base: str) -> str:
         if not in_tag:
             return base
@@ -186,6 +206,36 @@ def main():
         alignment_kwargs["min_heads"] = args.min_heads
     
     aligner = get_alignment_strategy(args.alignment_strategy, **alignment_kwargs)
+
+    # Optional: normalize DOM model name inside prediction files so downstream utilities expecting 'dom' match.
+    def _normalize_dom(path: str):
+        if not os.path.isfile(path):
+            return
+        tmp = path + ".normtmp"
+        changed = False
+        with open(path,"r",encoding="utf-8") as fin, open(tmp,"w",encoding="utf-8") as fout:
+            for line in fin:
+                line=line.strip()
+                if not line:
+                    continue
+                try:
+                    js=json.loads(line)
+                except Exception:
+                    continue
+                m = js.get("model")
+                if m and m not in ("dom","js_code","url","text","fusion","meta_fusion") and "markup" in m:
+                    js["model"] = "dom"; changed = True
+                fout.write(json.dumps(js)); fout.write("\n")
+        if changed:
+            os.replace(tmp, path)
+        else:
+            try: os.remove(tmp)
+            except Exception: pass
+
+    if args.normalize_dom_model:
+        for d in [args.dom_dir]:
+            for split in ["val","test"]:
+                _normalize_dom(os.path.join(d, f"preds_{split}.jsonl"))
     
     # Determine required heads
     required_heads = None
@@ -198,9 +248,11 @@ def main():
             return
 
     # Align data with available heads
+    # Wrapper to capture inclusion/exclusion diagnostics if verbose
+    # Alignment without diagnostics (library does not expose). Provide basic counts if verbose.
     Xv, yv, ids_v, feature_names = aligner.align(
         args.val_jsonl,
-        {k: v for k, v in available_heads.items()},  # pass mapping
+        {k: v for k, v in available_heads.items()},
         required_heads=required_heads,
         use_cheap_features=bool(getattr(args, "use_cheap_features", True))
     )
@@ -210,11 +262,30 @@ def main():
         required_heads=required_heads,
         use_cheap_features=bool(getattr(args, "use_cheap_features", True))
     )
+    if args.verbose_align:
+        print(f"[align] val aligned {len(ids_v)} test aligned {len(ids_t)} (strategy={args.alignment_strategy})")
     
     if Xv.size == 0 or Xt.size == 0:
         print("ERROR: No aligned predictions for fusion. Check that eval scripts have run for all included heads.")
         return
     
+    # Optional coverage_max comparison
+    if args.coverage_max_comparison and args.alignment_strategy != 'coverage_max':
+        cov_max_aligner = get_alignment_strategy('coverage_max', min_heads=getattr(args,'min_heads',2))
+        Xv_c, yv_c, ids_v_c, _ = cov_max_aligner.align(
+            args.val_jsonl,
+            {k: v for k, v in available_heads.items()},
+            required_heads=required_heads,
+            use_cheap_features=bool(getattr(args, "use_cheap_features", True))
+        )
+        Xt_c, yt_c, ids_t_c, _ = cov_max_aligner.align(
+            args.test_jsonl,
+            {k: v for k, v in available_heads.items()},
+            required_heads=required_heads,
+            use_cheap_features=bool(getattr(args, "use_cheap_features", True))
+        )
+        print(f"[coverage_max] val coverage {len(ids_v_c)}/{len(ids_v)} (+{len(ids_v_c)-len(ids_v)}) test {len(ids_t_c)}/{len(ids_t)} (+{len(ids_t_c)-len(ids_t)})")
+
     # Perform fusion
     pv: np.ndarray
     pt: np.ndarray
@@ -289,10 +360,15 @@ def main():
     # Metrics and thresholds on test
     pr = pr_auc_safe(yt.tolist(), pt.tolist())
     roc = roc_auc_safe(yt.tolist(), pt.tolist())
+    import math
     thresholds = {}
     for tpr in args.tpr:
         fpr, thr = fpr_at_tpr(yt.tolist(), pt.tolist(), tpr)
-        thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
+        if isinstance(thr, float) and math.isinf(thr):
+            # One-class or unattainable TPR; use a neutral threshold to avoid 'inf'
+            thresholds[str(tpr)] = {"fpr": float("nan"), "threshold": 0.5}
+        else:
+            thresholds[str(tpr)] = {"fpr": fpr, "threshold": thr}
 
     # Standardize and save predictions
     val_preds, val_meta = standardize_prediction_format(

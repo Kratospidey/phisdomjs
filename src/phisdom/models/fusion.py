@@ -73,14 +73,19 @@ class CrossModalTransformerFusion(nn.Module):
         self._tok_emb = nn.ModuleDict()
         self._tok_proj = nn.ModuleDict()
 
-        # Cheap feature encoder
+        # Cheap feature encoder: allow dynamic input dim across calls
+        self._cheap_in_dim: Optional[int] = None
+        self._cheap_fixed: bool = False
         if use_cheap:
             if cheap_dim is None:
-                self.enc_cheap = nn.LazyLinear(d_model)
+                # Construct on first use based on incoming feature dimension
+                self.enc_cheap = None
             else:
                 if cheap_dim <= 0:
                     raise ValueError("cheap_dim must be positive")
                 self.enc_cheap = nn.Linear(int(cheap_dim), d_model)
+                self._cheap_in_dim = int(cheap_dim)
+                self._cheap_fixed = True
         else:
             self.enc_cheap = None
 
@@ -207,15 +212,52 @@ class CrossModalTransformerFusion(nn.Module):
                         "seq_len_mean": float(m.sum(dim=1).float().mean().cpu()) if m.ndim==2 else 0.0,
                     })
                     per_stream_means.append(x.detach().mean(dim=1).mean(dim=0))
-        if self.use.get("cheap", False) and self.enc_cheap is not None:
+        if self.use.get("cheap", False):
+            cheap_tok = None  # ensure defined for diagnostics guards
             cf = self._pick(batch, "cheap_features", "cheap")
             if cf is not None:
-                cheap_tok = self.enc_cheap(cf.to(device)).unsqueeze(1)
-                cheap_tok = cheap_tok + self.type_emb.weight[self.type_index["cheap"]].view(1,1,-1)
-                streams.append(cheap_tok)
-                masks.append(torch.ones(cheap_tok.size(0),1,dtype=torch.bool,device=device))
-                stream_names.append("cheap")
-                if self.record_diagnostics:
+                # (Re)initialize cheap encoder if needed to match incoming dim
+                in_dim = int(cf.size(1)) if isinstance(cf, torch.Tensor) and cf.ndim == 2 else None
+                if in_dim is not None:
+                    # Determine policy: dynamic adaptation when other streams enabled; strict otherwise
+                    other_streams_enabled = any(self.use.get(n, False) for n in ("url","js","text","dom"))
+                    if self.enc_cheap is None:
+                        if self._cheap_in_dim is None:
+                            # No preset width: if cheap_dim was provided at init it set _cheap_in_dim; otherwise set on first use
+                            self.enc_cheap = nn.Linear(in_dim, self.d_model).to(device)
+                            nn.init.xavier_uniform_(self.enc_cheap.weight)
+                            if self.enc_cheap.bias is not None:
+                                nn.init.constant_(self.enc_cheap.bias, 0.0)
+                            self._cheap_in_dim = in_dim
+                        else:
+                            # Preset width exists (fixed cheap_dim); create with that and enforce match
+                            if in_dim != self._cheap_in_dim:
+                                raise RuntimeError(f"cheap_features width {in_dim} != expected {self._cheap_in_dim}")
+                            self.enc_cheap = nn.Linear(self._cheap_in_dim, self.d_model).to(device)
+                            nn.init.xavier_uniform_(self.enc_cheap.weight)
+                            if self.enc_cheap.bias is not None:
+                                nn.init.constant_(self.enc_cheap.bias, 0.0)
+                    else:
+                        # Encoder exists: allow dynamic reinit only if other streams are enabled; otherwise enforce strict
+                        if in_dim != self._cheap_in_dim:
+                            if self._cheap_fixed:
+                                raise RuntimeError(f"cheap_features width changed from {self._cheap_in_dim} to {in_dim}")
+                            if other_streams_enabled:
+                                # dynamically adapt by reinitializing
+                                self.enc_cheap = nn.Linear(in_dim, self.d_model).to(device)
+                                nn.init.xavier_uniform_(self.enc_cheap.weight)
+                                if self.enc_cheap.bias is not None:
+                                    nn.init.constant_(self.enc_cheap.bias, 0.0)
+                                self._cheap_in_dim = in_dim
+                            else:
+                                raise RuntimeError(f"cheap_features width changed from {self._cheap_in_dim} to {in_dim}")
+                if self.enc_cheap is not None:
+                    cheap_tok = self.enc_cheap(cf.to(device)).unsqueeze(1)
+                    cheap_tok = cheap_tok + self.type_emb.weight[self.type_index["cheap"]].view(1,1,-1)
+                    streams.append(cheap_tok)
+                    masks.append(torch.ones(cheap_tok.size(0),1,dtype=torch.bool,device=device))
+                    stream_names.append("cheap")
+                if self.record_diagnostics and ('cheap' in stream_names) and (cheap_tok is not None):
                     with torch.no_grad():
                         tn = cheap_tok.detach().norm(dim=-1)
                         self._last_stream_stats.append({

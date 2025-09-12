@@ -152,8 +152,9 @@ def main():
         ids = [ds[i].get("id", str(i)) for i in range(len(ds))]
         labels = np.array([ds[i].get("label", 0) for i in range(len(ds))], dtype=int)
         
+        # Use unified model label 'dom' for downstream fusion consistency
         preds, metadata = standardize_prediction_format(
-            ids, labels, probs, "markup_lm", split_name, auto_flip=True
+            ids, labels, probs, "dom", split_name, auto_flip=True
         )
         # Temporarily write to tag-suffixed filename if provided
         if tag:

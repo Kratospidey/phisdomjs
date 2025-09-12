@@ -1597,6 +1597,57 @@ def main():
         cache_path=test_cache if os.path.exists(test_cache) else os.path.join(cache_dir, "test_dom.jsonl"),
     )
 
+    # Auto-switch to *_full split files if a split is single-class or effectively degenerate
+    # (very tiny minority class) and the full variant exists.
+    def _is_degenerate_split(y_arr: np.ndarray, min_minor: int = 5) -> bool:
+        try:
+            vals = np.asarray(y_arr, dtype=int)
+            n_pos = int((vals == 1).sum())
+            n_neg = int((vals == 0).sum())
+            if (n_pos == 0) or (n_neg == 0):
+                return True
+            return min(n_pos, n_neg) < min_minor
+        except Exception:
+            try:
+                classes = set(map(int, y_arr.tolist()))
+                return len(classes) < 2
+            except Exception:
+                return False
+
+    def _with_full_suffix(path: str) -> str:
+        root, ext = os.path.splitext(path)
+        return f"{root}_full{ext}"
+
+    used_splits: Dict[str, str] = {"train": os.path.abspath(args.train_jsonl), "val": os.path.abspath(args.val_jsonl), "test": os.path.abspath(args.test_jsonl)}
+
+    if _is_degenerate_split(y_va):
+        val_full = _with_full_suffix(args.val_jsonl)
+        if os.path.exists(val_full):
+            print(f"[report][INFO] Validation split is one-class; switching to {val_full}")
+            y_va, p_va, rows_va = load_preds(
+                args.model_dir,
+                val_full,
+                args.max_length,
+                args.device,
+                args.eval_batch,
+                cache_path=val_cache if os.path.exists(val_cache) else os.path.join(cache_dir, "val_dom.jsonl"),
+            )
+        used_splits["val"] = os.path.abspath(val_full)
+
+    if _is_degenerate_split(y_te):
+        test_full = _with_full_suffix(args.test_jsonl)
+        if os.path.exists(test_full):
+            print(f"[report][INFO] Test split is one-class; switching to {test_full}")
+            y_te, p_te, rows_te = load_preds(
+                args.model_dir,
+                test_full,
+                args.max_length,
+                args.device,
+                args.eval_batch,
+                cache_path=test_cache if os.path.exists(test_cache) else os.path.join(cache_dir, "test_dom.jsonl"),
+            )
+        used_splits["test"] = os.path.abspath(test_full)
+
     # Load JS preds if available (compute if missing)
     def read_preds_arrays(path: str):
         if not os.path.exists(path):
@@ -1699,18 +1750,26 @@ def main():
         y = np.array([int(ds[k].get("label", 0)) for k in range(len(ds))], dtype=int)
         return ids, y, np.array(probs, dtype=float)
 
-    js_val_path = os.path.join(args.js_dir, "preds_val.jsonl")
-    js_test_path = os.path.join(args.js_dir, "preds_test.jsonl")
-    fu_val_path = os.path.join(args.fusion_dir, "preds_val.jsonl")
-    fu_test_path = os.path.join(args.fusion_dir, "preds_test.jsonl")
+    # Prefer extended (_full) predictions if they exist to improve coverage and avoid degenerate splits
+    def prefer_full(dir_path: str, base: str) -> str:
+        root, ext = os.path.splitext(base)
+        full = f"{root}_full{ext}"
+        p_full = os.path.join(dir_path, full)
+        p_base = os.path.join(dir_path, base)
+        return p_full if os.path.exists(p_full) else p_base
+
+    js_val_path = prefer_full(args.js_dir, "preds_val.jsonl")
+    js_test_path = prefer_full(args.js_dir, "preds_test.jsonl")
+    fu_val_path = prefer_full(args.fusion_dir, "preds_val.jsonl")
+    fu_test_path = prefer_full(args.fusion_dir, "preds_test.jsonl")
     # Meta-fusion (all heads) optional
-    meta_val_path = os.path.join(args.meta_fusion_dir, "preds_val.jsonl")
-    meta_test_path = os.path.join(args.meta_fusion_dir, "preds_test.jsonl")
+    meta_val_path = prefer_full(args.meta_fusion_dir, "preds_val.jsonl")
+    meta_test_path = prefer_full(args.meta_fusion_dir, "preds_test.jsonl")
     # Optional: cross-attention fusion
     # Allow overriding xfusion dir via CLI
     xfu_dir = args.xfusion_dir if args.xfusion_dir else (os.path.join(os.path.dirname(args.fusion_dir), "fusion_xattn") if os.path.isabs(args.fusion_dir) else os.path.join("artifacts", "fusion_xattn"))
-    xfu_val_path = os.path.join(xfu_dir, "preds_val.jsonl")
-    xfu_test_path = os.path.join(xfu_dir, "preds_test.jsonl")
+    xfu_val_path = prefer_full(xfu_dir, "preds_val.jsonl")
+    xfu_test_path = prefer_full(xfu_dir, "preds_test.jsonl")
 
     js_val = read_preds_arrays(js_val_path)
     js_test = read_preds_arrays(js_test_path)
@@ -2214,7 +2273,7 @@ def main():
     except Exception as e:
         dataset_drift = {"error": str(e)}
 
-    summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json, "dataset_drift": dataset_drift, "macro": macro_block}
+    summary_bundle = {"core": metrics_summary, "light_heads": light_cal, "cascade": cascade_json, "dataset_drift": dataset_drift, "macro": macro_block, "used_splits": used_splits}
     if args.splits_version:
         # If it's a path to v2 file, attempt to parse minimal metadata
         meta = {"declared": args.splits_version}
@@ -2312,7 +2371,11 @@ def main():
         # Safe float formatter for HTML (avoids formatting None)
         def fmt4(x) -> str:
             try:
-                return f"{float(x):.4f}"
+                v = float(x)
+                import math
+                if math.isnan(v) or math.isinf(v):
+                    return "n/a"
+                return f"{v:.4f}"
             except Exception:
                 return "n/a"
         dom_cal = safe_load(os.path.join(args.model_dir, "calibration.json"))
@@ -2321,6 +2384,21 @@ def main():
         meta_cal = safe_load(os.path.join(args.meta_fusion_dir, "calibration.json"))
         metrics_json = safe_load(os.path.join(report_dir, "summary.json"))
         pngs = [p for p in os.listdir(report_dir) if p.endswith(".png")]
+        used_splits_json = metrics_json.get("used_splits") if isinstance(metrics_json, dict) else None
+        used_note = ""
+        if isinstance(used_splits_json, dict):
+            try:
+                u_tr = used_splits_json.get("train")
+                u_va = used_splits_json.get("val")
+                u_te = used_splits_json.get("test")
+                used_note = (
+                    "<div class='mono' style='opacity:.75;margin-left:10px'>splits used → "
+                    f"train: {escape_html(os.path.basename(u_tr) if u_tr else '')}, "
+                    f"val: {escape_html(os.path.basename(u_va) if u_va else '')}, "
+                    f"test: {escape_html(os.path.basename(u_te) if u_te else '')}</div>"
+                )
+            except Exception:
+                used_note = ""
         lime_dom_dir = os.path.join(report_dir, "lime_dom")
         shap_dom_dir = os.path.join(report_dir, "shap_dom")
         lime_js_dir = os.path.join(report_dir, "lime_js")
@@ -2461,7 +2539,7 @@ def main():
             "</style>",
             "</head><body>",
             "<div class='top'><div class='pill'>Report</div><div class='mono'>PhisDOM Evaluation</div>"
-            f"<div style='margin-left:auto' class='mono'>{args.model_dir}</div></div>",
+            f"<div style='margin-left:auto' class='mono'>{args.model_dir}</div>{used_note}</div>",
             "<div class='jump mono'>Jump to: <a href='#dataset'>Dataset</a><a href='#cal'>Calibration</a><a href='#metrics'>Metrics</a><a href='#xfusion'>XFusion</a><a href='#plots'>Plots</a><a href='#xai'>Explanations</a></div>",
             "<div class='wrap'>",
             "<div class='section'><p class='mono' style='opacity:.85'>This report summarizes training/evaluation of the DOM model (MarkupLM) and optionally JS (CodeT5+) and fused heads. It includes PR/ROC curves, reliability, confusion matrices at calibrated thresholds, and optional LIME/SHAP explanations. Below are dataset counts and calibration snapshots, followed by detailed metrics tables and plots. The Tests section summarizes unit tests included in this repo.</p></div>",

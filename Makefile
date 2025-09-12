@@ -261,10 +261,10 @@ train-text-head:
 
 .PHONY: fuse
 fuse:
-	$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic
+		$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --out-dir artifacts/fusion --method logistic
 	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
-		echo "[MAKE] Generating extended fusion with --head-tag _full --tag _full"; \
-		$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --out-dir artifacts/fusion --method logistic --head-tag _full --tag _full; \
+			echo "[MAKE] Generating extended fusion with --tag _full (head tag now auto-inferred)"; \
+			$(PY) scripts/fuse_heads.py --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --out-dir artifacts/fusion --method logistic --tag _full; \
 	fi
 
 # Comprehensive coverage-max fusion (imputation) and unified export
@@ -273,13 +273,13 @@ fuse-all-coverage:
 	$(PY) scripts/fuse_heads.py \
 		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
-		--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 2 --export-unified-json
+		--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 1 --export-unified-json
 	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
 		echo "[MAKE] Generating extended fusion_all with --head-tag _full --tag _full"; \
 		$(PY) scripts/fuse_heads.py \
 			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
 			--val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl \
-			--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 2 --export-unified-json --head-tag _full --tag _full; \
+			--out-dir artifacts/fusion_all --method logistic --alignment-strategy coverage_max --min-heads 1 --export-unified-json --head-tag _full --tag _full; \
 	fi
 
 # Second-level meta-fusion including prior first-level fusion head
@@ -288,17 +288,90 @@ fuse-meta: fuse-all-coverage
 	$(PY) scripts/fuse_heads.py \
 		--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
-		--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 2 --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json
+		--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 1 --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json
 	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
 		echo "[MAKE] Generating extended fusion_meta with --head-tag _full --tag _full"; \
 		$(PY) scripts/fuse_heads.py \
 			--dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head \
 			--val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl \
-			--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 2 --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json --head-tag _full --tag _full; \
+			--out-dir artifacts/fusion_meta --method logistic --alignment-strategy coverage_max --min-heads 1 --include-fusion-head --fusion-dir artifacts/fusion_all --export-unified-json --head-tag _full --tag _full; \
 	fi
 
 # Meta weight search (simplex) producing fusion_meta/weights.json & preds
 .PHONY: meta-fuse-search
+# Phase targets (Phases 2-11)
+.PHONY: phase2-cluster phase3-augment phase5-stack-cv phase6-cascade phase7-loss phase8-refiner phase9-eval phase10-gate phase11-kpi
+
+phase2-cluster:
+	$(PY) scripts/cluster_false_positives.py
+	$(PY) scripts/cluster_false_positives_enhanced.py
+
+phase3-augment:
+	$(PY) scripts/prepare_hard_negatives.py
+	$(PY) scripts/augment_with_hard_negatives.py
+	$(PY) scripts/schedule_retrain_with_hard_negatives.py
+
+# Phase 3b: Retrain heads using augmented data (reads class weights from plan)
+.PHONY: phase3-retrain
+phase3-retrain: phase3-augment
+	@echo "[MAKE] Hard negative retrain starting (reading plan manifest)"
+	@PLAN=artifacts/diagnostics/hard_negative_retrain_plan.json; \
+	if [ ! -f $$PLAN ]; then echo "[MAKE][ERROR] Missing retrain plan $$PLAN"; exit 3; fi; \
+	POSW=$$(python - <<- 'PY'
+	import json; import sys
+	p=json.load(open('artifacts/diagnostics/hard_negative_retrain_plan.json'))
+	cw=p.get('heads',[{}])[0].get('class_weights',{})
+	pos=cw.get('positive',1.0); neg=cw.get('negative',1.0)
+	# BCEWithLogitsLoss pos_weight multiplies positive class loss; negatives weight=1.
+	# Use ratio so relative weighting matches plan suggestions.
+	pw = (pos/neg) if neg else pos
+	print(f"{pw:.6f}")
+	PY
+	); \
+	echo "[MAKE] Using pos_weight=$$POSW from plan"; \
+	$(PY) scripts/train_url_head.py --train-jsonl data/pages_train_augmented.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/url_head --batch-size $(if $(filter $(SMOKE),1),32,64) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --pos-weight $$POSW; \
+	$(PY) scripts/train_js_head.py --train-jsonl data/pages_train_augmented.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_charcnn --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --num-workers $(JS_HEAD_NUM_WORKERS) --pos-weight $$POSW $(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,); \
+	$(PY) scripts/train_text_head.py --train-jsonl data/pages_train_augmented.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/text_head --batch-size $(if $(filter $(SMOKE),1),16,32) --epochs $(if $(filter $(SMOKE),1),1,3) --lr 1e-3 --weight-decay 1e-4 --max-len $(if $(filter $(SMOKE),1),512,1024) --pos-weight $$POSW; \
+	$(PY) scripts/train_js_codet5p.py --train-jsonl data/pages_train_augmented.jsonl --val-jsonl data/pages_val.jsonl --output-dir artifacts/js_codet5p --model-name Salesforce/codet5p-220m --max-length 512 --batch-size $(if $(filter $(SMOKE),1),2,4) --num-epochs $(if $(filter $(SMOKE),1),0.5,1.0) --lr 3e-5 $(if $(filter $(DISABLE_TQDM),1),--disable-tqdm,); \
+	echo "[MAKE] (Optional) Provide your CodeT5p retrain command if desired"
+
+.PHONY: eval-heads-postretrain
+eval-heads-postretrain:
+	$(PY) scripts/eval_light_heads.py --head url --model-dir artifacts/url_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 128
+	$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+	$(PY) scripts/eval_light_heads.py --head text --model-dir artifacts/text_head --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --batch-size 64
+	$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl --max-length 512
+
+phase5-stack-cv:
+	$(PY) scripts/refit_fusion_calibrated_ids_cv.py
+	$(PY) scripts/refit_meta_fusion_cv.py --include-fusion-prob
+
+phase6-cascade:
+	$(PY) scripts/cascade_optimize_v2.py
+	$(PY) scripts/cascade_band_search.py
+
+phase7-loss:
+	$(PY) scripts/fusion_loss_experiments.py
+
+.PHONY: phase7-adopt
+phase7-adopt:
+	$(PY) scripts/refit_fusion_calibrated_ids.py --adopt-best-loss
+
+phase8-refiner:
+	$(PY) scripts/train_confusion_refiner.py --eval-on-test
+
+phase9-eval:
+	$(PY) scripts/evaluate_enhanced.py
+	$(PY) scripts/compare_stacking.py
+
+phase10-gate:
+	$(PY) scripts/ci_check_anomalies.py --split val
+	$(PY) scripts/ci_gate.py $(if $(CREATE_BASELINE),--create-baseline,)
+	$(PY) scripts/ci_gate_smoke.py || true
+
+phase11-kpi:
+	$(PY) scripts/build_kpi_dashboard.py
+
 meta-fuse-search:
 	$(PY) scripts/meta_fuse_heads.py \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
@@ -394,6 +467,55 @@ report-xai:
 	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
 		echo "[MAKE] NOTE: Extended dataset available - consider updating report script to use _full files"; \
 	fi
+
+# Extended heads prediction (generate _full for all active heads if extended splits exist)
+.PHONY: eval-extended-heads
+eval-extended-heads:
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Evaluating extended heads (_full)"; \
+		$(PY) scripts/eval_markup.py --model-dir artifacts/markup_run --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --max-length $(MAXLEN) --max-html-chars -1 --tag _full; \
+		$(PY) scripts/eval_js_codet5p.py --model-dir artifacts/js_codet5p --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --max-length 512 --tag _full; \
+		$(PY) scripts/eval_light_heads.py --head url --model-dir artifacts/url_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 128 --tag _full || echo "[WARN] url head extended eval failed"; \
+		$(PY) scripts/eval_light_heads.py --head text --model-dir artifacts/text_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full || echo "[WARN] text head extended eval failed"; \
+		$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full || echo "[WARN] js_charcnn base extended eval failed"; \
+		$(PY) scripts/eval_light_heads.py --head js --model-dir artifacts/js_charcnn_aug --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --batch-size 64 --tag _full || echo "[WARN] js_charcnn_aug extended eval failed"; \
+	else \
+		echo "[MAKE] Extended split files not found; skipping eval-extended-heads"; \
+	fi
+
+# Fusion variants regeneration (strict, coverage_max, soft, meta)
+.PHONY: fuse-variants
+fuse-variants: fuse fuse-all-coverage fuse-meta
+	$(PY) scripts/fuse_heads_coverage_max.py --min-heads 2 || true
+	$(PY) scripts/fuse_heads_soft_impute.py || true
+	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
+		echo "[MAKE] Generating extended coverage_max fusion_covmax (_full)"; \
+		$(PY) scripts/fuse_heads.py --alignment-strategy coverage_max --min-heads 2 --dom-dir artifacts/markup_run --js-dir artifacts/js_codet5p --url-dir artifacts/url_head --text-dir artifacts/text_head --val-jsonl data/pages_val_full.jsonl --test-jsonl data/pages_test_full.jsonl --out-dir artifacts/fusion_covmax --head-tag _full --tag _full --normalize-dom-model || true; \
+		echo "[MAKE] Generating extended soft fusion (_full)"; \
+		$(PY) scripts/fuse_heads_soft_impute.py --full || true; \
+	fi
+
+# Generate strict baseline including fusion variants
+.PHONY: baseline-strict
+baseline-strict:
+	$(PY) scripts/export_predictions.py --mode strict --model-allowlist dom js_code fused fused_covmax fused_soft meta_fused url text js_charcnn_base js_charcnn_aug --out-dir artifacts/baseline_strict
+	$(PY) scripts/audit_coverage_extended.py --baseline-dir artifacts/baseline_strict --model-allowlist dom js_code fused fused_covmax fused_soft meta_fused url text js_charcnn_base js_charcnn_aug
+
+# Extended strict baseline (includes *_full variants when available in a separate directory)
+.PHONY: baseline-extended
+baseline-extended: eval-extended-heads
+	$(PY) scripts/export_predictions.py --mode strict --model-allowlist dom js_code fused fused_covmax fused_soft meta_fused url text js_charcnn_base js_charcnn_aug --out-dir artifacts/baseline_strict_full --separate-full
+	$(PY) scripts/audit_coverage_extended.py --baseline-dir artifacts/baseline_strict_full --model-allowlist dom js_code fused fused_covmax fused_soft meta_fused url text js_charcnn_base js_charcnn_aug
+
+# Calibration comparison report across fusion variants
+.PHONY: calibrate-fusion-report
+calibrate-fusion-report:
+	$(PY) scripts/calibrate_fusion_variants.py --baseline-dir artifacts/baseline_strict --out artifacts/diagnostics/fusion_calibration_report.md || echo "[WARN] calibration report script missing"
+
+# Unified target to refresh everything after crawl/ingest
+.PHONY: full-refresh
+full-refresh: ensure-crawled-count eval eval-js eval-url-head train-js-head train-text-head fuse-variants baseline-strict calibrate-fusion-report
+
 
 # Evaluate calibrated lightweight heads and generate preds jsonl
 .PHONY: eval-url-head eval-js-head
@@ -491,6 +613,28 @@ auto-backfill:
 	@echo "[MAKE] Auto backfill (network=$(BACKFILL_NETWORK)) [parallel workers=$(BACKFILL_WORKERS) batch=$(BACKFILL_BATCH) visuals=$(if $(filter $(BACKFILL_DISABLE_VISUALS),1),off,on) drop_raw=$(BACKFILL_DROP_RAW) max_img=$(BACKFILL_MAX_IMAGE_BYTES)B]"
 	$(PY) scripts/auto_backfill.py --inputs data/pages.jsonl data/pages_train.jsonl data/pages_val.jsonl data/pages_test.jsonl --overwrite $(if $(filter $(BACKFILL_NETWORK),1),--network,) --tls-timeout $(TLS_TIMEOUT) --dns-timeout $(DNS_TIMEOUT) $(if $(BACKFILL_WORKERS),--workers $(BACKFILL_WORKERS),) $(if $(BACKFILL_BATCH),--batch-lines $(BACKFILL_BATCH),) $(if $(filter $(BACKFILL_DISABLE_VISUALS),1),--disable-visuals,) $(if $(BACKFILL_MAX_IMAGE_BYTES),--max-image-bytes $(BACKFILL_MAX_IMAGE_BYTES),) $(if $(filter $(BACKFILL_DROP_RAW),1),--drop-raw,)
 
+# ---- ID Repair and Balanced Subset Utilities ----
+.PHONY: repair-ids
+repair-ids:
+	$(PY) scripts/repair_ids.py --in data/pages.jsonl $(if $(wildcard data/pages_train.jsonl),data/pages_train.jsonl,) $(if $(wildcard data/pages_val.jsonl),data/pages_val.jsonl,) $(if $(wildcard data/pages_test.jsonl),data/pages_test.jsonl,)
+
+.PHONY: make-balanced
+make-balanced: repair-ids
+	@mkdir -p data
+	$(PY) scripts/make_balanced_subset.py --in data/pages.jsonl --out data/pages_balanced.jsonl --n $(if $(N_PER_CLASS),$(N_PER_CLASS),6000) --seed $(if $(SEED),$(SEED),42) --shuffle
+	@echo "[MAKE] Balanced dataset at data/pages_balanced.jsonl"
+
+.PHONY: splits-balanced
+splits-balanced: make-balanced
+	$(MAKE) splits DATASET=data/pages_balanced.jsonl POSR_TRAIN=0.5 POSR_VAL=0.5 POSR_TEST=0.5 BALANCE_SPLITS=1 SEED=$(if $(SEED),$(SEED),42) MIN_TOTAL_TEST=$(if $(MIN_TOTAL_TEST),$(MIN_TOTAL_TEST),1000)
+	$(MAKE) slice DATASET=data/pages_balanced.jsonl
+
+.PHONY: pipeline-balanced
+pipeline-balanced: splits-balanced
+	$(MAKE) run-all-custom-nosplits DATASET=data/pages_balanced.jsonl $(if $(ADOPT_BEST_LOSS),ADOPT_BEST_LOSS=$(ADOPT_BEST_LOSS),) $(if $(CREATE_BASELINE),CREATE_BASELINE=$(CREATE_BASELINE),) $(if $(HEAD_COSTS_JSON),HEAD_COSTS_JSON=$(HEAD_COSTS_JSON),) $(if $(COST_SCALE),COST_SCALE=$(COST_SCALE),)
+	# Auto-generate fresh full report after balanced pipeline completes
+	$(MAKE) report-full
+
 # Phase 4 end-to-end: train/eval all heads, fuse, plot, report
 .PHONY: phase4
 phase4: train eval report train-js eval-js train-url-head eval-url-head train-js-head eval-js-head train-text-head eval-text-head fuse report report-xai plot-heads
@@ -521,10 +665,11 @@ report-full:
 	$(PY) scripts/report_eval.py \
 		--out-dir $(REPORT_OUT) \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
+		--fusion-dir artifacts/fusion_covmax \
 		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-diag artifacts/fusion_xattn/diagnostics/diagnostics.json,) \
 		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-dir artifacts/fusion_xattn,) \
 		--heads-dirs artifacts/url_head artifacts/text_head artifacts/js_charcnn $(if $(filter $(ENABLE_CODET5P),1),artifacts/js_codet5p,) \
-		--meta-dir artifacts/fusion_meta || (echo "[MAKE][ERROR] report failed" && exit 4)
+		--meta-fusion-dir artifacts/fusion_meta || (echo "[MAKE][ERROR] report failed" && exit 4)
 	@echo "[MAKE] Report generated at $(REPORT_OUT)/index.html"
 
 # Extended XAI + versioned splits aware report
@@ -562,3 +707,43 @@ e2e-ultra: ensure-crawled-count extend-splits-if-needed splits slice train-url-h
 	$(if $(filter $(AUGMENT_JS),1),augment-js train-js-head-aug eval-js-head-aug,) \
 	fuse-all-coverage fuse-meta meta-fuse-search train-xfusion-diag report-extended-xai
 	@echo "[MAKE] e2e-ultra pipeline complete (diag interval=$(DIAG_INTERVAL), splits tag=$(SPLITS_VERSION_TAG))"
+
+# ---- Custom unified pipeline integrating new phases ----
+.PHONY: cascade-cost-sweep
+cascade-cost-sweep:
+	@echo "[MAKE] Cascade cost sweep with default costs"
+	$(PY) scripts/cascade_optimize_v2.py --split val $(if $(HEAD_COSTS_JSON),--head-costs-json $(HEAD_COSTS_JSON),) $(if $(COST_SCALE),--cost-scale $(COST_SCALE),)
+	@for s in 0.5 0.75 1.0 1.25 1.5 ; do \
+		echo "[MAKE] Sensitivity cost_scale=$$s"; \
+		$(PY) scripts/cascade_optimize_v2.py --split val $(if $(HEAD_COSTS_JSON),--head-costs-json $(HEAD_COSTS_JSON),) --cost-scale $$s || true; \
+	done
+
+.PHONY: hard-neg-cycle
+hard-neg-cycle: phase2-cluster phase3-augment phase3-retrain eval-heads-postretrain phase5-stack-cv phase7-loss phase7-adopt phase6-cascade phase8-refiner phase9-eval phase10-gate phase11-kpi
+	@echo "[MAKE] Hard-negative cycle complete"
+
+# Master pipeline: assumes crawl has been run externally if desired
+.PHONY: run-all-custom
+run-all-custom: ensure-crawled-count extend-splits-if-needed splits slice \
+	train-heads eval-heads fuse-variants fuse-coverage meta-fuse-all \
+	phase5-stack-cv phase7-loss $(if $(filter $(ADOPT_BEST_LOSS),1),phase7-adopt,) \
+	phase6-cascade cascade-cost-sweep phase8-refiner phase9-eval phase10-gate phase11-kpi
+	@echo "[MAKE] run-all-custom complete (ADOPT_BEST_LOSS=$(ADOPT_BEST_LOSS))"
+
+# Convenience: run both standard flow then optional hard-negative cycle
+.PHONY: run-all-with-hardnegs
+run-all-with-hardnegs: run-all-custom $(if $(filter $(DO_HARD_NEG_CYCLE),1),hard-neg-cycle,)
+	@echo "[MAKE] run-all-with-hardnegs complete (cycle=$(DO_HARD_NEG_CYCLE))"
+
+# Friendly alias: single-command pipeline with optional variables
+.PHONY: pipeline
+pipeline: run-all-custom
+	@echo "[MAKE] pipeline finished (alias of run-all-custom)"
+
+# Variant: master pipeline without splits/extend to respect pre-made splits
+.PHONY: run-all-custom-nosplits
+run-all-custom-nosplits: \
+	train-heads eval-heads fuse-variants fuse-coverage meta-fuse-all \
+	phase5-stack-cv phase7-loss $(if $(filter $(ADOPT_BEST_LOSS),1),phase7-adopt,) \
+	phase6-cascade cascade-cost-sweep phase8-refiner phase9-eval phase10-gate phase11-kpi
+	@echo "[MAKE] run-all-custom-nosplits complete (ADOPT_BEST_LOSS=$(ADOPT_BEST_LOSS))"

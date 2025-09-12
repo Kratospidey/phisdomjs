@@ -16,7 +16,7 @@ from phisdom.models.calibration import fit_temperature
 
 def train_one_epoch(model, loader, opt, sched, device):
     model.train()
-    crit = nn.BCEWithLogitsLoss()
+    crit = getattr(model, "_bce_loss", nn.BCEWithLogitsLoss())
     total = 0.0
     n = 0
     for batch in loader:
@@ -69,6 +69,7 @@ def main():
     ap.add_argument("--raw-field", type=str, default=None, help="Optional raw JS text field to encode on-the-fly (e.g., js_augmented)")
     ap.add_argument("--mix-aug", action="store_true", help="If set, mix original and augmented examples during training (requires --raw-field and augmented train file)")
     ap.add_argument("--aug-jsonl", type=str, default="data/pages_train_aug.jsonl", help="Path to augmented training JSONL when using --mix-aug")
+    ap.add_argument("--pos-weight", type=float, default=None, help="Optional positive class weight for BCEWithLogitsLoss")
     args = ap.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -117,6 +118,11 @@ def main():
     )
 
     model = JsCharCNN(dropout=args.dropout).to(device)
+    if args.pos_weight is not None:
+        pw = torch.tensor(float(args.pos_weight), dtype=torch.float32, device=device)
+        model._bce_loss = nn.BCEWithLogitsLoss(pos_weight=pw)  # type: ignore[attr-defined]
+    else:
+        model._bce_loss = nn.BCEWithLogitsLoss()  # type: ignore[attr-defined]
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=max(1, len(tr_dl) * args.epochs))
 

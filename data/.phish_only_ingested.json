@@ -1,1 +1,1 @@
-{"phish_only_path": "/home/krato/krato/repos/phisdom/data/pages_phish_only.jsonl", "dataset_path": "/home/krato/krato/repos/phisdom/data/pages.jsonl", "added": 0, "scanned": 4490, "skipped_existing": 4490, "skipped_blank": 0, "dedupe_strategy": "final"}
+{"phish_only_path": "/home/krato/krato/repos/phisdom/data/pages_phish_only.jsonl", "dataset_path": "/home/krato/krato/repos/phisdom/data/pages.jsonl", "added": 0, "scanned": 5264, "skipped_existing": 5264, "skipped_blank": 0, "dedupe_strategy": "final"}
