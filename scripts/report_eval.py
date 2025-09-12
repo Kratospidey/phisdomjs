@@ -1525,6 +1525,7 @@ def main():
     parser.add_argument("--xfusion-dir", default=None, help="Optional explicit cross-attention fusion directory (artifacts/fusion_xattn by default)")
     parser.add_argument("--xfusion-diag", default=None, help="Optional explicit XFusion diagnostics JSON path")
     parser.add_argument("--meta-fusion-dir", default="artifacts/fusion_meta", help="Directory containing meta-fusion (all heads) predictions")
+    parser.add_argument("--unified-dir", default="artifacts/fusion_all", help="Directory with unified_{val,test}.jsonl (per-head features) for meta explanations")
     parser.add_argument("--heads-dirs", nargs="*", default=None, help="Optional list of additional head directories to include (expects calibration_eval.json inside each)")
     parser.add_argument("--cascade-dir", default=None, help="Optional cascade directory (overrides artifacts/cascade)")
     parser.add_argument("--train-jsonl", default="data/pages_train.jsonl")
@@ -2294,6 +2295,416 @@ def main():
 
     # Interpretability samples
     if args.lime or args.shap:
+        # Helper: meta (tabular) explanations using per-head features
+        def _load_unified_rows(uni_dir: str):
+            uv = os.path.join(uni_dir, "unified_val.jsonl")
+            ut = os.path.join(uni_dir, "unified_test.jsonl")
+            if not (os.path.exists(uv) and os.path.exists(ut)):
+                return None
+            def _load(path: str):
+                rows = []
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                    for line in f:
+                        if not line.strip():
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except Exception:
+                            continue
+                        rows.append(obj)
+                return rows
+            rv = _load(uv)
+            rt = _load(ut)
+            if not rv or not rt:
+                return None
+            # Determine head names from first test row
+            head_keys = sorted(list((rt[0].get("heads") or {}).keys()))
+            return {"val": rv, "test": rt, "head_keys": head_keys}
+
+        def _build_meta_predictor(meta_dir: str, feature_names: List[str]):
+            # Try logistic stacker first
+            logw = os.path.join(meta_dir, "meta_logistic_weights.json")
+            if os.path.exists(logw):
+                try:
+                    cfg = json.load(open(logw, "r", encoding="utf-8"))
+                    coef = np.array(cfg.get("coef"), dtype=float).reshape(-1)
+                    intercept = float(np.array(cfg.get("intercept"), dtype=float).reshape(-1)[0])
+                    used = cfg.get("head_names") or []
+                    mu = np.array(cfg.get("scaler_mean") or [], dtype=float).reshape(-1)
+                    sc = np.array(cfg.get("scaler_scale") or [], dtype=float).reshape(-1)
+                    # Map feature_names -> indices of used
+                    idx = [feature_names.index(h) for h in used if h in feature_names]
+                    def predict(X: np.ndarray) -> np.ndarray:
+                        Xs = X[:, idx]
+                        if mu.size and sc.size and mu.size == Xs.shape[1] and sc.size == Xs.shape[1]:
+                            Xs = (Xs - mu) / np.clip(sc, 1e-8, None)
+                        z = Xs @ coef[: Xs.shape[1]] + intercept
+                        p1 = 1.0 / (1.0 + np.exp(-z))
+                        return np.vstack([1.0 - p1, p1]).T
+                    return predict, {"type": "logistic", "used": used}
+                except Exception:
+                    pass
+            # Fallback: simple weights
+            w_path = os.path.join(meta_dir, "weights.json")
+            if os.path.exists(w_path):
+                try:
+                    ws = json.load(open(w_path, "r", encoding="utf-8"))
+                    wmap = ws.get("weights") or {}
+                    used = [h for h in feature_names if h in wmap]
+                    wvec = np.array([float(wmap[h]) for h in used], dtype=float)
+                    wsum = float(wvec.sum())
+                    if wsum <= 0:
+                        wvec = np.ones_like(wvec) / max(1, len(wvec))
+                    else:
+                        wvec = wvec / wsum
+                    def predict(X: np.ndarray) -> np.ndarray:
+                        idx = [feature_names.index(h) for h in used]
+                        pv = np.clip(X[:, idx] @ wvec, 0.0, 1.0)
+                        return np.vstack([1.0 - pv, pv]).T
+                    return predict, {"type": "weights", "used": used, "w": wvec.tolist()}
+                except Exception:
+                    pass
+            return None, {"type": "none"}
+
+        def _build_meta_matrix(unified_rows: List[Dict[str, Any]], head_order: List[str]) -> tuple[np.ndarray, List[str], List[int], List[str | None]]:
+            X: List[List[float]] = []
+            ids: List[str] = []
+            labels: List[int] = []
+            urls: List[str | None] = []
+            for obj in unified_rows:
+                try:
+                    ids.append(str(obj.get("id")))
+                    labels.append(int(obj.get("label", 0)))
+                    urls.append(obj.get("url"))
+                    row = [float((obj.get("heads") or {}).get(h, 0.0)) for h in head_order]
+                    X.append(row)
+                except Exception:
+                    continue
+            return np.array(X, dtype=float), ids, labels, urls
+
+        def explain_lime_meta(meta_dir: str, unified_dir: str, out_dir: str, num_samples: int, max_chars: int = 0):
+            try:
+                from lime.lime_tabular import LimeTabularExplainer
+            except Exception:
+                print("[INFO] LIME not installed; skipping Meta LIME")
+                return
+            uni = _load_unified_rows(unified_dir)
+            if not uni:
+                print("[INFO] Unified per-head features missing; skip Meta LIME")
+                return
+            head_keys = list(uni["head_keys"])  # feature order
+            X_all, ids_all, y_all, urls = _build_meta_matrix(uni["test"], head_keys)
+            if X_all.size == 0:
+                return
+            # Build predictor over features using meta weights/stacker
+            predictor, meta_info = _build_meta_predictor(meta_dir, head_keys)
+            if predictor is None:
+                print("[INFO] Meta predictor not found; skip Meta LIME")
+                return
+            explainer = LimeTabularExplainer(X_all, feature_names=head_keys, class_names=["benign","phish"], discretize_continuous=False, verbose=False)
+            os.makedirs(out_dir, exist_ok=True)
+            # Pick samples: top N pos and top N neg by label ordering
+            # Choose up to N positive and N negative samples (by label)
+            pos_idx = [i for i, y in enumerate(y_all) if int(y) == 1][: max(1, args.num_expl)]
+            neg_idx = [i for i, y in enumerate(y_all) if int(y) == 0][: max(1, args.num_expl)]
+            chosen = (pos_idx + neg_idx)[: max(1, args.num_expl)]
+            for i in chosen:
+                rid = ids_all[i]
+                x0 = X_all[i]
+                try:
+                    exp = explainer.explain_instance(x0, lambda z: predictor(np.array(z)), num_features=min(10, len(head_keys)), num_samples=num_samples)
+                except Exception as e:
+                    print(f"[WARN] Meta LIME failed on {rid}: {e}")
+                    continue
+                # Build small HTML with feature contributions
+                try:
+                    feats = exp.as_list(label=1)
+                except Exception:
+                    feats = exp.as_list()
+                rows_html = "".join(
+                    f"<tr><td class='mono'>{escape_html(str(k))}</td><td class='mono' style='text-align:right'>{float(v):.4f}</td></tr>"
+                    for k, v in feats
+                )
+                # Compute prediction for header pill
+                try:
+                    pred_vec = predictor(x0.reshape(1, -1))[0]
+                    p = pred_vec.tolist()
+                except Exception:
+                    p = [float('nan'), float('nan')]
+                bars = _prob_bars_html(p, ["benign","phish"]) if isinstance(p, list) and len(p) == 2 else ""
+                pred_label = "phish" if isinstance(p, list) and len(p) == 2 and p[1] >= p[0] else "?"
+                pred_prob = (max(p) if isinstance(p, list) and len(p) == 2 else float('nan'))
+                header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                url_i = urls[i] if i < len(urls) else None
+                info = [("ID", rid), ("Explainer", "LIME (Meta)"), ("Stacker", meta_info.get("type","?")), ("URL", url_i or "-")]
+                # Feature snapshot (raw per-head probabilities)
+                snap_rows = "".join(
+                    f"<tr><td class='mono'>{escape_html(h)}</td><td class='mono' style='text-align:right'>{float(x0[j]):.4f}</td></tr>"
+                    for j, h in enumerate(head_keys)
+                )
+                snap_tbl = f"<div class='card' style='margin:8px 0 0 0'><h4 style='margin:0 0 6px 0'>Feature snapshot</h4><table class='tbl'><thead><tr><th>feature</th><th>p(head)</th></tr></thead><tbody>{snap_rows}</tbody></table></div>"
+                # Compose body
+                body = (
+                    f"<h3 style='margin:0 0 6px 0'>Feature contributions</h3>"
+                    f"<table class='tbl'><thead><tr><th>feature</th><th>weight</th></tr></thead><tbody>{rows_html}</tbody></table>"
+                    f"<div style='margin-top:8px'>{bars}</div>"
+                    + snap_tbl
+                )
+                html = _wrap_expl_html("LIME (Meta)", url_i, info, body, details_extra_html="", header_extra_html=header_pill)
+                out_path = os.path.join(out_dir, f"lime_meta_{rid}.html")
+                try:
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print(f"[INFO] Wrote Meta LIME: {out_path}")
+                except Exception:
+                    pass
+
+        def explain_shap_meta(meta_dir: str, unified_dir: str, out_dir: str, num_samples: int):
+            try:
+                import shap
+            except Exception:
+                print("[INFO] SHAP not installed; skipping Meta SHAP")
+                return
+            uni = _load_unified_rows(unified_dir)
+            if not uni:
+                print("[INFO] Unified per-head features missing; skip Meta SHAP")
+                return
+            head_keys = list(uni["head_keys"])  # feature order
+            X_all, ids_all, y_all, urls = _build_meta_matrix(uni["test"], head_keys)
+            if X_all.size == 0:
+                return
+            predictor, meta_info = _build_meta_predictor(meta_dir, head_keys)
+            if predictor is None:
+                print("[INFO] Meta predictor not found; skip Meta SHAP")
+                return
+            os.makedirs(out_dir, exist_ok=True)
+            # Background for KernelExplainer
+            bg_n = max(1, min(len(X_all), args.xai_background))
+            bg = X_all[:bg_n]
+            try:
+                explainer = shap.KernelExplainer(lambda z: predictor(np.array(z)), bg)
+            except Exception as e:
+                print(f"[INFO] Meta SHAP explainer init failed: {e}")
+                return
+            # Choose samples
+            # Choose up to N positive and N negative samples (by label)
+            pos_idx = [i for i, y in enumerate(y_all) if int(y) == 1][: max(1, args.num_expl)]
+            neg_idx = [i for i, y in enumerate(y_all) if int(y) == 0][: max(1, args.num_expl)]
+            chosen = (pos_idx + neg_idx)[: max(1, args.num_expl)]
+            for i in chosen:
+                rid = ids_all[i]
+                x0 = X_all[i:i+1]
+                try:
+                    # Compute SHAP values (class 1 contributions)
+                    sv = explainer.shap_values(x0, nsamples=max(50, min(200, num_samples)))
+                    # KernelExplainer returns list per class; take class 1 if available
+                    if isinstance(sv, list) and len(sv) > 1:
+                        vals = np.array(sv[1]).reshape(-1)
+                    else:
+                        vals = np.array(sv).reshape(-1)
+                    pairs = list(zip(head_keys[: len(vals)], vals.tolist()))
+                    pairs.sort(key=lambda t: abs(t[1]), reverse=True)
+                    rows_html = "".join(
+                        f"<tr><td class='mono'>{escape_html(str(k))}</td><td class='mono' style='text-align:right'>{float(v):.4f}</td></tr>"
+                        for k, v in pairs
+                    )
+                    try:
+                        pred_vec = predictor(x0)[0]
+                        p = pred_vec.tolist()
+                    except Exception:
+                        p = [float('nan'), float('nan')]
+                    bars = _prob_bars_html(p, ["benign","phish"]) if isinstance(p, list) and len(p) == 2 else ""
+                    pred_label = "phish" if isinstance(p, list) and len(p) == 2 and p[1] >= p[0] else "?"
+                    pred_prob = (max(p) if isinstance(p, list) and len(p) == 2 else float('nan'))
+                    header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                    url_i = urls[i] if i < len(urls) else None
+                    info = [("ID", rid), ("Explainer", "SHAP (Meta)"), ("Stacker", meta_info.get("type","?")), ("URL", url_i or "-")]
+                    # Feature snapshot table
+                    xrow = X_all[i]
+                    snap_rows = "".join(
+                        f"<tr><td class='mono'>{escape_html(h)}</td><td class='mono' style='text-align:right'>{float(xrow[j]):.4f}</td></tr>"
+                        for j, h in enumerate(head_keys)
+                    )
+                    snap_tbl = f"<div class='card' style='margin:8px 0 0 0'><h4 style='margin:0 0 6px 0'>Feature snapshot</h4><table class='tbl'><thead><tr><th>feature</th><th>p(head)</th></tr></thead><tbody>{snap_rows}</tbody></table></div>"
+                    body = (
+                        f"<h3 style='margin:0 0 6px 0'>Feature contributions</h3>"
+                        f"<table class='tbl'><thead><tr><th>feature</th><th>phi</th></tr></thead><tbody>{rows_html}</tbody></table>"
+                        f"<div style='margin-top:8px'>{bars}</div>"
+                        + snap_tbl
+                    )
+                    html = _wrap_expl_html("SHAP (Meta)", url_i, info, body, details_extra_html="", header_extra_html=header_pill)
+                    out_path = os.path.join(out_dir, f"shap_meta_{rid}.html")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print(f"[INFO] Wrote Meta SHAP: {out_path}")
+                except Exception as e:
+                    print(f"[WARN] Meta SHAP failed on {rid}: {e}")
+
+        # --- New: Fused (DOM+JS) tabular explainers using unified features and fusion weights ---
+        def _build_fused_predictor(fusion_dir: str, feature_names: List[str]):
+            # Try to load fusion logistic weights exported by fuse_heads
+            try:
+                wj = json.load(open(os.path.join(fusion_dir, "fusion_weights.json"), "r", encoding="utf-8"))
+                used = [h for h in (wj.get("head_names") or []) if h in feature_names]
+                coef = np.array([float(c) for h, c in zip(wj.get("head_names", []), wj.get("coefficients", [])) if h in used], dtype=float)
+                bias = float(wj.get("intercept", 0.0))
+                # Optional scaling not captured; proceed in probability space as approximation
+                def predict(X: np.ndarray) -> np.ndarray:
+                    z = X[:, [feature_names.index(h) for h in used]] @ coef + bias
+                    p1 = 1.0 / (1.0 + np.exp(-z))
+                    p1 = np.clip(p1, 0.0, 1.0)
+                    return np.vstack([1.0 - p1, p1]).T
+                return predict, {"type": "logistic", "used": used, "coef": coef.tolist(), "bias": bias}
+            except Exception:
+                pass
+            # Fallback: simple average over available DOM/JS heads
+            used = [h for h in ["p_dom", "p_js"] if h in feature_names]
+            if not used:
+                return None, {"type": "none"}
+            def predict(X: np.ndarray) -> np.ndarray:
+                idx = [feature_names.index(h) for h in used]
+                p1 = np.clip(X[:, idx].mean(axis=1), 0.0, 1.0)
+                return np.vstack([1.0 - p1, p1]).T
+            return predict, {"type": "average", "used": used}
+
+        def explain_lime_fused(fusion_dir: str, unified_dir: str, out_dir: str, num_samples: int):
+            try:
+                from lime.lime_tabular import LimeTabularExplainer
+            except Exception:
+                print("[INFO] LIME not installed; skipping Fused LIME")
+                return
+            uni = _load_unified_rows(unified_dir)
+            if not uni:
+                print("[INFO] Unified per-head features missing; skip Fused LIME")
+                return
+            head_keys = list(uni["head_keys"])  # feature order (all heads present)
+            # Use only features available to fused (DOM+JS preferred)
+            used_feats = [h for h in ["p_dom", "p_js"] if h in head_keys]
+            if not used_feats:
+                print("[INFO] No DOM/JS features for fused explanations")
+                return
+            X_all, ids_all, y_all, urls = _build_meta_matrix(uni["test"], head_keys)
+            predictor, info = _build_fused_predictor(fusion_dir, head_keys)
+            if predictor is None:
+                print("[INFO] Fused predictor not found; skip Fused LIME")
+                return
+            os.makedirs(out_dir, exist_ok=True)
+            explainer = LimeTabularExplainer(X_all, feature_names=head_keys, class_names=["benign","phish"], discretize_continuous=False, verbose=False)
+            pos_idx = [i for i, y in enumerate(y_all) if int(y) == 1][: max(1, args.num_expl)]
+            neg_idx = [i for i, y in enumerate(y_all) if int(y) == 0][: max(1, args.num_expl)]
+            for i in (pos_idx + neg_idx):
+                rid = ids_all[i]
+                x0 = X_all[i]
+                try:
+                    exp = explainer.explain_instance(x0, lambda z: predictor(np.array(z)), num_features=min(10, len(used_feats)), num_samples=num_samples)
+                except Exception as e:
+                    print(f"[WARN] Fused LIME failed on {rid}: {e}")
+                    continue
+                try:
+                    feats = exp.as_list(label=1)
+                except Exception:
+                    feats = exp.as_list()
+                rows_html = "".join(
+                    f"<tr><td class='mono'>{escape_html(str(k))}</td><td class='mono' style='text-align:right'>{float(v):.4f}</td></tr>"
+                    for k, v in feats
+                )
+                try:
+                    p = predictor(x0.reshape(1, -1))[0].tolist()
+                except Exception:
+                    p = [float('nan'), float('nan')]
+                bars = _prob_bars_html(p, ["benign","phish"]) if isinstance(p, list) and len(p) == 2 else ""
+                pred_label = "phish" if isinstance(p, list) and len(p) == 2 and p[1] >= p[0] else "?"
+                pred_prob = (max(p) if isinstance(p, list) and len(p) == 2 else float('nan'))
+                header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                url_i = urls[i] if i < len(urls) else None
+                info_rows = [("ID", rid), ("Explainer", "LIME (Fused)"), ("Stacker", info.get("type","?")), ("URL", url_i or "-")]
+                snap_rows = "".join(
+                    f"<tr><td class='mono'>{escape_html(h)}</td><td class='mono' style='text-align:right'>{float(x0[head_keys.index(h)]):.4f}</td></tr>"
+                    for h in used_feats
+                )
+                snap_tbl = f"<div class='card' style='margin:8px 0 0 0'><h4 style='margin:0 0 6px 0'>Feature snapshot</h4><table class='tbl'><thead><tr><th>feature</th><th>p(head)</th></tr></thead><tbody>{snap_rows}</tbody></table></div>"
+                body = f"<h3 style='margin:0 0 6px 0'>Feature contributions</h3><table class='tbl'><thead><tr><th>feature</th><th>weight</th></tr></thead><tbody>{rows_html}</tbody></table><div style='margin-top:8px'>{bars}</div>" + snap_tbl
+                html = _wrap_expl_html("LIME (Fused)", url_i, info_rows, body, details_extra_html="", header_extra_html=header_pill)
+                out_path = os.path.join(out_dir, f"lime_fused_{rid}.html")
+                try:
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print(f"[INFO] Wrote Fused LIME: {out_path}")
+                except Exception:
+                    pass
+
+        def explain_shap_fused(fusion_dir: str, unified_dir: str, out_dir: str, num_samples: int):
+            try:
+                import shap
+            except Exception:
+                print("[INFO] SHAP not installed; skipping Fused SHAP")
+                return
+            uni = _load_unified_rows(unified_dir)
+            if not uni:
+                print("[INFO] Unified per-head features missing; skip Fused SHAP")
+                return
+            head_keys = list(uni["head_keys"])  # feature order
+            used_feats = ["p_dom", "p_js"]
+            used_feats = [h for h in used_feats if h in head_keys]
+            if not used_feats:
+                print("[INFO] No DOM/JS features for fused explanations")
+                return
+            X_all, ids_all, y_all, urls = _build_meta_matrix(uni["test"], head_keys)
+            predictor, info = _build_fused_predictor(fusion_dir, head_keys)
+            if predictor is None:
+                print("[INFO] Fused predictor not found; skip Fused SHAP")
+                return
+            os.makedirs(out_dir, exist_ok=True)
+            bg_n = max(1, min(len(X_all), args.xai_background))
+            bg = X_all[:bg_n]
+            try:
+                explainer = shap.KernelExplainer(lambda z: predictor(np.array(z)), bg)
+            except Exception as e:
+                print(f"[INFO] Fused SHAP explainer init failed: {e}")
+                return
+            pos_idx = [i for i, y in enumerate(y_all) if int(y) == 1][: max(1, args.num_expl)]
+            neg_idx = [i for i, y in enumerate(y_all) if int(y) == 0][: max(1, args.num_expl)]
+            for i in (pos_idx + neg_idx):
+                rid = ids_all[i]
+                x0 = X_all[i:i+1]
+                try:
+                    sv = explainer.shap_values(x0, nsamples=max(50, min(200, num_samples)))
+                    if isinstance(sv, list) and len(sv) > 1:
+                        vals = np.array(sv[1]).reshape(-1)
+                    else:
+                        vals = np.array(sv).reshape(-1)
+                    pairs = list(zip(head_keys[: len(vals)], vals.tolist()))
+                    # Keep only used features
+                    pairs = [p for p in pairs if p[0] in used_feats]
+                    pairs.sort(key=lambda t: abs(t[1]), reverse=True)
+                    rows_html = "".join(
+                        f"<tr><td class='mono'>{escape_html(str(k))}</td><td class='mono' style='text-align:right'>{float(v):.4f}</td></tr>"
+                        for k, v in pairs
+                    )
+                    try:
+                        p = predictor(x0)[0].tolist()
+                    except Exception:
+                        p = [float('nan'), float('nan')]
+                    bars = _prob_bars_html(p, ["benign","phish"]) if isinstance(p, list) and len(p) == 2 else ""
+                    pred_label = "phish" if isinstance(p, list) and len(p) == 2 and p[1] >= p[0] else "?"
+                    pred_prob = (max(p) if isinstance(p, list) and len(p) == 2 else float('nan'))
+                    header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                    url_i = urls[i] if i < len(urls) else None
+                    info_rows = [("ID", rid), ("Explainer", "SHAP (Fused)"), ("Stacker", info.get("type","?")), ("URL", url_i or "-")]
+                    snap_rows = "".join(
+                        f"<tr><td class='mono'>{escape_html(h)}</td><td class='mono' style='text-align:right'>{float(X_all[i][head_keys.index(h)]):.4f}</td></tr>"
+                        for h in used_feats
+                    )
+                    snap_tbl = f"<div class='card' style='margin:8px 0 0 0'><h4 style='margin:0 0 6px 0'>Feature snapshot</h4><table class='tbl'><thead><tr><th>feature</th><th>p(head)</th></tr></thead><tbody>{snap_rows}</tbody></table></div>"
+                    body = f"<h3 style='margin:0 0 6px 0'>Feature contributions</h3><table class='tbl'><thead><tr><th>feature</th><th>phi</th></tr></thead><tbody>{rows_html}</tbody></table><div style='margin-top:8px'>{bars}</div>" + snap_tbl
+                    html = _wrap_expl_html("SHAP (Fused)", url_i, info_rows, body, details_extra_html="", header_extra_html=header_pill)
+                    out_path = os.path.join(out_dir, f"shap_fused_{rid}.html")
+                    with open(out_path, "w", encoding="utf-8") as f:
+                        f.write(html)
+                    print(f"[INFO] Wrote Fused SHAP: {out_path}")
+                except Exception as e:
+                    print(f"[WARN] Fused SHAP failed on {rid}: {e}")
+
         # pick some examples per class from test set for DOM
         pos = [r for r in rows_te if int(r.get("label", 0)) == 1][: args.num_expl]
         neg = [r for r in rows_te if int(r.get("label", 0)) == 0][: args.num_expl]
@@ -2357,7 +2768,236 @@ def main():
                     tokenizer_mode=args.xai_tokenizer,
                 )
 
+        # Fused (DOM+JS) XAI using unified features (tabular)
+        if (args.lime or args.shap) and args.fusion_dir and args.unified_dir:
+            try:
+                if args.lime:
+                    explain_lime_fused(args.fusion_dir, args.unified_dir, os.path.join(report_dir, "lime_fused"), num_samples=args.xai_num_samples)
+                if args.shap:
+                    explain_shap_fused(args.fusion_dir, args.unified_dir, os.path.join(report_dir, "shap_fused"), num_samples=args.xai_num_samples)
+            except Exception as e:
+                print(f"[WARN] Fused explanations failed: {e}")
+
+        # Meta-fused explanations (tabular over per-head probabilities)
+        # Only if meta predictions exist and unified features are available
+        if (meta_val and meta_test):
+            try:
+                if args.lime:
+                    explain_lime_meta(args.meta_fusion_dir, args.unified_dir, os.path.join(report_dir, "lime_meta"), num_samples=args.xai_num_samples)
+                if args.shap:
+                    explain_shap_meta(args.meta_fusion_dir, args.unified_dir, os.path.join(report_dir, "shap_meta"), num_samples=args.xai_num_samples)
+            except Exception as e:
+                print(f"[WARN] Meta explanations failed: {e}")
+
     print(f"[INFO] Report written to: {report_dir}")
+
+    # --- Lightweight heads (URL/Text/JS CharCNN base+aug) explanations ---
+    def _explain_charcnn_head(
+        head: str,
+        model_dir: str,
+        jsonl_path: str,
+        out_prefix: str,
+        raw_field: str | None = None,
+    ):
+        """Generate LIME/SHAP explanations for a char-CNN head using pseudo-token text (idN tokens).
+        head: one of {'url','text','js'}; js uses JsSeqDataset; raw_field='js_augmented' selects aug variant.
+        out_prefix: subdir name like 'url', 'text', 'jschar_base', 'jschar_aug'.
+        """
+        try:
+            from phisdom.data.new_heads import (
+                UrlSeqDataset, TextSeqDataset, JsSeqDataset, PaddedSeqCollator,
+            )
+            from torch.utils.data import DataLoader
+            import torch as _torch
+            import numpy as _np
+        except Exception as e:
+            print(f"[INFO] Skipping {head} explanations (data loader import failed): {e}")
+            return
+
+        # Build dataset
+        if head == "url":
+            ds = UrlSeqDataset(jsonl_path)
+        elif head == "text":
+            ds = TextSeqDataset(jsonl_path)
+        else:
+            ds = JsSeqDataset(jsonl_path, raw_field=raw_field)
+        if len(ds) == 0:
+            print(f"[INFO] No samples in {head} dataset; skipping")
+            return
+        dl = DataLoader(ds, batch_size=128, shuffle=False, collate_fn=PaddedSeqCollator(pad_idx=0))  # type: ignore[arg-type]
+
+        # Load model + temperature
+        try:
+            if head == "url":
+                from phisdom.models.heads import UrlCharCNN as _H
+            elif head == "text":
+                from phisdom.models.heads import TextCharCNN as _H
+            else:
+                from phisdom.models.heads import JsCharCNN as _H
+        except Exception as e:
+            print(f"[INFO] Skipping {head} explanations (model import failed): {e}")
+            return
+        dev = _torch.device("cuda" if (args.xai_device == "cuda" and _torch.cuda.is_available()) else "cpu")
+        model = _H().to(dev)
+        state_p = os.path.join(model_dir, "model.pt")
+        if not os.path.exists(state_p):
+            print(f"[INFO] {head} model.pt missing in {model_dir}; skipping")
+            return
+        model.load_state_dict(_torch.load(state_p, map_location=dev))
+        model.eval()
+        # Temperature (optional)
+        logT = None
+        tpath = os.path.join(model_dir, "temp_scale.pt")
+        if os.path.exists(tpath):
+            try:
+                ck = _torch.load(tpath, map_location="cpu")
+                logT = float(ck.get("log_T", _torch.zeros(())))
+            except Exception:
+                logT = None
+
+        # Compute test probabilities for selection
+        all_probs: list[float] = []
+        all_labels: list[int] = []
+        with _torch.no_grad():
+            for batch in dl:
+                X = batch["input_ids"].to(dev)
+                logits = model(X)
+                if logT is not None:
+                    logits = logits / float(_torch.exp(_torch.tensor(logT)))
+                p = _torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+                all_probs.extend(p.tolist())
+                all_labels.extend([int(x) for x in batch["labels"].detach().cpu().numpy().tolist()])
+
+        # Pick examples: up to num_expl per class
+        idx_pos = [i for i, y in enumerate(all_labels) if y == 1]
+        idx_neg = [i for i, y in enumerate(all_labels) if y == 0]
+        # Prefer middle-confidence for variety
+        idx_pos = sorted(idx_pos, key=lambda i: abs(0.5 - all_probs[i]))[: max(1, args.num_expl)]
+        idx_neg = sorted(idx_neg, key=lambda i: abs(0.5 - all_probs[i]))[: max(1, args.num_expl)]
+        sel = idx_pos + idx_neg
+        if not sel:
+            print(f"[INFO] No suitable {head} samples for XAI")
+            return
+
+        # Build text form from seq: idN tokens
+        def seq_to_text(i: int) -> tuple[str, str]:
+            row = ds[i]
+            seq = row.get("seq") or []
+            toks = [f"id{int(t)}" for t in list(seq)[: 512]]
+            rid = str(row.get("id", i))
+            return " ".join(toks) or ".", rid
+
+        # Predictor mapping text -> probs using the same model (re-tokenize idN->int)
+        def predict_proba(texts: list[str]) -> _np.ndarray:
+            arr: list[list[int]] = []
+            for t in texts:
+                words = (t or "").split()
+                ints: list[int] = []
+                for w in words[: 512]:
+                    if w.startswith("id") and w[2:].isdigit():
+                        ints.append(int(w[2:]))
+                arr.append(ints)
+            maxL = max(1, max((len(s) for s in arr), default=1))
+            X = _torch.zeros((len(arr), maxL), dtype=_torch.long)
+            for i, s in enumerate(arr):
+                if s:
+                    X[i, : len(s)] = _torch.tensor(s[:maxL], dtype=_torch.long)
+            X = X.to(dev)
+            with _torch.no_grad():
+                logits = model(X)
+                if logT is not None:
+                    logits = logits / float(_torch.exp(_torch.tensor(logT)))
+                probs1 = _torch.sigmoid(logits).detach().cpu().numpy().reshape(-1)
+            p0 = 1.0 - probs1
+            return _np.vstack([p0, probs1]).T
+
+        # Generate LIME/SHAP pages
+        ldir = os.path.join(report_dir, f"lime_{out_prefix}")
+        sdir = os.path.join(report_dir, f"shap_{out_prefix}")
+        os.makedirs(ldir, exist_ok=True)
+        os.makedirs(sdir, exist_ok=True)
+        # LIME
+        if args.lime:
+            try:
+                from lime.lime_text import LimeTextExplainer  # type: ignore
+                expl = LimeTextExplainer(class_names=["benign", "phish"])  # type: ignore
+                for i in sel:
+                    text_i, rid = seq_to_text(i)
+                    # Guard degenerate predictions
+                    try:
+                        pv = predict_proba([text_i])[0].tolist()
+                        if not (0.01 < pv[1] < 0.99):
+                            continue
+                        exp = expl.explain_instance(text_i, predict_proba, num_features=10, num_samples=args.xai_num_samples)
+                        toks_w = exp.as_list(label=1)
+                        toks = [t for t, _ in toks_w]
+                        vals = np.array([float(w) for _, w in toks_w], dtype=float)
+                        bars = _prob_bars_html(pv, ["benign", "phish"]) 
+                        pred_label = "phish" if pv[1] >= pv[0] else "benign"
+                        pred_prob = max(pv)
+                        header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                        meta = [("ID", str(rid)), ("Explainer", f"LIME ({out_prefix})"), ("Device", str(dev))]
+                        _save_shap_text_html(os.path.join(ldir, f"lime_{out_prefix}_{rid}.html"), text_i, toks, vals, class_index=1, title=f"LIME ({out_prefix})", url=None, info=meta, details_extra_html=f"<div style='margin-top:8px'>{bars}</div>", header_extra_html=header_pill)
+                    except Exception as e:
+                        print(f"[WARN] LIME ({out_prefix}) failed for {rid}: {e}")
+            except Exception:
+                print(f"[INFO] LIME not installed; skipping LIME for {out_prefix}")
+        # SHAP
+        if args.shap:
+            try:
+                import shap  # type: ignore
+                try:
+                    Expl = getattr(__import__("shap.explainers", fromlist=["Text"]), "Text")  # type: ignore[attr-defined]
+                    shap_expl = Expl(predict_proba)  # type: ignore
+                except Exception:
+                    masker = shap.maskers.Text()  # type: ignore[attr-defined]
+                    shap_expl = shap.Explainer(predict_proba, masker)
+                for i in sel[: max(1, args.xai_num_samples // 10)]:
+                    text_i, rid = seq_to_text(i)
+                    try:
+                        pv = predict_proba([text_i])[0].tolist()
+                        if not (0.01 < pv[1] < 0.99):
+                            continue
+                        sv = shap_expl([text_i], max_evals=args.xai_num_samples)  # type: ignore[call-arg]
+                        try:
+                            ex0 = sv[0]
+                        except Exception:
+                            ex0 = sv
+                        # Try SHAP's HTML plot; otherwise fall back to our renderer
+                        outp = os.path.join(sdir, f"shap_{out_prefix}_{rid}.html")
+                        try:
+                            html_obj = shap.plots.text(ex0, display=False)
+                            shap.save_html(outp, html_obj)
+                            pred_label = "phish" if pv[1] >= pv[0] else "benign"
+                            pred_prob = max(pv)
+                            header_pill = f"<span class='pill' style='background:#1a2a1a;border:1px solid #245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</span>"
+                            _inject_link_into_html(outp, None, extra_html=header_pill)
+                        except Exception:
+                            vals = _select_class_values(getattr(ex0, "values", []), class_index=1)
+                            toks = list(getattr(ex0, "data", [])) if hasattr(ex0, "data") else text_i.split()
+                            bars = _prob_bars_html(pv, ["benign", "phish"]) 
+                            pred_label = "phish" if pv[1] >= pv[0] else "benign"
+                            pred_prob = max(pv)
+                            header_pill = f"<div class='pill' style='margin-left:8px;background:#1a2a1a;border-color:#245c2a;color:#a7e3a7'>pred: {pred_label} · {pred_prob:.2%}</div>"
+                            meta = [("ID", str(rid)), ("Explainer", f"SHAP ({out_prefix})"), ("Device", str(dev))]
+                            _save_shap_text_html(outp, text_i, toks, vals, class_index=1, title=f"SHAP ({out_prefix})", url=None, info=meta, details_extra_html=f"<div style='margin-top:8px'>{bars}</div>", header_extra_html=header_pill)
+                    except Exception as e:
+                        print(f"[WARN] SHAP ({out_prefix}) failed for {rid}: {e}")
+            except Exception:
+                print(f"[INFO] SHAP not installed; skipping SHAP for {out_prefix}")
+
+    # Only attempt if heads directories exist
+    try:
+        if os.path.isdir("artifacts/url_head"):
+            _explain_charcnn_head("url", "artifacts/url_head", args.test_jsonl, out_prefix="url")
+        if os.path.isdir("artifacts/text_head"):
+            _explain_charcnn_head("text", "artifacts/text_head", args.test_jsonl, out_prefix="text")
+        if os.path.isdir("artifacts/js_charcnn"):
+            _explain_charcnn_head("js", "artifacts/js_charcnn", args.test_jsonl, out_prefix="jschar_base")
+        if os.path.isdir("artifacts/js_charcnn_aug"):
+            _explain_charcnn_head("js", "artifacts/js_charcnn_aug", args.test_jsonl, out_prefix="jschar_aug", raw_field="js_augmented")
+    except Exception as e:
+        print(f"[WARN] Lightweight head explanations failed: {e}")
 
     # Build an HTML summary page linking key artifacts
     def write_html_index():
@@ -2368,7 +3008,6 @@ def main():
             except Exception:
                 return None
 
-        # Safe float formatter for HTML (avoids formatting None)
         def fmt4(x) -> str:
             try:
                 v = float(x)
@@ -2378,12 +3017,14 @@ def main():
                 return f"{v:.4f}"
             except Exception:
                 return "n/a"
+
         dom_cal = safe_load(os.path.join(args.model_dir, "calibration.json"))
         js_cal = safe_load(os.path.join(args.js_dir, "calibration.json"))
         fu_cal = safe_load(os.path.join(args.fusion_dir, "calibration.json"))
         meta_cal = safe_load(os.path.join(args.meta_fusion_dir, "calibration.json"))
         metrics_json = safe_load(os.path.join(report_dir, "summary.json"))
         pngs = [p for p in os.listdir(report_dir) if p.endswith(".png")]
+
         used_splits_json = metrics_json.get("used_splits") if isinstance(metrics_json, dict) else None
         used_note = ""
         if isinstance(used_splits_json, dict):
@@ -2399,24 +3040,48 @@ def main():
                 )
             except Exception:
                 used_note = ""
+
         lime_dom_dir = os.path.join(report_dir, "lime_dom")
         shap_dom_dir = os.path.join(report_dir, "shap_dom")
         lime_js_dir = os.path.join(report_dir, "lime_js")
         shap_js_dir = os.path.join(report_dir, "shap_js")
+        lime_meta_dir = os.path.join(report_dir, "lime_meta")
+        shap_meta_dir = os.path.join(report_dir, "shap_meta")
+        lime_fused_dir = os.path.join(report_dir, "lime_fused")
+        shap_fused_dir = os.path.join(report_dir, "shap_fused")
         lime_dom_files = sorted([f for f in os.listdir(lime_dom_dir) if f.endswith(".html")]) if os.path.isdir(lime_dom_dir) else []
         shap_dom_files = sorted([f for f in os.listdir(shap_dom_dir) if f.endswith(".html")]) if os.path.isdir(shap_dom_dir) else []
         lime_js_files = sorted([f for f in os.listdir(lime_js_dir) if f.endswith(".html")]) if os.path.isdir(lime_js_dir) else []
         shap_js_files = sorted([f for f in os.listdir(shap_js_dir) if f.endswith(".html")]) if os.path.isdir(shap_js_dir) else []
+        lime_meta_files = sorted([f for f in os.listdir(lime_meta_dir) if f.endswith(".html")]) if os.path.isdir(lime_meta_dir) else []
+        shap_meta_files = sorted([f for f in os.listdir(shap_meta_dir) if f.endswith(".html")]) if os.path.isdir(shap_meta_dir) else []
+        lime_fused_files = sorted([f for f in os.listdir(lime_fused_dir) if f.endswith(".html")]) if os.path.isdir(lime_fused_dir) else []
+        shap_fused_files = sorted([f for f in os.listdir(shap_fused_dir) if f.endswith(".html")]) if os.path.isdir(shap_fused_dir) else []
 
-        # Dataset summary counts
+        # Lightweight head explainer dirs
+        lime_url_dir = os.path.join(report_dir, "lime_url"); shap_url_dir = os.path.join(report_dir, "shap_url")
+        lime_text_dir = os.path.join(report_dir, "lime_text"); shap_text_dir = os.path.join(report_dir, "shap_text")
+        lime_jsb_dir = os.path.join(report_dir, "lime_jschar_base"); shap_jsb_dir = os.path.join(report_dir, "shap_jschar_base")
+        lime_jsa_dir = os.path.join(report_dir, "lime_jschar_aug"); shap_jsa_dir = os.path.join(report_dir, "shap_jschar_aug")
+        lime_url_files = sorted([f for f in os.listdir(lime_url_dir) if f.endswith('.html')]) if os.path.isdir(lime_url_dir) else []
+        shap_url_files = sorted([f for f in os.listdir(shap_url_dir) if f.endswith('.html')]) if os.path.isdir(shap_url_dir) else []
+        lime_text_files = sorted([f for f in os.listdir(lime_text_dir) if f.endswith('.html')]) if os.path.isdir(lime_text_dir) else []
+        shap_text_files = sorted([f for f in os.listdir(shap_text_dir) if f.endswith('.html')]) if os.path.isdir(shap_text_dir) else []
+        lime_jsb_files = sorted([f for f in os.listdir(lime_jsb_dir) if f.endswith('.html')]) if os.path.isdir(lime_jsb_dir) else []
+        shap_jsb_files = sorted([f for f in os.listdir(shap_jsb_dir) if f.endswith('.html')]) if os.path.isdir(shap_jsb_dir) else []
+        lime_jsa_files = sorted([f for f in os.listdir(lime_jsa_dir) if f.endswith('.html')]) if os.path.isdir(lime_jsa_dir) else []
+        shap_jsa_files = sorted([f for f in os.listdir(shap_jsa_dir) if f.endswith('.html')]) if os.path.isdir(shap_jsa_dir) else []
+
         def counts(rows: List[Dict[str, Any]]):
             total = len(rows)
             pos = sum(1 for r in rows if int(r.get("label", 0)) == 1)
             neg = total - pos
             return total, neg, pos
+
         tr_tot, tr_neg, tr_pos = counts(rows_tr)
         va_tot, va_neg, va_pos = counts(rows_va)
         te_tot, te_neg, te_pos = counts(rows_te)
+
         drift = (metrics_json or {}).get("dataset_drift") if isinstance(metrics_json, dict) else None
         drift_html = ""
         if isinstance(drift, dict) and drift.get("full_total"):
@@ -2454,7 +3119,6 @@ def main():
                 f"<table><thead><tr><th>TPR</th><th>Threshold</th><th>FPR</th></tr></thead><tbody>{rows}</tbody></table>"
             )
 
-        # Build a metrics table if available
         def metrics_table(title: str, section: Dict[str, Any] | None):
             if not section:
                 return f"<div class='card'><h3>{title}</h3><p>No metrics.</p></div>"
@@ -2471,7 +3135,6 @@ def main():
                 f"<table><thead><tr>{head}</tr></thead><tbody>{''.join(rows_html)}</tbody></table></div>"
             )
 
-        # Tests overview (import dynamically)
         tests_html = ""
         try:
             from tests import test_metrics as _tm  # type: ignore
@@ -2491,6 +3154,7 @@ def main():
             tests_html = ""
 
         macro_json = (metrics_json or {}).get("macro") if isinstance(metrics_json, dict) else None
+
         def macro_table(macro: Dict[str, Any] | None):
             if not isinstance(macro, dict):
                 return "<div class='card'><h3>Macro Metrics</h3><p>No macro metrics.</p></div>"
@@ -2546,14 +3210,12 @@ def main():
             "<div id='dataset' class='section'><h2 style='margin:0 0 8px 0'>Dataset summary</h2>",
             f"<div class='subgrid'><div class='card'><b>Train</b><div>{tr_tot} docs</div><div>benign: {tr_neg}</div><div>phish: {tr_pos}</div></div>",
             f"<div class='card'><b>Val</b><div>{va_tot} docs</div><div>benign: {va_neg}</div><div>phish: {va_pos}</div></div>",
-            f"<div class='card'><b>Test</b><div>{te_tot} docs</div><div>benign: {te_neg}</div><div>phish: {te_pos}</div></div></div></div>",
-            (drift_html if drift_html else ""),
+            f"<div class='card'><b>Test</b><div>{te_tot} docs</div><div>benign: {te_neg}</div><div>phish: {te_pos}</div></div>" + (drift_html or "") + "</div></div>",
             "<div id='cal' class='section'><h2 style='margin:0 0 8px 0'>Calibration & Metrics</h2>",
             f"<div class='grid'><div class='card'>{metric_block('DOM (MarkupLM)', dom_cal)}</div>",
             f"<div class='card'>{metric_block('JS (CodeT5+)', js_cal)}</div>",
             f"<div class='card'>{metric_block('Fused (DOM+JS)', fu_cal)}</div>",
             f"<div class='card'>{metric_block('Meta Fused (All Heads)', meta_cal)}</div>",
-            # Include light heads if present
             (lambda light: ''.join([
                 f"<div class='card'>{metric_block('URL CharCNN', light.get('url'))}</div>",
                 f"<div class='card'>{metric_block('Text CharCNN', light.get('text'))}</div>",
@@ -2570,7 +3232,6 @@ def main():
             "</div>",
         ]
 
-        # XFusion diagnostics card (if present)
         xfd = (metrics_json or {}).get("xfusion_diagnostics") if isinstance(metrics_json, dict) else None
         if isinstance(xfd, dict):
             try:
@@ -2579,7 +3240,6 @@ def main():
                 corr = xfd.get("correlation_matrix") or []
                 corr_mods = xfd.get("correlation_modalities") or []
                 steps = xfd.get("total_steps")
-                # Build gradient list
                 grad_rows = []
                 for name, val in top_grad[:10]:
                     try:
@@ -2587,7 +3247,6 @@ def main():
                     except Exception:
                         continue
                 grad_tbl = ("<table><thead><tr><th>Param</th><th>|grad|</th></tr></thead><tbody>"+"".join(grad_rows)+"</tbody></table>") if grad_rows else "<p>No gradient stats.</p>"
-                # Modalities stats
                 mod_cards = []
                 for m, stats in modalities.items():
                     if not isinstance(stats, dict):
@@ -2606,7 +3265,6 @@ def main():
                         )
                     except Exception:
                         continue
-                # Correlation matrix
                 corr_html = ""
                 if corr and corr_mods and all(isinstance(r, (list, tuple)) for r in corr):
                     try:
@@ -2627,7 +3285,6 @@ def main():
                         corr_html = "<p>Correlation matrix parse error.</p>"
                 heat_png = "xfusion_corr_heatmap.png"
                 heat_img = f"<div><img src='{heat_png}' alt='corr heatmap'/></div>" if os.path.exists(os.path.join(report_dir, heat_png)) else ""
-                # Attention entropy card (with optional trend + alerts)
                 attn_entropy_html = ""
                 attn_list = xfd.get('attn_entropy') if isinstance(xfd, dict) else None
                 trend = xfd.get('attn_entropy_trend') if isinstance(xfd, dict) else None
@@ -2686,6 +3343,7 @@ def main():
                     )
             except Exception:
                 pass
+
         html.extend([
             "<div id='tests' class='section'><h2 style='margin:0 0 8px 0'>Tests overview</h2>", tests_html, "</div>",
             "<div id='plots' class='section'><h2 style='margin:0 0 8px 0'>Key Plots</h2>",
@@ -2696,9 +3354,8 @@ def main():
         for name in sorted(pngs):
             html.append(f"<div><p class='mono' style='opacity:.75'>{name}</p><img src='{name}'/></div>")
 
-        if lime_dom_files or shap_dom_files or lime_js_files or shap_js_files:
+        if lime_dom_files or shap_dom_files or lime_js_files or shap_js_files or lime_meta_files or shap_meta_files or lime_fused_files or shap_fused_files or lime_url_files or shap_url_files or lime_text_files or shap_text_files or lime_jsb_files or shap_jsb_files or lime_jsa_files or shap_jsa_files:
             html.append("<div id='xai' class='section'><h2 style='margin:0 0 8px 0'>Explanations</h2><div class='grid'>")
-            # Build id->row map for test set to retrieve original URLs
             id2row = {str(r.get("id")): r for r in rows_te if r.get("id") is not None}
 
             if lime_dom_files:
@@ -2733,9 +3390,81 @@ def main():
                     url_html = f" — <a href='{url}' target='_blank'>visit</a>" if url else ""
                     html.append(f"<li><a href='shap_js/{f}' target='_blank'>{f}</a>{url_html}</li>")
                 html.append("</ul></div>")
+            if lime_meta_files:
+                html.append("<div class='card'><h3>LIME (Meta)</h3><ul>")
+                for f in lime_meta_files:
+                    rid = f.replace("lime_meta_", "").replace(".html", "")
+                    url = id2row.get(rid, {}).get("url") if rid in id2row else None
+                    url_html = f" — <a href='{url}' target='_blank'>visit</a>" if url else ""
+                    html.append(f"<li><a href='lime_meta/{f}' target='_blank'>{f}</a>{url_html}</li>")
+                html.append("</ul></div>")
+            if shap_meta_files:
+                html.append("<div class='card'><h3>SHAP (Meta)</h3><ul>")
+                for f in shap_meta_files:
+                    rid = f.replace("shap_meta_", "").replace(".html", "")
+                    url = id2row.get(rid, {}).get("url") if rid in id2row else None
+                    url_html = f" — <a href='{url}' target='_blank'>visit</a>" if url else ""
+                    html.append(f"<li><a href='shap_meta/{f}' target='_blank'>{f}</a>{url_html}</li>")
+                html.append("</ul></div>")
+            if lime_fused_files:
+                html.append("<div class='card'><h3>LIME (Fused DOM+JS)</h3><ul>")
+                for f in lime_fused_files:
+                    rid = f.replace("lime_fused_", "").replace(".html", "")
+                    url = id2row.get(rid, {}).get("url") if rid in id2row else None
+                    url_html = f" — <a href='{url}' target='_blank'>visit</a>" if url else ""
+                    html.append(f"<li><a href='lime_fused/{f}' target='_blank'>{f}</a>{url_html}</li>")
+                html.append("</ul></div>")
+            if shap_fused_files:
+                html.append("<div class='card'><h3>SHAP (Fused DOM+JS)</h3><ul>")
+                for f in shap_fused_files:
+                    rid = f.replace("shap_fused_", "").replace(".html", "")
+                    url = id2row.get(rid, {}).get("url") if rid in id2row else None
+                    url_html = f" — <a href='{url}' target='_blank'>visit</a>" if url else ""
+                    html.append(f"<li><a href='shap_fused/{f}' target='_blank'>{f}</a>{url_html}</li>")
+                html.append("</ul></div>")
+            # Lightweight heads
+            if lime_url_files:
+                html.append("<div class='card'><h3>LIME (URL CharCNN)</h3><ul>")
+                for f in lime_url_files:
+                    html.append(f"<li><a href='lime_url/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if shap_url_files:
+                html.append("<div class='card'><h3>SHAP (URL CharCNN)</h3><ul>")
+                for f in shap_url_files:
+                    html.append(f"<li><a href='shap_url/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if lime_text_files:
+                html.append("<div class='card'><h3>LIME (Text CharCNN)</h3><ul>")
+                for f in lime_text_files:
+                    html.append(f"<li><a href='lime_text/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if shap_text_files:
+                html.append("<div class='card'><h3>SHAP (Text CharCNN)</h3><ul>")
+                for f in shap_text_files:
+                    html.append(f"<li><a href='shap_text/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if lime_jsb_files:
+                html.append("<div class='card'><h3>LIME (JS CharCNN base)</h3><ul>")
+                for f in lime_jsb_files:
+                    html.append(f"<li><a href='lime_jschar_base/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if shap_jsb_files:
+                html.append("<div class='card'><h3>SHAP (JS CharCNN base)</h3><ul>")
+                for f in shap_jsb_files:
+                    html.append(f"<li><a href='shap_jschar_base/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if lime_jsa_files:
+                html.append("<div class='card'><h3>LIME (JS CharCNN aug)</h3><ul>")
+                for f in lime_jsa_files:
+                    html.append(f"<li><a href='lime_jschar_aug/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
+            if shap_jsa_files:
+                html.append("<div class='card'><h3>SHAP (JS CharCNN aug)</h3><ul>")
+                for f in shap_jsa_files:
+                    html.append(f"<li><a href='shap_jschar_aug/{f}' target='_blank'>{f}</a></li>")
+                html.append("</ul></div>")
             html.append("</div></div>")
 
-        # Cascade coverage (if available)
         cas = (metrics_json or {}).get('cascade')
         cas_analysis = (metrics_json or {}).get('cascade_analysis')
         if cas and isinstance(cas, dict):
@@ -2754,7 +3483,6 @@ def main():
                 html.append(f"<div class='mono' style='opacity:.85'>stage1 thr_hi={float(s1.get('thr_hi', float('nan'))):.4f}, thr_lo={float(s1.get('thr_lo', float('nan'))):.4f}</div>")
             except Exception:
                 pass
-            # Narrative & efficiency gain (test split)
             if cas_analysis and isinstance(cas_analysis, dict):
                 test_block = cas_analysis.get('test') or {}
                 try:
@@ -2773,7 +3501,6 @@ def main():
                     pass
             html.append("</div></div>")
 
-        # Robustness delta card: JS base vs augmented (if both present)
         def _rob_card(light):
             if not isinstance(light, dict):
                 return ""
@@ -2783,7 +3510,6 @@ def main():
             pr_a = _safe_float((aug.get('metrics') or {}).get('pr_auc'))
             roc_b = _safe_float((base.get('metrics') or {}).get('roc_auc'))
             roc_a = _safe_float((aug.get('metrics') or {}).get('roc_auc'))
-            # If any metric is missing/unparseable, skip the card (preserve prior behavior)
             if any(np.isnan(v) for v in (pr_b, pr_a, roc_b, roc_a)):
                 return ""
             d_pr = pr_a - pr_b
@@ -2797,8 +3523,8 @@ def main():
                 f"<div class='mono'>ROC-AUC: {roc_b:.4f} → {roc_a:.4f} (<b>{sign(d_roc)}{d_roc:.4f}</b>)</div>"
                 "</div></div></div>"
             )
-        html.append(_rob_card((metrics_json or {}).get('light_heads')))
 
+        html.append(_rob_card((metrics_json or {}).get('light_heads')))
         html.append("</div></body></html>")
         with open(os.path.join(report_dir, "index.html"), "w", encoding="utf-8") as f:
             f.write("\n".join(html))
@@ -2835,6 +3561,18 @@ def main():
     _darkify_html_dir(os.path.join(report_dir, "shap_dom"))
     _darkify_html_dir(os.path.join(report_dir, "lime_js"))
     _darkify_html_dir(os.path.join(report_dir, "shap_js"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_meta"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_meta"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_fused"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_fused"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_url"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_url"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_text"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_text"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_jschar_base"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_jschar_base"))
+    _darkify_html_dir(os.path.join(report_dir, "lime_jschar_aug"))
+    _darkify_html_dir(os.path.join(report_dir, "shap_jschar_aug"))
 
 
 if __name__ == "__main__":

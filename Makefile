@@ -64,6 +64,7 @@ JS_HEAD_NUM_WORKERS ?= 4
 DIAG_INTERVAL ?= 100
 REPORT_OUT ?= artifacts/report_e2e
 INCLUDE_XFUSION ?= 1
+FORCE ?= 0
 
 # Optional toggle to include heavy CodeT5p JS head in unified report
 ENABLE_CODET5P ?= 0
@@ -486,7 +487,7 @@ report-xai:
 		--test-jsonl data/pages_test.jsonl \
 		--max-length $(MAXLEN) \
 		--device cuda --eval-batch 4 \
-		--lime --shap --num-expl 1 \
+		--lime --shap $(if $(NUM_EXPL),--num-expl $(NUM_EXPL),--num-expl 1) \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3
 	@if [ -f data/pages_val_full.jsonl ] && [ -f data/pages_test_full.jsonl ]; then \
 		echo "[MAKE] NOTE: Extended dataset available - consider updating report script to use _full files"; \
@@ -686,14 +687,22 @@ xfusion-diag: train-xfusion-diag
 # Comprehensive HTML report including heads, meta fusion, cascade, and XFusion diagnostics
 report-full:
 	@mkdir -p $(REPORT_OUT)
+	@if [ "$(FORCE)" = "1" ]; then \
+		echo "[MAKE] FORCE=1 → retraining and regenerating artifacts before report"; \
+		rm -rf artifacts/markup_run artifacts/url_head artifacts/js_charcnn artifacts/text_head artifacts/fusion artifacts/fusion_covmax artifacts/fusion_all artifacts/fusion_meta; \
+		$(MAKE) train eval train-heads eval-heads fuse-variants fuse-coverage meta-fuse-all; \
+	fi
 	$(PY) scripts/report_eval.py \
 		--out-dir $(REPORT_OUT) \
+	--model-dir artifacts/markup_run \
 		--val-jsonl data/pages_val.jsonl --test-jsonl data/pages_test.jsonl \
 		--fusion-dir artifacts/fusion_covmax \
 		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-diag artifacts/fusion_xattn/diagnostics/diagnostics.json,) \
 		$(if $(filter $(INCLUDE_XFUSION),1),--xfusion-dir artifacts/fusion_xattn,) \
 		--heads-dirs artifacts/url_head artifacts/text_head artifacts/js_charcnn $(if $(filter $(ENABLE_CODET5P),1),artifacts/js_codet5p,) \
-		--meta-fusion-dir artifacts/fusion_meta || (echo "[MAKE][ERROR] report failed" && exit 4)
+	--meta-fusion-dir artifacts/fusion_meta \
+	--lime --shap $(if $(NUM_EXPL),--num-expl $(NUM_EXPL),--num-expl 1) \
+	--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3 || (echo "[MAKE][ERROR] report failed" && exit 4)
 	@echo "[MAKE] Report generated at $(REPORT_OUT)/index.html"
 
 # Extended XAI + versioned splits aware report
@@ -712,7 +721,7 @@ report-extended-xai:
 		$(if $(filter $(USE_XFUSION),1),--xfusion-dir artifacts/fusion_xattn,) \
 		--heads-dirs $(HEADS_DIRS) \
 		--device $(XAI_DEVICE) --eval-batch 4 \
-		--lime --shap --num-expl 1 \
+		--lime --shap $(if $(NUM_EXPL),--num-expl $(NUM_EXPL),--num-expl 1) \
 		--xai-device $(XAI_DEVICE) --xai-max-chars 1500 --xai-num-samples 150 --xai-background 3 || (echo "[MAKE][ERROR] extended report failed" && exit 4)
 	@echo "[MAKE] Extended report at $(REPORT_OUT)/index.html"
 
